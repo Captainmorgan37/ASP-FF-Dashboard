@@ -154,6 +154,10 @@ if uploaded is not None:
         default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])
     ]
 
+    # Keep a pre-filter, cleaned copy for the simulator & lookups
+    df_clean = df.copy()
+
+    
     # ----------------------------
     # Quick Filters (TAIL / AIRPORT / WORKFLOW)
     # ----------------------------
@@ -220,21 +224,16 @@ if uploaded is not None:
         if "status_updates" not in st.session_state:
             st.session_state.status_updates = {}  # booking -> dict
 
-        booking_choices = df_raw[df_raw["is_real_leg"]]["Booking"].unique().tolist()  # allow updates even if filtered out
+        booking_choices = df_clean["Booking"].unique().tolist()  # allow updates even if filtered out
         if booking_choices:
             sel_booking = st.selectbox("Booking to update", booking_choices)
             update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
             actual_time_utc = utc_datetime_picker("Actual time", datetime.now(timezone.utc))
 
             if st.button("Apply Update"):
-                # look up planned times in the original cleaned data (pre-filter) for accuracy
-                base = df_raw.copy()
-                base["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(base["Off-Block (Est)"])
-                base["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(base["On-Block (Est)"])
-                base["is_real_leg"] = base["Aircraft"].apply(is_real_tail)
-                base = base[base["is_real_leg"]]
+                # use the pre-filter clean data (already parsed & fake-tail filtered)
+                row = df_clean[df_clean["Booking"] == sel_booking]
 
-                row = base[base["Booking"] == sel_booking]
                 if not row.empty:
                     planned = row["ETD_UTC"].iloc[0] if update_type == "Departure" else row["ETA_UTC"].iloc[0]
                     delta_min = None
