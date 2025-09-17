@@ -1,0 +1,208 @@
+# daily_ops_dashboard.py
+import re
+from datetime import datetime, timezone, timedelta
+
+import pandas as pd
+import streamlit as st
+
+# ----------------------------
+# Page config
+# ----------------------------
+st.set_page_config(page_title="Daily Ops Dashboard (Schedule + Status)", layout="wide")
+st.title("Daily Ops Dashboard (Schedule + Status)")
+
+st.caption(
+    "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
+    "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
+)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+TAIL_REGEX = re.compile(r"^C-[A-Z0-9]{4}$")   # Simple Canadian tail check like C-FASV
+FAKE_TAIL_PATTERNS = [
+    re.compile(r"^\s*(add|remove)\b", re.I),
+    re.compile(r"\b(ocs|emb)\b", re.I),
+]
+
+def is_real_tail(tail: str) -> bool:
+    if not isinstance(tail, str) or not tail.strip():
+        return False
+    for pat in FAKE_TAIL_PATTERNS:
+        if pat.search(tail):
+            return False
+    return bool(TAIL_REGEX.match(tail.strip()))
+
+def parse_utc_ddmmyyyy_hhmmz(series: pd.Series) -> pd.Series:
+    """
+    Convert strings like '18.09.2025 00:05z' to timezone-aware UTC timestamps.
+    """
+    s = series.astype(str).str.strip().str.replace("z", "", regex=False)
+    return pd.to_datetime(s, format="%d.%m.%Y %H:%M", errors="coerce", utc=True)
+
+def fmt_td(td: timedelta | pd.Timedelta | None) -> str:
+    if td is None or pd.isna(td):
+        return "—"
+    if isinstance(td, pd.Timedelta):
+        td = td.to_pytimedelta()
+    sign = "-" if td.total_seconds() < 0 else ""
+    td_abs = abs(td)
+    hours, remainder = divmod(int(td_abs.total_seconds()), 3600)
+    minutes = remainder // 60
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+def flight_time_hhmm_from_decimal(hours_decimal) -> str:
+    try:
+        mins = int(round(float(hours_decimal) * 60))
+        return f"{mins // 60:02d}:{mins % 60:02d}"
+    except Exception:
+        return "—"
+
+def classify_account(account_val: str) -> str:
+    # Your note: "AirSprint Inc." => OCS; anything else => Owner
+    if isinstance(account_val, str) and "airsprint inc" in account_val.lower():
+        return "OCS"
+    return "Owner"
+
+def type_badge(flight_type: str) -> str:
+    # Basic color-coding via emoji badges (reliable in Streamlit tables)
+    return {"OCS": "🟢 OCS", "Owner": "🔵 Owner"}.get(flight_type, "⚪︎")
+
+def default_status(dep_utc: pd.Timestamp, eta_utc: pd.Timestamp) -> str:
+    now = datetime.now(timezone.utc)
+    if pd.notna(dep_utc) and now < dep_utc:
+        return "🟡 SCHEDULED"
+    if pd.notna(dep_utc) and now >= dep_utc and (pd.isna(eta_utc) or now < eta_utc):
+        return "🟢 DEPARTED"
+    if pd.notna(eta_utc) and now >= eta_utc:
+        return "🟣 ARRIVED"
+    return "🟡 SCHEDULED"
+
+# ----------------------------
+# Controls
+# ----------------------------
+left, right = st.columns([1, 1])
+with left:
+    show_only_upcoming = st.checkbox("Show only upcoming departures", value=True)
+with right:
+    delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
+
+uploaded = st.file_uploader("Upload your daily flights CSV (FL3XX export)", type=["csv"])
+
+# ----------------------------
+# Parse + Display
+# ----------------------------
+if uploaded is not None:
+    # Read CSV
+    df_raw = pd.read_csv(uploaded)
+
+    # Expecting these column names (from your sample):
+    # Booking, Off-Block (Est), On-Block (Est), From (ICAO), To (ICAO),
+    # Flight time (Est), PIC, SIC, Account, Aircraft, Aircraft Type, Workflow
+    missing = [c for c in [
+        "Booking", "Off-Block (Est)", "On-Block (Est)", "From (ICAO)", "To (ICAO)",
+        "Flight time (Est)", "PIC", "SIC", "Account", "Aircraft", "Aircraft Type", "Workflow"
+    ] if c not in df_raw.columns]
+
+    if missing:
+        st.error(f"Missing expected columns: {missing}")
+        st.stop()
+
+    # Normalize & clean
+    df = df_raw.copy()
+
+    df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
+    df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
+
+    # Filter out fake/non-tail rows
+    df["is_real_leg"] = df["Aircraft"].apply(is_real_tail)
+    df = df[df["is_real_leg"]].copy()
+
+    # Classify flight type (OCS vs Owner)
+    df["Type"] = df["Account"].apply(classify_account)
+    df["TypeBadge"] = df["Type"].apply(type_badge)
+
+    # Route formatting and blanks handling
+    df["From"] = df["From (ICAO)"].fillna("—").replace({"nan": "—"})
+    df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
+    df["Route"] = df["From"] + " → " + df["To"]
+
+    # Flight time format
+    df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
+
+    # Relative time columns
+    now_utc = datetime.now(timezone.utc)
+    df["Departs In"] = (df["ETD_UTC"] - now_utc)
+    df["Arrives In"] = (df["ETA_UTC"] - now_utc)
+    df["Departs In"] = df["Departs In"].apply(fmt_td)
+    df["Arrives In"] = df["Arrives In"].apply(fmt_td)
+
+    # Default status (will be overridden later by email-driven updates)
+    df["Status"] = [
+        default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])
+    ]
+
+    # Optional filter: show only flights with ETD in the future
+    if show_only_upcoming:
+        df = df[df["ETD_UTC"] >= pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(minutes=5)].copy()
+
+    # Sort by ETD
+    df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True])
+
+    # Display subset with readable columns
+    display_cols = [
+        "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
+        "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
+        "Sched FT", "PIC", "SIC", "Workflow", "Status"
+    ]
+    st.subheader("Schedule")
+    st.dataframe(df[display_cols], use_container_width=True)
+
+    # ----------------------------
+    # Simulated email update hook (for later wiring)
+    # ----------------------------
+    st.markdown("### Email Updates (Simulator)")
+    with st.expander("Simulate a FlightBridge email alert → update status / detect delays"):
+        if "status_updates" not in st.session_state:
+            st.session_state.status_updates = {}  # booking -> dict
+
+        booking_choices = df["Booking"].unique().tolist()
+        if booking_choices:
+            sel_booking = st.selectbox("Booking to update", booking_choices)
+            update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
+            actual_time_utc = st.datetime_input(
+                "Actual time (UTC)", value=datetime.now(timezone.utc)
+            )
+
+            if st.button("Apply Update"):
+                # Retrieve row for selected booking
+                row = df[df["Booking"] == sel_booking].iloc[0]
+                planned = row["ETD_UTC"] if update_type == "Departure" else row["ETA_UTC"]
+                delta_min = None
+                if pd.notna(planned) and isinstance(planned, pd.Timestamp):
+                    delta_min = int(round((actual_time_utc - planned).total_seconds() / 60.0))
+
+                status = "🟢 DEPARTED" if update_type == "Departure" else "🟣 ARRIVED"
+                if delta_min is not None and abs(delta_min) >= int(delay_threshold_min):
+                    status = "🔴 DELAY" if update_type == "Departure" else "🟠 LATE ARRIVAL"
+
+                st.session_state.status_updates[sel_booking] = {
+                    "type": update_type,
+                    "actual_time_utc": actual_time_utc.isoformat(),
+                    "delta_min": delta_min,
+                    "status": status,
+                }
+                st.success(f"Applied update to {sel_booking}: {status} (Δ {delta_min} min)")
+
+        # Show current update map
+        if st.session_state.get("status_updates"):
+            st.write("Current updates:")
+            st.json(st.session_state.status_updates)
+
+    st.caption(
+        "Next step: connect Gmail/Outlook/Power Automate to parse FlightBridge alert emails "
+        "into `(booking, event, actual_time)` and call the same logic as the simulator above."
+    )
+
+else:
+    st.info("Upload today’s FL3XX flights CSV to begin.")
