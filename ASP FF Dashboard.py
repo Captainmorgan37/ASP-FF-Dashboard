@@ -88,15 +88,23 @@ def default_status(dep_utc: pd.Timestamp, eta_utc: pd.Timestamp) -> str:
     return "🟡 SCHEDULED"
 
 # ----------------------------
-# Controls
+# Controls  
 # ----------------------------
-left, right = st.columns([1, 1])
-with left:
+c1, c2, c3 = st.columns([1, 1, 1])
+
+with c1:
     show_only_upcoming = st.checkbox("Show only upcoming departures", value=True)
-with right:
-    delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
+
+with c2:
+    limit_next_hours = st.checkbox("Limit to next X hours", value=False)
+
+with c3:
+    next_hours = st.number_input("X hours (for filter above)", min_value=1, max_value=48, value=6)
+
+delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
 
 uploaded = st.file_uploader("Upload your daily flights CSV (FL3XX export)", type=["csv"])
+
 
 # ----------------------------
 # Parse + Display
@@ -151,21 +159,98 @@ if uploaded is not None:
         default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])
     ]
 
-    # Optional filter: show only flights with ETD in the future
-    if show_only_upcoming:
-        df = df[df["ETD_UTC"] >= pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(minutes=5)].copy()
+# ----------------------------
+# Quick Filters (TAIL / AIRPORT / WORKFLOW)
+# ----------------------------
+st.markdown("### Quick Filters")
 
-    # Sort by ETD
-    df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True])
+# Options
+tails_opts = sorted(df["Aircraft"].dropna().unique().tolist())
+airports_opts = sorted(
+    pd.unique(pd.concat([df["From"].fillna("—"), df["To"].fillna("—")], ignore_index=True)).tolist()
+)
+workflows_opts = sorted(df["Workflow"].fillna("").unique().tolist())
 
-    # Display subset with readable columns
-    display_cols = [
-        "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
-        "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
-        "Sched FT", "PIC", "SIC", "Workflow", "Status"
-    ]
-    st.subheader("Schedule")
-    st.dataframe(df[display_cols], use_container_width=True)
+f1, f2, f3 = st.columns([1, 1, 1])
+with f1:
+    tails_sel = st.multiselect("Tail(s)", tails_opts, default=[])
+with f2:
+    airports_sel = st.multiselect("Airport(s) (matches From OR To)", airports_opts, default=[])
+with f3:
+    workflows_sel = st.multiselect("Workflow(s)", workflows_opts, default=[])
+
+# Apply filters
+if tails_sel:
+    df = df[df["Aircraft"].isin(tails_sel)]
+
+if airports_sel:
+    df = df[df["From"].isin(airports_sel) | df["To"].isin(airports_sel)]
+
+if workflows_sel:
+    df = df[df["Workflow"].isin(workflows_sel)]
+
+# Time-window filters
+now_utc = datetime.now(timezone.utc)
+
+if limit_next_hours:
+    window_end = now_utc + pd.Timedelta(hours=int(next_hours))
+    # Keep flights departing within the window (a small negative tolerance keeps just-departed flights visible)
+    df = df[(df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)) & (df["ETD_UTC"] <= window_end)]
+elif show_only_upcoming:
+    df = df[df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)]
+
+# ----------------------------
+# Quick Filters (TAIL / AIRPORT / WORKFLOW)
+# ----------------------------
+st.markdown("### Quick Filters")
+
+# Options
+tails_opts = sorted(df["Aircraft"].dropna().unique().tolist())
+airports_opts = sorted(
+    pd.unique(pd.concat([df["From"].fillna("—"), df["To"].fillna("—")], ignore_index=True)).tolist()
+)
+workflows_opts = sorted(df["Workflow"].fillna("").unique().tolist())
+
+f1, f2, f3 = st.columns([1, 1, 1])
+with f1:
+    tails_sel = st.multiselect("Tail(s)", tails_opts, default=[])
+with f2:
+    airports_sel = st.multiselect("Airport(s) (matches From OR To)", airports_opts, default=[])
+with f3:
+    workflows_sel = st.multiselect("Workflow(s)", workflows_opts, default=[])
+
+# Apply filters
+if tails_sel:
+    df = df[df["Aircraft"].isin(tails_sel)]
+
+if airports_sel:
+    df = df[df["From"].isin(airports_sel) | df["To"].isin(airports_sel)]
+
+if workflows_sel:
+    df = df[df["Workflow"].isin(workflows_sel)]
+
+# Time-window filters
+now_utc = datetime.now(timezone.utc)
+
+if limit_next_hours:
+    window_end = now_utc + pd.Timedelta(hours=int(next_hours))
+    # Keep flights departing within the window (a small negative tolerance keeps just-departed flights visible)
+    df = df[(df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)) & (df["ETD_UTC"] <= window_end)]
+elif show_only_upcoming:
+    df = df[df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)]
+
+# Sort & display
+df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
+
+display_cols = [
+    "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
+    "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
+    "Sched FT", "PIC", "SIC", "Workflow", "Status"
+]
+
+st.subheader("Schedule")
+st.dataframe(df[display_cols], use_container_width=True)
+
 
     # ----------------------------
     # Simulated email update hook (for later wiring)
