@@ -16,6 +16,27 @@ st.caption(
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
 )
 
+# --- Auto-refresh controls ---
+ar1, ar2 = st.columns([1, 1])
+with ar1:
+    auto_refresh = st.checkbox("Auto-refresh", value=True, help="Re-run the app so countdowns update.")
+with ar2:
+    refresh_sec = st.number_input("Refresh every (sec)", min_value=5, max_value=120, value=30, step=5)
+
+# Trigger auto-refresh (uses st_autorefresh if available; falls back to JS)
+if auto_refresh:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
+    except Exception:
+        # Fallback for environments without the package
+        import streamlit.components.v1 as components
+        components.html(
+            f"<script>setTimeout(function(){{window.parent.location.reload()}}, {int(refresh_sec*1000)});</script>",
+            height=0,
+        )
+
+
 # ----------------------------
 # Helpers
 # ----------------------------
