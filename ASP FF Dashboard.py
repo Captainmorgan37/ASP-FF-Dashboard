@@ -405,30 +405,47 @@ now_utc = datetime.now(timezone.utc)
 df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
 df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 
-# Default status
-df["Status"] = [default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])]
-
-# Keep pre-filter copy for lookups
-df_clean = df.copy()
-
 # ============================
-# Merge persisted statuses (priority: Diversion > Arrival > ArrivalForecast > Departure > default)
+# Build event map (persisted + in-session) and compute status
 # ============================
-persisted = load_status_map()
-def merged_status(booking, default_val):
-    rec = persisted.get(booking, {})
-    if "Diversion" in rec: return rec["Diversion"]["status"]
-    if "Arrival" in rec: return rec["Arrival"]["status"]
-    if "ArrivalForecast" in rec: return rec["ArrivalForecast"]["status"]
-    if "Departure" in rec: return rec["Departure"]["status"]
-    return default_val
+events_map = load_status_map()
+# Overlay in-session updates (from IMAP polling this run) into events_map
+if st.session_state.get("status_updates"):
+    for b, upd in st.session_state["status_updates"].items():
+        et = upd.get("type") or "Unknown"
+        events_map.setdefault(b, {})[et] = upd
 
-df["Status"] = [merged_status(b, s) for b, s in zip(df["Booking"], df["Status"])]
+def compute_status_row(booking, dep_utc, eta_utc) -> str:
+    rec = events_map.get(booking, {})
+    now = datetime.now(timezone.utc)
+    thr = timedelta(minutes=int(delay_threshold_min))
 
-# Overlay in-session updates if present (e.g., from IMAP polling below)
-if "status_updates" in st.session_state and st.session_state["status_updates"]:
-    su = st.session_state["status_updates"]
-    df["Status"] = [su.get(b, {}).get("status", s) for b, s in zip(df["Booking"], df["Status"])]
+    # Hard-priority events from emails
+    if "Diversion" in rec:
+        return rec["Diversion"]["status"]
+    if "Arrival" in rec:
+        return rec["Arrival"]["status"]
+    if "ArrivalForecast" in rec:
+        return "🟦 ARRIVING SOON"
+
+    # We have a DEP email but not ARR yet
+    if "Departure" in rec:
+        if pd.notna(eta_utc) and now >= eta_utc + thr:
+            return "🟠 LATE ARRIVAL"  # departed, but overdue to arrive
+        return "🟢 DEPARTED"         # departed and not yet overdue
+
+    # No emails at all → schedule-based, but DON'T assume movement without email
+    if pd.notna(dep_utc):
+        if now < dep_utc:
+            return "🟡 SCHEDULED"
+        # Past ETD with no dep email ⇒ treat as delay (after threshold)
+        return "🔴 DELAY" if (now - dep_utc) >= thr else "🟡 SCHEDULED"
+
+    return "🟡 SCHEDULED"
+
+# Compute status per row using the email-driven logic above
+df["Status"] = [compute_status_row(b, dep, eta) for b, dep, eta in zip(df["Booking"], df["ETD_UTC"], df["ETA_UTC"])]
+
 
 # ============================
 # Quick Filters
