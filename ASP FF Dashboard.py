@@ -1,7 +1,6 @@
 # daily_ops_dashboard.py
 import re
 import sqlite3
-from contextlib import closing
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -19,7 +18,7 @@ st.caption(
 )
 
 # ============================
-# Auto-refresh controls
+# Auto-refresh controls (no page reload fallback)
 # ============================
 ar1, ar2 = st.columns([1, 1])
 with ar1:
@@ -32,14 +31,13 @@ if auto_refresh:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
     except Exception:
-        import streamlit.components.v1 as components
-        components.html(
-            f"<script>setTimeout(function(){{window.parent.location.reload()}}, {int(refresh_sec*1000)});</script>",
-            height=0,
+        st.warning(
+            "Auto-refresh requires the 'streamlit-autorefresh' package. "
+            "Add `streamlit-autorefresh` to requirements.txt (or disable Auto-refresh)."
         )
 
 # ============================
-# SQLite persistence for statuses
+# SQLite persistence (statuses + CSV)
 # ============================
 DB_PATH = "status_store.db"
 
@@ -56,9 +54,16 @@ def init_db():
             PRIMARY KEY (booking, event_type)
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS csv_store (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            name TEXT,
+            content BLOB,
+            uploaded_at TEXT NOT NULL
+        )
+        """)
 
 def load_status_map() -> dict:
-    # returns: { booking: {"Departure": {...}, "Arrival": {...}}, ...}
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("""
             SELECT booking, event_type, status, actual_time_utc, delta_min
@@ -84,6 +89,24 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
         """, (booking, event_type, status, actual_time_iso,
               int(delta_min) if delta_min is not None else None))
 
+def save_csv_to_db(name: str, content_bytes: bytes):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO csv_store (id, name, content, uploaded_at)
+            VALUES (1, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                content=excluded.content,
+                uploaded_at=datetime('now')
+        """, (name, content_bytes))
+
+def load_csv_from_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT name, content, uploaded_at FROM csv_store WHERE id=1").fetchone()
+    if row:
+        return row[0], row[1], row[2]
+    return None, None, None
+
 init_db()
 
 # ============================
@@ -104,13 +127,11 @@ def is_real_tail(tail: str) -> bool:
     return True  # be permissive; only filter known placeholders
 
 def parse_utc_ddmmyyyy_hhmmz(series: pd.Series) -> pd.Series:
-    """
-    Convert strings like '18.09.2025 00:05z' to timezone-aware UTC timestamps.
-    """
+    """Convert '18.09.2025 00:05z' -> tz-aware UTC timestamps."""
     s = series.astype(str).str.strip().str.replace("Z", "z", regex=False).str.replace("z", "", regex=False)
     return pd.to_datetime(s, format="%d.%m.%Y %H:%M", errors="coerce", utc=True)
 
-def fmt_td(td: timedelta | pd.Timedelta | None) -> str:
+def fmt_td(td):
     if td is None or pd.isna(td):
         return "—"
     if isinstance(td, pd.Timedelta):
@@ -172,7 +193,7 @@ with c3:
 delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
 
 # ============================
-# File upload with persistence across refreshes
+# File upload with persistence (session + SQLite)
 # ============================
 uploaded = st.file_uploader(
     "Upload your daily flights CSV (FL3XX export)",
@@ -190,25 +211,41 @@ with btn_cols[0]:
             st.session_state.pop(k, None)
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("DELETE FROM status_events")
-        try:
-            st.rerun()
-        except Exception:
-            st.experimental_rerun()
+            conn.execute("DELETE FROM csv_store")
+        st.rerun()  # safe in modern Streamlit; falls back internally
 
+# Priority 1: new upload
 if uploaded is not None:
-    st.session_state["csv_bytes"] = uploaded.getvalue()
-    st.session_state["csv_name"]  = uploaded.name
+    csv_bytes = uploaded.getvalue()
+    st.session_state["csv_bytes"] = csv_bytes
+    st.session_state["csv_name"] = uploaded.name
     st.session_state["csv_uploaded_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    df_raw = _load_csv_from_bytes(st.session_state["csv_bytes"])
+    save_csv_to_db(uploaded.name, csv_bytes)  # persist to DB
+    df_raw = _load_csv_from_bytes(csv_bytes)
+
+# Priority 2: existing session cache
 elif "csv_bytes" in st.session_state:
     df_raw = _load_csv_from_bytes(st.session_state["csv_bytes"])
     st.caption(
         f"Using cached CSV: **{st.session_state.get('csv_name','flights.csv')}** "
         f"(uploaded {st.session_state.get('csv_uploaded_at','')})"
     )
+
+# Priority 3: DB fallback (fresh session / restart / redeploy)
 else:
-    st.info("Upload today’s FL3XX flights CSV to begin.")
-    st.stop()
+    name, content, uploaded_at = load_csv_from_db()
+    if content is not None:
+        st.session_state["csv_bytes"] = content
+        st.session_state["csv_name"] = name or "flights.csv"
+        st.session_state["csv_uploaded_at"] = uploaded_at or ""
+        df_raw = _load_csv_from_bytes(content)
+        st.caption(
+            f"Loaded CSV from storage: **{st.session_state['csv_name']}** "
+            f"(uploaded {st.session_state['csv_uploaded_at']})"
+        )
+    else:
+        st.info("Upload today’s FL3XX flights CSV to begin.")
+        st.stop()
 
 # ============================
 # Parse & normalize
@@ -225,7 +262,6 @@ if missing:
     st.stop()
 
 df = df_raw.copy()
-
 df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
 df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
 
@@ -321,9 +357,8 @@ display_cols = [
     "Sched FT", "PIC", "SIC", "Workflow", "Status"
 ]
 
-st.subheader(f"Schedule  ·  {len(df)} flight(s) shown)")
+st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
-
 st.dataframe(df[display_cols], use_container_width=True)
 
 # ============================
@@ -352,7 +387,7 @@ with st.expander("Simulate a FlightBridge email alert → update status / detect
                 if delta_min is not None and abs(delta_min) >= int(delay_threshold_min):
                     status = "🔴 DELAY" if update_type == "Departure" else "🟠 LATE ARRIVAL"
 
-                # Update in-session map
+                # Session overlay
                 st.session_state.status_updates[sel_booking] = {
                     "type": update_type,
                     "actual_time_utc": actual_time_utc.isoformat(),
@@ -371,12 +406,11 @@ with st.expander("Simulate a FlightBridge email alert → update status / detect
             else:
                 st.error("Booking not found in the current dataset.")
 
-    # Show current update map
     if st.session_state.get("status_updates"):
         st.write("Current updates (session):")
         st.json(st.session_state.status_updates)
 
 st.caption(
-    "Next step: connect Gmail/Outlook/Power Automate to parse FlightBridge alert emails "
-    "into `(booking, event, actual_time)` and call the same logic as the simulator above."
+    "Next step: wire Gmail/Outlook/Power Automate to parse FlightBridge alert emails into "
+    "`(booking, event, actual_time)` and call the same logic as the simulator above."
 )
