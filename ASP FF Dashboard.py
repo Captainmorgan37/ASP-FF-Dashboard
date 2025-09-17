@@ -1,45 +1,94 @@
 # daily_ops_dashboard.py
 import re
+import sqlite3
+from contextlib import closing
+from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import streamlit as st
 
-# ----------------------------
+# ============================
 # Page config
-# ----------------------------
+# ============================
 st.set_page_config(page_title="Daily Ops Dashboard (Schedule + Status)", layout="wide")
 st.title("Daily Ops Dashboard (Schedule + Status)")
-
 st.caption(
     "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
 )
 
-# --- Auto-refresh controls ---
+# ============================
+# Auto-refresh controls
+# ============================
 ar1, ar2 = st.columns([1, 1])
 with ar1:
     auto_refresh = st.checkbox("Auto-refresh", value=True, help="Re-run the app so countdowns update.")
 with ar2:
     refresh_sec = st.number_input("Refresh every (sec)", min_value=5, max_value=120, value=30, step=5)
 
-# Trigger auto-refresh (uses st_autorefresh if available; falls back to JS)
 if auto_refresh:
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
     except Exception:
-        # Fallback for environments without the package
         import streamlit.components.v1 as components
         components.html(
             f"<script>setTimeout(function(){{window.parent.location.reload()}}, {int(refresh_sec*1000)});</script>",
             height=0,
         )
 
+# ============================
+# SQLite persistence for statuses
+# ============================
+DB_PATH = "status_store.db"
 
-# ----------------------------
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS status_events (
+            booking TEXT NOT NULL,
+            event_type TEXT NOT NULL,  -- 'Departure' or 'Arrival'
+            status TEXT NOT NULL,      -- '🟢 DEPARTED', '🔴 DELAY', '🟣 ARRIVED', etc.
+            actual_time_utc TEXT,
+            delta_min INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (booking, event_type)
+        )
+        """)
+
+def load_status_map() -> dict:
+    # returns: { booking: {"Departure": {...}, "Arrival": {...}}, ...}
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT booking, event_type, status, actual_time_utc, delta_min
+            FROM status_events
+        """).fetchall()
+    m = {}
+    for booking, event_type, status, actual, delta in rows:
+        m.setdefault(booking, {})[event_type] = {
+            "status": status, "actual_time_utc": actual, "delta_min": delta
+        }
+    return m
+
+def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO status_events (booking, event_type, status, actual_time_utc, delta_min, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(booking, event_type) DO UPDATE SET
+                status=excluded.status,
+                actual_time_utc=excluded.actual_time_utc,
+                delta_min=excluded.delta_min,
+                updated_at=datetime('now')
+        """, (booking, event_type, status, actual_time_iso,
+              int(delta_min) if delta_min is not None else None))
+
+init_db()
+
+# ============================
 # Helpers
-# ----------------------------
+# ============================
 FAKE_TAIL_PATTERNS = [
     re.compile(r"^\s*(add|remove)\b", re.I),
     re.compile(r"\b(ocs|emb)\b", re.I),
@@ -80,7 +129,7 @@ def flight_time_hhmm_from_decimal(hours_decimal) -> str:
         return "—"
 
 def classify_account(account_val: str) -> str:
-    # Your note: "AirSprint Inc." => OCS; anything else => Owner
+    # Your rule: "AirSprint Inc." => OCS; anything else => Owner
     if isinstance(account_val, str) and "airsprint inc" in account_val.lower():
         return "OCS"
     return "Owner"
@@ -109,9 +158,9 @@ def utc_datetime_picker(label: str, default_dt_utc: datetime) -> datetime:
     )
     return datetime.combine(d, t).replace(tzinfo=timezone.utc)
 
-# ----------------------------
+# ============================
 # Controls
-# ----------------------------
+# ============================
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
     show_only_upcoming = st.checkbox("Show only upcoming departures", value=True)
@@ -122,168 +171,212 @@ with c3:
 
 delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
 
-uploaded = st.file_uploader("Upload your daily flights CSV (FL3XX export)", type=["csv"])
+# ============================
+# File upload with persistence across refreshes
+# ============================
+uploaded = st.file_uploader(
+    "Upload your daily flights CSV (FL3XX export)",
+    type=["csv"],
+    key="flights_csv"
+)
 
-# ----------------------------
-# Parse + Display
-# ----------------------------
+def _load_csv_from_bytes(b: bytes) -> pd.DataFrame:
+    return pd.read_csv(BytesIO(b))
+
+btn_cols = st.columns([1, 3, 1])
+with btn_cols[0]:
+    if st.button("Reset data & clear cache"):
+        for k in ("csv_bytes", "csv_name", "csv_uploaded_at", "status_updates"):
+            st.session_state.pop(k, None)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM status_events")
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
+
 if uploaded is not None:
-    # Read CSV
-    df_raw = pd.read_csv(uploaded)
-
-    # Expected columns (from your sample)
-    expected_cols = [
-        "Booking", "Off-Block (Est)", "On-Block (Est)",
-        "From (ICAO)", "To (ICAO)",
-        "Flight time (Est)", "PIC", "SIC",
-        "Account", "Aircraft", "Aircraft Type", "Workflow"
-    ]
-    missing = [c for c in expected_cols if c not in df_raw.columns]
-    if missing:
-        st.error(f"Missing expected columns: {missing}")
-        st.stop()
-
-    # Normalize & clean
-    df = df_raw.copy()
-
-    df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
-    df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
-
-    # Filter out fake/non-tail rows
-    df["is_real_leg"] = df["Aircraft"].apply(is_real_tail)
-    df = df[df["is_real_leg"]].copy()
-
-    # Classify flight type (OCS vs Owner)
-    df["Type"] = df["Account"].apply(classify_account)
-    df["TypeBadge"] = df["Type"].apply(type_badge)
-
-    # Route formatting and blanks handling
-    df["From"] = df["From (ICAO)"].fillna("—").replace({"nan": "—"})
-    df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
-    df["Route"] = df["From"] + " → " + df["To"]
-
-    # Flight time format
-    df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
-
-    # Relative time columns
-    now_utc = datetime.now(timezone.utc)
-    df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
-    df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
-
-    # Default status (will be overridden later by email-driven updates)
-    df["Status"] = [
-        default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])
-    ]
-
-    # Keep a pre-filter, cleaned copy for the simulator & lookups
-    df_clean = df.copy()
-
-    
-    # ----------------------------
-    # Quick Filters (TAIL / AIRPORT / WORKFLOW)
-    # ----------------------------
-    st.markdown("### Quick Filters")
-
-    tails_opts = sorted(df["Aircraft"].dropna().unique().tolist())
-    airports_opts = sorted(
-        pd.unique(pd.concat([df["From"].fillna("—"), df["To"].fillna("—")], ignore_index=True)).tolist()
-    )
-    workflows_opts = sorted(df["Workflow"].fillna("").unique().tolist())
-
-    f1, f2, f3 = st.columns([1, 1, 1])
-    with f1:
-        tails_sel = st.multiselect("Tail(s)", tails_opts, default=[])
-    with f2:
-        airports_sel = st.multiselect("Airport(s) (matches From OR To)", airports_opts, default=[])
-    with f3:
-        workflows_sel = st.multiselect("Workflow(s)", workflows_opts, default=[])
-
-    # Apply filters
-    if tails_sel:
-        df = df[df["Aircraft"].isin(tails_sel)]
-    if airports_sel:
-        df = df[df["From"].isin(airports_sel) | df["To"].isin(airports_sel)]
-    if workflows_sel:
-        df = df[df["Workflow"].isin(workflows_sel)]
-
-    # Time-window filters
-    now_utc = datetime.now(timezone.utc)
-
-    if limit_next_hours:
-        window_end = now_utc + pd.Timedelta(hours=int(next_hours))
-        df = df[(df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)) & (df["ETD_UTC"] <= window_end)]
-    elif show_only_upcoming:
-        df = df[df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)]
-
-    # ----------------------------
-    # Apply any simulated email status overrides to the filtered df
-    # ----------------------------
-    if "status_updates" in st.session_state:
-        su = st.session_state["status_updates"]
-        if su:
-            df["Status"] = [
-                su.get(b, {}).get("status", s) for b, s in zip(df["Booking"], df["Status"])
-            ]
-
-    # Sort & display
-    df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
-
-    display_cols = [
-        "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
-        "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
-        "Sched FT", "PIC", "SIC", "Workflow", "Status"
-    ]
-
-    st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
-    st.dataframe(df[display_cols], use_container_width=True)
-
-    # ----------------------------
-    # Email Updates (Simulator)
-    # ----------------------------
-    st.markdown("### Email Updates (Simulator)")
-    with st.expander("Simulate a FlightBridge email alert → update status / detect delays"):
-        if "status_updates" not in st.session_state:
-            st.session_state.status_updates = {}  # booking -> dict
-
-        booking_choices = df_clean["Booking"].unique().tolist()  # allow updates even if filtered out
-        if booking_choices:
-            sel_booking = st.selectbox("Booking to update", booking_choices)
-            update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
-            actual_time_utc = utc_datetime_picker("Actual time", datetime.now(timezone.utc))
-
-            if st.button("Apply Update"):
-                # use the pre-filter clean data (already parsed & fake-tail filtered)
-                row = df_clean[df_clean["Booking"] == sel_booking]
-
-                if not row.empty:
-                    planned = row["ETD_UTC"].iloc[0] if update_type == "Departure" else row["ETA_UTC"].iloc[0]
-                    delta_min = None
-                    if pd.notna(planned) and isinstance(planned, pd.Timestamp):
-                        delta_min = int(round((actual_time_utc - planned).total_seconds() / 60.0))
-
-                    status = "🟢 DEPARTED" if update_type == "Departure" else "🟣 ARRIVED"
-                    if delta_min is not None and abs(delta_min) >= int(delay_threshold_min):
-                        status = "🔴 DELAY" if update_type == "Departure" else "🟠 LATE ARRIVAL"
-
-                    st.session_state.status_updates[sel_booking] = {
-                        "type": update_type,
-                        "actual_time_utc": actual_time_utc.isoformat(),
-                        "delta_min": delta_min,
-                        "status": status,
-                    }
-                    st.success(f"Applied update to {sel_booking}: {status} (Δ {delta_min} min)")
-                else:
-                    st.error("Booking not found in the current dataset.")
-
-        # Show current update map
-        if st.session_state.get("status_updates"):
-            st.write("Current updates:")
-            st.json(st.session_state.status_updates)
-
+    st.session_state["csv_bytes"] = uploaded.getvalue()
+    st.session_state["csv_name"]  = uploaded.name
+    st.session_state["csv_uploaded_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    df_raw = _load_csv_from_bytes(st.session_state["csv_bytes"])
+elif "csv_bytes" in st.session_state:
+    df_raw = _load_csv_from_bytes(st.session_state["csv_bytes"])
     st.caption(
-        "Next step: connect Gmail/Outlook/Power Automate to parse FlightBridge alert emails "
-        "into `(booking, event, actual_time)` and call the same logic as the simulator above."
+        f"Using cached CSV: **{st.session_state.get('csv_name','flights.csv')}** "
+        f"(uploaded {st.session_state.get('csv_uploaded_at','')})"
     )
-
 else:
     st.info("Upload today’s FL3XX flights CSV to begin.")
+    st.stop()
+
+# ============================
+# Parse & normalize
+# ============================
+expected_cols = [
+    "Booking", "Off-Block (Est)", "On-Block (Est)",
+    "From (ICAO)", "To (ICAO)",
+    "Flight time (Est)", "PIC", "SIC",
+    "Account", "Aircraft", "Aircraft Type", "Workflow"
+]
+missing = [c for c in expected_cols if c not in df_raw.columns]
+if missing:
+    st.error(f"Missing expected columns: {missing}")
+    st.stop()
+
+df = df_raw.copy()
+
+df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
+df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
+
+# Filter out fake/non-tail rows
+df["is_real_leg"] = df["Aircraft"].apply(is_real_tail)
+df = df[df["is_real_leg"]].copy()
+
+# Classify flight type (OCS vs Owner)
+df["Type"] = df["Account"].apply(classify_account)
+df["TypeBadge"] = df["Type"].apply(type_badge)
+
+# Route formatting and blanks handling
+df["From"] = df["From (ICAO)"].fillna("—").replace({"nan": "—"})
+df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
+df["Route"] = df["From"] + " → " + df["To"]
+
+# Flight time format
+df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
+
+# Relative time columns
+now_utc = datetime.now(timezone.utc)
+df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
+df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
+
+# Default status
+df["Status"] = [default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])]
+
+# Keep a pre-filter, cleaned copy for simulator & lookups
+df_clean = df.copy()
+
+# ============================
+# Merge persisted statuses
+# ============================
+persisted = load_status_map()
+
+def merged_status(booking, default_val):
+    rec = persisted.get(booking, {})
+    # Prefer Arrival over Departure if both exist
+    if "Arrival" in rec:
+        return rec["Arrival"]["status"]
+    if "Departure" in rec:
+        return rec["Departure"]["status"]
+    return default_val
+
+df["Status"] = [merged_status(b, s) for b, s in zip(df["Booking"], df["Status"])]
+
+# Overlay any in-session updates (more recent than DB if present)
+if "status_updates" in st.session_state and st.session_state["status_updates"]:
+    su = st.session_state["status_updates"]
+    df["Status"] = [su.get(b, {}).get("status", s) for b, s in zip(df["Booking"], df["Status"])]
+
+# ============================
+# Quick Filters (TAIL / AIRPORT / WORKFLOW)
+# ============================
+st.markdown("### Quick Filters")
+
+tails_opts = sorted(df["Aircraft"].dropna().unique().tolist())
+airports_opts = sorted(
+    pd.unique(pd.concat([df["From"].fillna("—"), df["To"].fillna("—")], ignore_index=True)).tolist()
+)
+workflows_opts = sorted(df["Workflow"].fillna("").unique().tolist())
+
+f1, f2, f3 = st.columns([1, 1, 1])
+with f1:
+    tails_sel = st.multiselect("Tail(s)", tails_opts, default=[])
+with f2:
+    airports_sel = st.multiselect("Airport(s) (matches From OR To)", airports_opts, default=[])
+with f3:
+    workflows_sel = st.multiselect("Workflow(s)", workflows_opts, default=[])
+
+# Apply filters
+if tails_sel:
+    df = df[df["Aircraft"].isin(tails_sel)]
+if airports_sel:
+    df = df[df["From"].isin(airports_sel) | df["To"].isin(airports_sel)]
+if workflows_sel:
+    df = df[df["Workflow"].isin(workflows_sel)]
+
+# Time-window filters
+now_utc = datetime.now(timezone.utc)
+if limit_next_hours:
+    window_end = now_utc + pd.Timedelta(hours=int(next_hours))
+    df = df[(df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)) & (df["ETD_UTC"] <= window_end)]
+elif show_only_upcoming:
+    df = df[df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)]
+
+# Sort & display
+df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
+
+display_cols = [
+    "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
+    "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
+    "Sched FT", "PIC", "SIC", "Workflow", "Status"
+]
+
+st.subheader(f"Schedule  ·  {len(df)} flight(s) shown)")
+st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
+
+st.dataframe(df[display_cols], use_container_width=True)
+
+# ============================
+# Email Updates (Simulator)
+# ============================
+st.markdown("### Email Updates (Simulator)")
+with st.expander("Simulate a FlightBridge email alert → update status / detect delays"):
+    if "status_updates" not in st.session_state:
+        st.session_state.status_updates = {}  # booking -> dict
+
+    booking_choices = df_clean["Booking"].unique().tolist()  # allow updates even if filtered out
+    if booking_choices:
+        sel_booking = st.selectbox("Booking to update", booking_choices)
+        update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
+        actual_time_utc = utc_datetime_picker("Actual time", datetime.now(timezone.utc))
+
+        if st.button("Apply Update"):
+            row = df_clean[df_clean["Booking"] == sel_booking]
+            if not row.empty:
+                planned = row["ETD_UTC"].iloc[0] if update_type == "Departure" else row["ETA_UTC"].iloc[0]
+                delta_min = None
+                if pd.notna(planned) and isinstance(planned, pd.Timestamp):
+                    delta_min = int(round((actual_time_utc - planned).total_seconds() / 60.0))
+
+                status = "🟢 DEPARTED" if update_type == "Departure" else "🟣 ARRIVED"
+                if delta_min is not None and abs(delta_min) >= int(delay_threshold_min):
+                    status = "🔴 DELAY" if update_type == "Departure" else "🟠 LATE ARRIVAL"
+
+                # Update in-session map
+                st.session_state.status_updates[sel_booking] = {
+                    "type": update_type,
+                    "actual_time_utc": actual_time_utc.isoformat(),
+                    "delta_min": delta_min,
+                    "status": status,
+                }
+                # Persist to DB
+                upsert_status(
+                    booking=sel_booking,
+                    event_type=update_type,
+                    status=status,
+                    actual_time_iso=actual_time_utc.isoformat(),
+                    delta_min=delta_min
+                )
+                st.success(f"Applied update to {sel_booking}: {status} (Δ {delta_min} min)")
+            else:
+                st.error("Booking not found in the current dataset.")
+
+    # Show current update map
+    if st.session_state.get("status_updates"):
+        st.write("Current updates (session):")
+        st.json(st.session_state.status_updates)
+
+st.caption(
+    "Next step: connect Gmail/Outlook/Power Automate to parse FlightBridge alert emails "
+    "into `(booking, event, actual_time)` and call the same logic as the simulator above."
+)
