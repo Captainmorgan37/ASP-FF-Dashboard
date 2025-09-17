@@ -25,6 +25,15 @@ FAKE_TAIL_PATTERNS = [
     re.compile(r"\b(ocs|emb)\b", re.I),
 ]
 
+from datetime import datetime, timezone
+
+def utc_datetime_picker(label: str, default_dt_utc: datetime) -> datetime:
+    d = st.date_input(f"{label} — Date (UTC)", value=default_dt_utc.date(), key=f"{label}-date")
+    t = st.time_input(f"{label} — Time (UTC)", value=default_dt_utc.time().replace(microsecond=0),
+                      key=f"{label}-time")
+    return datetime.combine(d, t).replace(tzinfo=timezone.utc)
+
+
 def is_real_tail(tail: str) -> bool:
     if not isinstance(tail, str) or not tail.strip():
         return False
@@ -170,9 +179,8 @@ if uploaded is not None:
         if booking_choices:
             sel_booking = st.selectbox("Booking to update", booking_choices)
             update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
-            actual_time_utc = st.datetime_input(
-                "Actual time (UTC)", value=datetime.now(timezone.utc)
-            )
+            actual_time_utc = utc_datetime_picker("Actual time", datetime.now(timezone.utc))
+
 
             if st.button("Apply Update"):
                 # Retrieve row for selected booking
