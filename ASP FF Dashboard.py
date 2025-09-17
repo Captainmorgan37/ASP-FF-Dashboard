@@ -8,8 +8,6 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dateparse
-from email import policy
-from email.parser import BytesParser
 
 # ============================
 # Page config
@@ -189,6 +187,7 @@ def default_status(dep_utc: pd.Timestamp, eta_utc: pd.Timestamp) -> str:
     return "🟡 SCHEDULED"
 
 def utc_datetime_picker(label: str, default_dt_utc: datetime) -> datetime:
+    # (left in place; unused now that simulator is removed)
     d = st.date_input(f"{label} — Date (UTC)", value=default_dt_utc.date(), key=f"{label}-date")
     t = st.time_input(f"{label} — Time (UTC)", value=default_dt_utc.time().replace(microsecond=0), key=f"{label}-time")
     return datetime.combine(d, t).replace(tzinfo=timezone.utc)
@@ -399,7 +398,6 @@ df["TypeBadge"] = df["Type"].apply(type_badge)
 df["From"] = df["From (ICAO)"].fillna("—").replace({"nan": "—"})
 df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
 df["Route"] = df["From"] + " → " + df["To"]
-# (You hid Sched FT from the table, so we keep computation optional)
 # df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
 
 # Relative time columns
@@ -427,7 +425,7 @@ def merged_status(booking, default_val):
 
 df["Status"] = [merged_status(b, s) for b, s in zip(df["Booking"], df["Status"])]
 
-# Overlay in-session updates if present
+# Overlay in-session updates if present (e.g., from IMAP polling below)
 if "status_updates" in st.session_state and st.session_state["status_updates"]:
     su = st.session_state["status_updates"]
     df["Status"] = [su.get(b, {}).get("status", s) for b, s in zip(df["Booking"], df["Status"])]
@@ -472,157 +470,7 @@ display_cols = [
 ]
 st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
-st.dataframe(df[display_cols], use_container_width=True)
-
-# ============================
-# Email Updates (Simulator)
-# ============================
-st.markdown("### Email Updates (Simulator)")
-with st.expander("Simulate a FlightBridge email alert → update status / detect delays"):
-    if "status_updates" not in st.session_state:
-        st.session_state.status_updates = {}
-
-    booking_choices = df_clean["Booking"].unique().tolist()
-    if booking_choices:
-        sel_booking = st.selectbox("Booking to update", booking_choices)
-        update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
-        actual_time_utc = utc_datetime_picker("Actual time", datetime.now(timezone.utc))
-
-        if st.button("Apply Update"):
-            row = df_clean[df_clean["Booking"] == sel_booking]
-            if not row.empty:
-                planned = row["ETD_UTC"].iloc[0] if update_type == "Departure" else row["ETA_UTC"].iloc[0]
-                delta_min = None
-                if pd.notna(planned):
-                    delta_min = int(round((actual_time_utc - planned).total_seconds() / 60.0))
-                status = "🟢 DEPARTED" if update_type == "Departure" else "🟣 ARRIVED"
-                if delta_min is not None and abs(delta_min) >= int(delay_threshold_min):
-                    status = "🔴 DELAY" if update_type == "Departure" else "🟠 LATE ARRIVAL"
-
-                st.session_state.status_updates[sel_booking] = {
-                    "type": update_type,
-                    "actual_time_utc": actual_time_utc.isoformat(),
-                    "delta_min": delta_min,
-                    "status": status,
-                }
-                upsert_status(sel_booking, update_type, status, actual_time_utc.isoformat(), delta_min)
-                st.success(f"Applied update to {sel_booking}: {status} (Δ {delta_min} min)")
-            else:
-                st.error("Booking not found in the current dataset.")
-
-    if st.session_state.get("status_updates"):
-        st.write("Current updates (session):")
-        st.json(st.session_state.status_updates)
-
-# ============================
-# Email Ingestion (Paste or .eml)
-# ============================
-st.markdown("### Email Ingestion (Paste or Upload .eml)")
-with st.expander("Ingest a FlightBridge email to auto-update status"):
-    c_up1, c_up2 = st.columns([1, 1])
-    with c_up1:
-        eml_file = st.file_uploader("Upload .eml", type=["eml"], key="eml_upload")
-    with c_up2:
-        st.caption("…or paste the email contents below")
-
-    subj_input = st.text_input("Email Subject", value="")
-    body_input = st.text_area("Email Body", value="", height=200)
-
-    def parse_eml(file) -> tuple[str, str]:
-        if not file:
-            return "", ""
-        try:
-            msg = BytesParser(policy=policy.default).parsebytes(file.read())
-            subj = msg.get("subject", "")
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_content()
-                        break
-                if not body:
-                    for part in msg.walk():
-                        if part.get_content_type().startswith("text/"):
-                            body = part.get_content()
-                            break
-            else:
-                body = msg.get_content()
-            return subj or "", body or ""
-        except Exception as e:
-            st.error(f"Failed to parse .eml: {e}")
-            return "", ""
-
-    if eml_file is not None:
-        subj_parsed, body_parsed = parse_eml(eml_file)
-        if subj_parsed and not subj_input: subj_input = subj_parsed
-        if body_parsed and not body_input: body_input = body_parsed
-
-    if st.button("Parse Email"):
-        text = (subj_input or "") + "\n" + (body_input or "")
-        if not text.strip():
-            st.warning("Please upload a .eml or paste Subject/Body.")
-        else:
-            now_utc = datetime.now(timezone.utc)
-            subj_info = parse_subject_line(subj_input or "", now_utc)
-            event_choice = subj_info.get("event_type")
-            actual_dt_utc = subj_info.get("actual_time_utc")
-
-            if not event_choice:
-                event_choice = extract_event(text)
-            if actual_dt_utc is None:
-                actual_dt_utc = parse_any_datetime_to_utc(text) or now_utc
-
-            cand_tails = []
-            if subj_info.get("tail"): cand_tails.append(subj_info["tail"])
-            cand_tails += re.findall(r"\bC-[A-Z0-9]{4}\b", text)
-            cand_tails = sorted(set(cand_tails))
-
-            cand_bookings, _, _ = extract_candidates(text)
-            booking_choice = cand_bookings[0] if cand_bookings else None
-
-            if not booking_choice and cand_tails and actual_dt_utc:
-                rows = df_clean[df_clean["Aircraft"].isin(cand_tails)].copy()
-                if not rows.empty:
-                    if event_choice in ("Arrival", "ArrivalForecast"):
-                        rows["Δ"] = (rows["ETA_UTC"] - actual_dt_utc).abs()
-                    else:
-                        rows["Δ"] = (rows["ETD_UTC"] - actual_dt_utc).abs()
-                    rows = rows.sort_values("Δ")
-                    if not rows.empty and rows.iloc[0]["Δ"] <= pd.Timedelta(hours=12):
-                        booking_choice = rows.iloc[0]["Booking"]
-
-            if not booking_choice:
-                booking_choice = st.selectbox("Select booking (fallback)", df_clean["Booking"].unique().tolist())
-
-            row = df_clean[df_clean["Booking"] == booking_choice]
-            planned = None
-            if not row.empty:
-                planned = row["ETA_UTC"].iloc[0] if event_choice in ("Arrival", "ArrivalForecast") else row["ETD_UTC"].iloc[0]
-            delta_min = None
-            if planned is not None and pd.notna(planned):
-                delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
-
-            if event_choice == "Diversion":
-                status = f"🔷 DIVERTED to {subj_info.get('to_airport','—')}"
-            elif event_choice == "ArrivalForecast":
-                status = "🟦 ARRIVING SOON"
-            elif event_choice == "Arrival":
-                status = "🟣 ARRIVED" if (delta_min is None or abs(delta_min) < int(delay_threshold_min)) else "🟠 LATE ARRIVAL"
-            else:
-                status = "🟢 DEPARTED" if (delta_min is None or abs(delta_min) < int(delay_threshold_min)) else "🔴 DELAY"
-
-            st.write(f"Proposed status for **{booking_choice}**: **{status}** (Δ {delta_min} min)")
-
-            if st.button("Apply parsed update"):
-                st.session_state.setdefault("status_updates", {})
-                st.session_state["status_updates"][booking_choice] = {
-                    "type": event_choice or "Unknown",
-                    "actual_time_utc": actual_dt_utc.isoformat(),
-                    "delta_min": delta_min,
-                    "status": status,
-                }
-                upsert_status(booking_choice, event_choice or "Unknown", status, actual_dt_utc.isoformat(), delta_min)
-                st.success(f"Applied update to {booking_choice}: {status} (Δ {delta_min} min)")
+st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
 # ============================
 # Mailbox Polling (IMAP)
@@ -654,11 +502,12 @@ def imap_poll_once(max_to_process: int = 25) -> int:
         except: pass
         return 0
 
-    # Search
+    # Search for only newer UIDs (server-side) for speed
+    last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
     if IMAP_SENDER:
-        typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"')
+        typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
     else:
-        typ, data = M.uid('search', None, 'ALL')
+        typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
     if typ != "OK":
         st.error("IMAP search failed")
         M.logout()
@@ -669,14 +518,8 @@ def imap_poll_once(max_to_process: int = 25) -> int:
         M.logout()
         return 0
 
-    last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
-    new_uids = [u for u in uids if u > last_uid]
-    if not new_uids:
-        M.logout()
-        return 0
-
     applied = 0
-    for uid in sorted(new_uids)[:max_to_process]:
+    for uid in sorted(uids)[:max_to_process]:
         typ, msg_data = M.uid('fetch', str(uid), '(RFC822)')
         if typ != "OK" or not msg_data or not msg_data[0]:
             set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
