@@ -354,7 +354,7 @@ df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
-    "Sched FT", "PIC", "SIC", "Workflow", "Status"
+    "PIC", "SIC", "Workflow", "Status"
 ]
 
 st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
