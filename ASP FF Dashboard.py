@@ -194,17 +194,6 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
     except Exception:
         return None
 
-def default_status(dep_utc: pd.Timestamp, eta_utc: pd.Timestamp) -> str:
-    # Kept for reference; not used to auto-flip
-    now = datetime.now(timezone.utc)
-    if pd.notna(dep_utc) and now < dep_utc:
-        return "🟡 SCHEDULED"
-    if pd.notna(dep_utc) and now >= dep_utc and (pd.isna(eta_utc) or now < eta_utc):
-        return "🟢 DEPARTED"
-    if pd.notna(eta_utc) and now >= eta_utc:
-        return "🟣 ARRIVED"
-    return "🟡 SCHEDULED"
-
 # ---------- Subject-aware parsing ----------
 SUBJ_TAIL_RE = re.compile(r"\bC-[A-Z0-9]{4}\b")
 SUBJ_CALLSIGN_RE = re.compile(r"\bASP\d{3,4}\b")
@@ -377,43 +366,88 @@ def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dic
         return info
     return info
 
+# ============================
+# CSV IATA/ICAO support
+# ============================
+def normalize_iata(code: str) -> str:
+    c = (code or "").strip().upper()
+    return c if len(c) == 3 else ""
+
+def derive_iata_from_icao(icao: str) -> str:
+    c = (icao or "").strip().upper()
+    # Common NA heuristic: C/K + IATA (e.g., CYVR→YVR, KLAX→LAX)
+    if len(c) == 4 and c[0] in ("C", "K"):
+        return c[1:]
+    return ""
+
+def display_airport(icao: str, iata: str) -> str:
+    i = (icao or "").strip().upper()
+    a = (iata or "").strip().upper()
+    if i and len(i) == 4:
+        return i
+    if a and len(a) == 3:
+        return a
+    return "—"
+
 # ---- Airport-aware, tight-window chooser for booking when not in email ----
 def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, event_dt_utc: datetime) -> str | None:
     if event_dt_utc is None or event not in ("Arrival", "ArrivalForecast", "Departure", "Diversion"):
         return None
     cand = df_clean.copy()
 
-    # Narrow by tail if present
+    # Filter by tail if present
     if tails:
         cand = cand[cand["Aircraft"].isin(tails)]
         if cand.empty:
             return None
 
-    # Narrow by airports
-    at_ap   = subj_info.get("at_airport")
-    from_ap = subj_info.get("from_airport")
-    to_ap   = subj_info.get("to_airport")
+    # Raw tokens from subject/body (could be IATA or ICAO)
+    raw_at   = (subj_info.get("at_airport") or "").strip().upper()
+    raw_from = (subj_info.get("from_airport") or "").strip().upper()
+    raw_to   = (subj_info.get("to_airport") or "").strip().upper()
 
+    def match_token(cdf, col_iata, col_icao, token):
+        if not token:
+            return cdf
+        tok_iata = normalize_iata(token)
+        tok_icao = token if len(token) == 4 else None
+        if tok_iata and tok_icao:
+            mask = (cdf[col_iata] == tok_iata) | (cdf[col_icao] == tok_icao)
+        elif tok_iata:
+            mask = (cdf[col_iata] == tok_iata)
+        elif tok_icao:
+            mask = (cdf[col_icao] == tok_icao)
+        else:
+            return cdf
+        return cdf[mask]
+
+    # Apply by event type
     if event in ("Arrival", "ArrivalForecast"):
-        if at_ap:   cand = cand[cand["To"] == at_ap]
-        if from_ap: cand = cand[cand["From"] == from_ap]
+        if raw_at:
+            cand = match_token(cand, "To_IATA", "To_ICAO", raw_at)
+        if raw_from:
+            cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETA_UTC"
     elif event == "Departure":
-        if from_ap: cand = cand[cand["From"] == from_ap]
-        if to_ap:   cand = cand[cand["To"] == to_ap]
+        if raw_from:
+            cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
+        if raw_to:
+            cand = match_token(cand, "To_IATA", "To_ICAO", raw_to)
         sched_col = "ETD_UTC"
     else:  # Diversion → match pre-diversion leg; use dep side if given
-        if from_ap: cand = cand[cand["From"] == from_ap]
+        if raw_from:
+            cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETD_UTC"
 
     if cand.empty:
         return None
 
+    # Nearest by time with sane window
     cand = cand.copy()
     cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
     cand = cand.sort_values("Δ")
 
-    MAX_WINDOW = pd.Timedelta(hours=3)
+    MAX_WINDOW = pd.Timedelta(hours=3)  # tune if needed
     best = cand.iloc[0]
     return best["Booking"] if best["Δ"] <= MAX_WINDOW else None
 
@@ -476,7 +510,7 @@ else:
         df_raw = _load_csv_from_bytes(content)
         st.caption(
             f"Loaded CSV from storage: **{st.session_state['csv_name']}** "
-            f"(uploaded {st.session_state['uploaded_at']})"
+            f"(uploaded {st.session_state['csv_uploaded_at']})"
         )
     else:
         st.info("Upload today’s FL3XX flights CSV to begin.")
@@ -497,8 +531,25 @@ if missing:
     st.stop()
 
 df = df_raw.copy()
+
+# Scheduled times
 df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
 df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
+
+# Canonical ICAO fields (uppercase)
+df["From_ICAO"] = df["From (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
+df["To_ICAO"]   = df["To (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
+
+# Optional IATA columns: use if present; otherwise derive from ICAO heuristic
+if "From (IATA)" in df_raw.columns:
+    df["From_IATA"] = df_raw["From (IATA)"].astype(str).str.strip().str.upper()
+else:
+    df["From_IATA"] = df["From_ICAO"].apply(derive_iata_from_icao)
+
+if "To (IATA)" in df_raw.columns:
+    df["To_IATA"] = df_raw["To (IATA)"].astype(str).str.strip().str.upper()
+else:
+    df["To_IATA"] = df["To_ICAO"].apply(derive_iata_from_icao)
 
 # Filter out fake/non-tail rows
 df["is_real_leg"] = df["Aircraft"].apply(is_real_tail)
@@ -507,8 +558,10 @@ df = df[df["is_real_leg"]].copy()
 # Classify & format
 df["Type"] = df["Account"].apply(classify_account)
 df["TypeBadge"] = df["Type"].apply(type_badge)
-df["From"] = df["From (ICAO)"].fillna("—").replace({"nan": "—"})
-df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
+
+# Display airports: prefer ICAO if present, else IATA
+df["From"] = [display_airport(i, a) for i, a in zip(df["From_ICAO"], df["From_IATA"])]
+df["To"]   = [display_airport(i, a) for i, a in zip(df["To_ICAO"], df["To_IATA"])]
 df["Route"] = df["From"] + " → " + df["To"]
 # df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
 
@@ -517,7 +570,7 @@ now_utc = datetime.now(timezone.utc)
 df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
 df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 
-# Keep pre-filter copy for matching
+# Keep pre-filter copy for matching and lookups
 df_clean = df.copy()
 
 # ============================
@@ -567,7 +620,7 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
 # Compute Status
 df["Status"] = [compute_status_row(b, dep, eta) for b, dep, eta in zip(df["Booking"], df["ETD_UTC"], df["ETA_UTC"])]
 
-# Build FA time columns from events_map
+# FlightAware time columns from events_map
 dep_actual_list = []
 eta_fore_list   = []
 arr_actual_list = []
@@ -593,6 +646,7 @@ df.loc[has_arr_series, "Arrives In"] = "—"
 # ============================
 st.markdown("### Quick Filters")
 tails_opts = sorted(df["Aircraft"].dropna().unique().tolist())
+# Build airport options from displayed codes (already ICAO else IATA)
 airports_opts = sorted(pd.unique(pd.concat([df["From"].fillna("—"), df["To"].fillna("—")], ignore_index=True)).tolist())
 workflows_opts = sorted(df["Workflow"].fillna("").unique().tolist())
 
@@ -640,12 +694,17 @@ IMAP_HOST = st.secrets.get("IMAP_HOST")
 IMAP_USER = st.secrets.get("IMAP_USER")
 IMAP_PASS = st.secrets.get("IMAP_PASS")
 IMAP_FOLDER = st.secrets.get("IMAP_FOLDER", "INBOX")
-IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., "noreply@flightbridge.com"
+IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., alerts@flightaware.com
+
+if IMAP_SENDER:
+    st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
+else:
+    st.caption("IMAP filter: **From = ALL senders**")
 
 enable_poll = st.checkbox("Enable IMAP polling", value=False,
-                          help="Poll the mailbox for FlightBridge alerts and auto-apply updates.")
+                          help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.")
 
-def imap_poll_once(max_to_process: int = 25) -> int:
+def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
     M = imaplib.IMAP4_SSL(IMAP_HOST)
@@ -662,12 +721,17 @@ def imap_poll_once(max_to_process: int = 25) -> int:
         except: pass
         return 0
 
-    # Search only newer UIDs (server-side)
+    # Search only newer UIDs (server-side) with fallback if FROM filter yields nothing
     last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
     if IMAP_SENDER:
         typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
+        if typ != "OK" or not data or not data[0]:
+            if debug:
+                st.warning(f'No matches for FROM filter "{IMAP_SENDER}". Falling back to unfiltered UID search.')
+            typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
     else:
         typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
+
     if typ != "OK":
         st.error("IMAP search failed")
         M.logout()
@@ -723,15 +787,15 @@ def imap_poll_once(max_to_process: int = 25) -> int:
             else:
                 actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
 
-            # Enrich airports from body if present
+            # Enrich airports from body if present (keep raw token; matcher will check IATA/ICAO)
             if body_info.get("from") and not subj_info.get("from_airport"):
-                subj_info["from_airport"] = body_info["from"]
+                subj_info["from_airport"] = body_info["from"].upper()
             if body_info.get("to") and not subj_info.get("to_airport"):
-                subj_info["to_airport"] = body_info["to"]
+                subj_info["to_airport"] = body_info["to"].upper()
             if body_info.get("at") and not subj_info.get("at_airport"):
-                subj_info["at_airport"] = body_info["at"]
+                subj_info["at_airport"] = body_info["at"].upper()
 
-            # Booking directly from text; else choose by tail+airports+tight window
+            # Booking directly from text; else choose by tail+airports+tight time window
             bookings = extract_candidates(text)[0]
             booking = bookings[0] if bookings else None
 
@@ -792,6 +856,19 @@ def imap_poll_once(max_to_process: int = 25) -> int:
                 }
                 upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", eta_iso, None)
 
+            if debug:
+                st.write({
+                    "uid": uid,
+                    "subject": subject,
+                    "event": event,
+                    "from_airport": subj_info.get("from_airport"),
+                    "to_airport": subj_info.get("to_airport"),
+                    "at_airport": subj_info.get("at_airport"),
+                    "tails": tails,
+                    "actual_dt_utc": actual_dt_utc.isoformat() if actual_dt_utc else None,
+                    "booking": booking,
+                })
+
             applied += 1
         finally:
             set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
@@ -804,16 +881,23 @@ if enable_poll:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
     else:
-        c_poll1, c_poll2 = st.columns([1,1])
+        c_poll1, c_poll2, c_poll3 = st.columns([1,1,1])
         with c_poll1:
-            if st.button("Poll now"):
-                applied = imap_poll_once()
-                st.success(f"Applied {applied} update(s) from mailbox.")
+            debug_poll = st.checkbox("Debug IMAP (verbose)", value=False)
         with c_poll2:
             poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
+        with c_poll3:
+            if st.button("Reset IMAP cursor only"):
+                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
+                st.success("IMAP cursor reset to 0 (statuses preserved).")
+
+        if st.button("Poll now"):
+            applied = imap_poll_once(debug=debug_poll)
+            st.success(f"Applied {applied} update(s) from mailbox.")
+
         if poll_on_refresh:
             try:
-                applied = imap_poll_once()
+                applied = imap_poll_once(debug=debug_poll)
                 if applied:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
