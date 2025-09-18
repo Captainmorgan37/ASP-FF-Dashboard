@@ -8,6 +8,8 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dateparse
+from email import policy
+from email.parser import BytesParser
 
 # ============================
 # Page config
@@ -18,6 +20,9 @@ st.caption(
     "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
 )
+
+# Safe default so functions don't crash before a CSV is loaded
+df_clean = pd.DataFrame(columns=["Booking", "ETD_UTC", "ETA_UTC", "Aircraft"])
 
 # ============================
 # Auto-refresh controls (no page reload fallback)
@@ -39,7 +44,7 @@ if auto_refresh:
         )
 
 # ============================
-# SQLite persistence (statuses + CSV)
+# SQLite persistence (statuses + CSV + email cursor)
 # ============================
 DB_PATH = "status_store.db"
 
@@ -187,15 +192,13 @@ def default_status(dep_utc: pd.Timestamp, eta_utc: pd.Timestamp) -> str:
     return "🟡 SCHEDULED"
 
 def utc_datetime_picker(label: str, default_dt_utc: datetime) -> datetime:
-    # (left in place; unused now that simulator is removed)
     d = st.date_input(f"{label} — Date (UTC)", value=default_dt_utc.date(), key=f"{label}-date")
     t = st.time_input(f"{label} — Time (UTC)", value=default_dt_utc.time().replace(microsecond=0), key=f"{label}-time")
     return datetime.combine(d, t).replace(tzinfo=timezone.utc)
 
-# ---------- Subject-aware parsing (named groups for reliability) ----------
+# ---------- Subject-aware parsing ----------
 SUBJ_TAIL_RE = re.compile(r"\bC-[A-Z0-9]{4}\b")
 SUBJ_CALLSIGN_RE = re.compile(r"\bASP\d{3,4}\b")
-
 SUBJ_PATTERNS = {
     "Arrival": re.compile(
         r"\barrived\b.*\bat\s+(?P<at>[A-Z]{3,4})\b(?:.*\bfrom\s+(?P<from>[A-Z]{3,4})\b)?",
@@ -261,7 +264,6 @@ def parse_subject_line(subject: str, now_utc: datetime):
     return result
 
 def parse_any_datetime_to_utc(text: str) -> datetime | None:
-    # ISO-ish
     m_iso = re.search(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+\-]\d{2}:?\d{2})?", text)
     if m_iso:
         try:
@@ -271,7 +273,6 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
             return dt.astimezone(timezone.utc)
         except Exception:
             pass
-    # dd.mm.yyyy HH:MMZ-like or "Sep 18, 2025 01:23 UTC"
     m2_date = re.search(r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b", text)
     m2_time = re.search(r"\b(\d{1,2}:\d{2}(:\d{2})?)\s*(Z|UTC|[+\-]\d{2}:?\d{2}|[A-Z]{2,4})?\b", text, re.I)
     try_strings = []
@@ -280,7 +281,6 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
     elif m2_time:
         assumed = datetime.now(timezone.utc).strftime("%Y-%m-%d ") + m2_time.group(0)
         try_strings.append(assumed)
-
     for s in try_strings:
         try:
             dt = dateparse.parse(s, fuzzy=True)
@@ -398,6 +398,7 @@ df["TypeBadge"] = df["Type"].apply(type_badge)
 df["From"] = df["From (ICAO)"].fillna("—").replace({"nan": "—"})
 df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
 df["Route"] = df["From"] + " → " + df["To"]
+# (You hid Sched FT from the table; compute optional)
 # df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
 
 # Relative time columns
@@ -405,47 +406,30 @@ now_utc = datetime.now(timezone.utc)
 df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
 df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 
+# Default status
+df["Status"] = [default_status(dep, eta) for dep, eta in zip(df["ETD_UTC"], df["ETA_UTC"])]
+
+# Keep pre-filter copy for lookups
+df_clean = df.copy()
+
 # ============================
-# Build event map (persisted + in-session) and compute status
+# Merge persisted statuses (priority: Diversion > Arrival > ArrivalForecast > Departure > default)
 # ============================
-events_map = load_status_map()
-# Overlay in-session updates (from IMAP polling this run) into events_map
-if st.session_state.get("status_updates"):
-    for b, upd in st.session_state["status_updates"].items():
-        et = upd.get("type") or "Unknown"
-        events_map.setdefault(b, {})[et] = upd
+persisted = load_status_map()
+def merged_status(booking, default_val):
+    rec = persisted.get(booking, {})
+    if "Diversion" in rec: return rec["Diversion"]["status"]
+    if "Arrival" in rec: return rec["Arrival"]["status"]
+    if "ArrivalForecast" in rec: return rec["ArrivalForecast"]["status"]
+    if "Departure" in rec: return rec["Departure"]["status"]
+    return default_val
 
-def compute_status_row(booking, dep_utc, eta_utc) -> str:
-    rec = events_map.get(booking, {})
-    now = datetime.now(timezone.utc)
-    thr = timedelta(minutes=int(delay_threshold_min))
+df["Status"] = [merged_status(b, s) for b, s in zip(df["Booking"], df["Status"])]
 
-    # Hard-priority events from emails
-    if "Diversion" in rec:
-        return rec["Diversion"]["status"]
-    if "Arrival" in rec:
-        return rec["Arrival"]["status"]
-    if "ArrivalForecast" in rec:
-        return "🟦 ARRIVING SOON"
-
-    # We have a DEP email but not ARR yet
-    if "Departure" in rec:
-        if pd.notna(eta_utc) and now >= eta_utc + thr:
-            return "🟠 LATE ARRIVAL"  # departed, but overdue to arrive
-        return "🟢 DEPARTED"         # departed and not yet overdue
-
-    # No emails at all → schedule-based, but DON'T assume movement without email
-    if pd.notna(dep_utc):
-        if now < dep_utc:
-            return "🟡 SCHEDULED"
-        # Past ETD with no dep email ⇒ treat as delay (after threshold)
-        return "🔴 DELAY" if (now - dep_utc) >= thr else "🟡 SCHEDULED"
-
-    return "🟡 SCHEDULED"
-
-# Compute status per row using the email-driven logic above
-df["Status"] = [compute_status_row(b, dep, eta) for b, dep, eta in zip(df["Booking"], df["ETD_UTC"], df["ETA_UTC"])]
-
+# Overlay in-session updates if present
+if "status_updates" in st.session_state and st.session_state["status_updates"]:
+    su = st.session_state["status_updates"]
+    df["Status"] = [su.get(b, {}).get("status", s) for b, s in zip(df["Booking"], df["Status"])]
 
 # ============================
 # Quick Filters
@@ -487,10 +471,160 @@ display_cols = [
 ]
 st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
-st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+st.dataframe(df[display_cols], use_container_width=True)
 
 # ============================
-# Mailbox Polling (IMAP)
+# Email Updates (Simulator)
+# ============================
+st.markdown("### Email Updates (Simulator)")
+with st.expander("Simulate a FlightBridge email alert → update status / detect delays"):
+    if "status_updates" not in st.session_state:
+        st.session_state.status_updates = {}
+
+    booking_choices = df_clean["Booking"].unique().tolist()
+    if booking_choices:
+        sel_booking = st.selectbox("Booking to update", booking_choices)
+        update_type = st.radio("Alert Type", ["Departure", "Arrival"], horizontal=True)
+        actual_time_utc = utc_datetime_picker("Actual time", datetime.now(timezone.utc))
+
+        if st.button("Apply Update"):
+            row = df_clean[df_clean["Booking"] == sel_booking]
+            if not row.empty:
+                planned = row["ETD_UTC"].iloc[0] if update_type == "Departure" else row["ETA_UTC"].iloc[0]
+                delta_min = None
+                if pd.notna(planned):
+                    delta_min = int(round((actual_time_utc - planned).total_seconds() / 60.0))
+                status = "🟢 DEPARTED" if update_type == "Departure" else "🟣 ARRIVED"
+                if delta_min is not None and abs(delta_min) >= int(delay_threshold_min):
+                    status = "🔴 DELAY" if update_type == "Departure" else "🟠 LATE ARRIVAL"
+
+                st.session_state.status_updates[sel_booking] = {
+                    "type": update_type,
+                    "actual_time_utc": actual_time_utc.isoformat(),
+                    "delta_min": delta_min,
+                    "status": status,
+                }
+                upsert_status(sel_booking, update_type, status, actual_time_utc.isoformat(), delta_min)
+                st.success(f"Applied update to {sel_booking}: {status} (Δ {delta_min} min)")
+            else:
+                st.error("Booking not found in the current dataset.")
+
+    if st.session_state.get("status_updates"):
+        st.write("Current updates (session):")
+        st.json(st.session_state.status_updates)
+
+# ============================
+# Email Ingestion (Paste or .eml)
+# ============================
+st.markdown("### Email Ingestion (Paste or Upload .eml)")
+with st.expander("Ingest a FlightBridge email to auto-update status"):
+    c_up1, c_up2 = st.columns([1, 1])
+    with c_up1:
+        eml_file = st.file_uploader("Upload .eml", type=["eml"], key="eml_upload")
+    with c_up2:
+        st.caption("…or paste the email contents below")
+
+    subj_input = st.text_input("Email Subject", value="")
+    body_input = st.text_area("Email Body", value="", height=200)
+
+    def parse_eml(file) -> tuple[str, str]:
+        if not file:
+            return "", ""
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(file.read())
+            subj = msg.get("subject", "")
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_content()
+                        break
+                if not body:
+                    for part in msg.walk():
+                        if part.get_content_type().startswith("text/"):
+                            body = part.get_content()
+                            break
+            else:
+                body = msg.get_content()
+            return subj or "", body or ""
+        except Exception as e:
+            st.error(f"Failed to parse .eml: {e}")
+            return "", ""
+
+    if eml_file is not None:
+        subj_parsed, body_parsed = parse_eml(eml_file)
+        if subj_parsed and not subj_input: subj_input = subj_parsed
+        if body_parsed and not body_input: body_input = body_parsed
+
+    if st.button("Parse Email"):
+        text = (subj_input or "") + "\n" + (body_input or "")
+        if not text.strip():
+            st.warning("Please upload a .eml or paste Subject/Body.")
+        else:
+            now_utc = datetime.now(timezone.utc)
+            subj_info = parse_subject_line(subj_input or "", now_utc)
+            event_choice = subj_info.get("event_type")
+            actual_dt_utc = subj_info.get("actual_time_utc")
+
+            if not event_choice:
+                event_choice = extract_event(text)
+            if actual_dt_utc is None:
+                actual_dt_utc = parse_any_datetime_to_utc(text) or now_utc
+
+            cand_tails = []
+            if subj_info.get("tail"): cand_tails.append(subj_info["tail"])
+            cand_tails += re.findall(r"\bC-[A-Z0-9]{4}\b", text)
+            cand_tails = sorted(set(cand_tails))
+
+            cand_bookings, _, _ = extract_candidates(text)
+            booking_choice = cand_bookings[0] if cand_bookings else None
+
+            if not booking_choice and cand_tails and actual_dt_utc:
+                rows = df_clean[df_clean["Aircraft"].isin(cand_tails)].copy()
+                if not rows.empty:
+                    if event_choice in ("Arrival", "ArrivalForecast"):
+                        rows["Δ"] = (rows["ETA_UTC"] - actual_dt_utc).abs()
+                    else:
+                        rows["Δ"] = (rows["ETD_UTC"] - actual_dt_utc).abs()
+                    rows = rows.sort_values("Δ")
+                    if not rows.empty and rows.iloc[0]["Δ"] <= pd.Timedelta(hours=12):
+                        booking_choice = rows.iloc[0]["Booking"]
+
+            if not booking_choice:
+                booking_choice = st.selectbox("Select booking (fallback)", df_clean["Booking"].unique().tolist())
+
+            row = df_clean[df_clean["Booking"] == booking_choice]
+            planned = None
+            if not row.empty:
+                planned = row["ETA_UTC"].iloc[0] if event_choice in ("Arrival", "ArrivalForecast") else row["ETD_UTC"].iloc[0]
+            delta_min = None
+            if planned is not None and pd.notna(planned):
+                delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
+
+            if event_choice == "Diversion":
+                status = f"🔷 DIVERTED to {subj_info.get('to_airport','—')}"
+            elif event_choice == "ArrivalForecast":
+                status = "🟦 ARRIVING SOON"
+            elif event_choice == "Arrival":
+                status = "🟣 ARRIVED" if (delta_min is None or abs(delta_min) < int(delay_threshold_min)) else "🟠 LATE ARRIVAL"
+            else:
+                status = "🟢 DEPARTED" if (delta_min is None or abs(delta_min) < int(delay_threshold_min)) else "🔴 DELAY"
+
+            st.write(f"Proposed status for **{booking_choice}**: **{status}** (Δ {delta_min} min)")
+
+            if st.button("Apply parsed update"):
+                st.session_state.setdefault("status_updates", {})
+                st.session_state["status_updates"][booking_choice] = {
+                    "type": event_choice or "Unknown",
+                    "actual_time_utc": actual_dt_utc.isoformat(),
+                    "delta_min": delta_min,
+                    "status": status,
+                }
+                upsert_status(booking_choice, event_choice or "Unknown", status, actual_dt_utc.isoformat(), delta_min)
+                st.success(f"Applied update to {booking_choice}: {status} (Δ {delta_min} min)")
+
+# ============================
+# Mailbox Polling (IMAP) — argument-driven (no global df_clean)
 # ============================
 st.markdown("### Mailbox Polling")
 IMAP_HOST = st.secrets.get("IMAP_HOST")
@@ -502,9 +636,19 @@ IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., "noreply@flightbridge.com"
 enable_poll = st.checkbox("Enable IMAP polling", value=False,
                           help="Poll the mailbox for FlightBridge alerts and auto-apply updates.")
 
-def imap_poll_once(max_to_process: int = 25) -> int:
+# Don't allow polling until a CSV is loaded
+if df_clean is None or df_clean.empty:
+    st.info("Load a flights CSV before enabling polling.")
+    enable_poll = False
+
+def imap_poll_once(schedule_df: pd.DataFrame, delay_threshold_min: int, max_to_process: int = 25) -> int:
+    # No mailbox creds? nothing to do.
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
+    # No schedule loaded yet? skip cleanly.
+    if schedule_df is None or schedule_df.empty:
+        return 0
+
     M = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
         M.login(IMAP_USER, IMAP_PASS)
@@ -519,12 +663,11 @@ def imap_poll_once(max_to_process: int = 25) -> int:
         except: pass
         return 0
 
-    # Search for only newer UIDs (server-side) for speed
-    last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
+    # Search
     if IMAP_SENDER:
-        typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
+        typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"')
     else:
-        typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
+        typ, data = M.uid('search', None, 'ALL')
     if typ != "OK":
         st.error("IMAP search failed")
         M.logout()
@@ -535,8 +678,16 @@ def imap_poll_once(max_to_process: int = 25) -> int:
         M.logout()
         return 0
 
+    last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
+    new_uids = [u for u in uids if u > last_uid]
+    if not new_uids:
+        M.logout()
+        return 0
+
+    valid_bookings = set(schedule_df["Booking"].astype(str).unique().tolist())
+
     applied = 0
-    for uid in sorted(uids)[:max_to_process]:
+    for uid in sorted(new_uids)[:max_to_process]:
         typ, msg_data = M.uid('fetch', str(uid), '(RFC822)')
         if typ != "OK" or not msg_data or not msg_data[0]:
             set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
@@ -575,17 +726,19 @@ def imap_poll_once(max_to_process: int = 25) -> int:
             if actual_dt_utc is None:
                 actual_dt_utc = parse_any_datetime_to_utc(text) or now_utc
 
-            # Booking
-            bookings = extract_candidates(text)[0]
+            # Booking from text, filtered to today's valid bookings
+            bookings_in_text = set(re.findall(r"\b([A-Z0-9]{5})\b", text))
+            bookings = sorted(list(valid_bookings & bookings_in_text))
             booking = bookings[0] if bookings else None
 
+            # Fallback by tail + time proximity
             tails = []
             if subj_info.get("tail"): tails.append(subj_info["tail"])
             tails += re.findall(r"\bC-[A-Z0-9]{4}\b", text)
             tails = sorted(set(tails))
 
             if not booking and tails and actual_dt_utc:
-                rows = df_clean[df_clean["Aircraft"].isin(tails)].copy()
+                rows = schedule_df[schedule_df["Aircraft"].isin(tails)].copy()
                 if not rows.empty:
                     if event in ("Arrival", "ArrivalForecast"):
                         rows["Δ"] = (rows["ETA_UTC"] - actual_dt_utc).abs()
@@ -599,7 +752,7 @@ def imap_poll_once(max_to_process: int = 25) -> int:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                 continue
 
-            row = df_clean[df_clean["Booking"] == booking]
+            row = schedule_df[schedule_df["Booking"] == booking]
             planned = None
             if not row.empty:
                 planned = row["ETA_UTC"].iloc[0] if event in ("Arrival", "ArrivalForecast") else row["ETD_UTC"].iloc[0]
@@ -639,13 +792,13 @@ if enable_poll:
         c_poll1, c_poll2 = st.columns([1,1])
         with c_poll1:
             if st.button("Poll now"):
-                applied = imap_poll_once()
+                applied = imap_poll_once(df_clean, int(delay_threshold_min))
                 st.success(f"Applied {applied} update(s) from mailbox.")
         with c_poll2:
             poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
         if poll_on_refresh:
             try:
-                applied = imap_poll_once()
+                applied = imap_poll_once(df_clean, int(delay_threshold_min))
                 if applied:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
