@@ -538,6 +538,11 @@ def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, even
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETD_UTC"
+    elif event == "Diversion":
+        if raw_from:
+            cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
+        sched_col = "ETA_UTC"
+
 
     if cand.empty:
         return None
@@ -546,7 +551,7 @@ def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, even
     cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
     cand = cand.sort_values("Δ")
 
-    MAX_WINDOW = pd.Timedelta(hours=3)
+    MAX_WINDOW = pd.Timedelta(hours=12) if event == "Diversion" else pd.Timedelta(hours=3)
     best = cand.iloc[0]
     return best["Booking"] if best["Δ"] <= MAX_WINDOW else None
 
@@ -676,7 +681,7 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
     has_arr  = "Arrival" in rec
     has_div  = "Diversion" in rec
 
-    if has_dep and has_div:
+    if has_div:
         return rec["Diversion"].get("status", "🔷 DIVERTED")
     if has_arr:
         return "🟣 ARRIVED"
