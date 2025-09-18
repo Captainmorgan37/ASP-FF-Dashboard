@@ -713,18 +713,38 @@ if workflows_sel:
 # ============================
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
 
-delay_thr_td = pd.Timedelta(minutes=int(delay_threshold_min))
+# Thresholds
+delay_thr_td = pd.Timedelta(minutes=int(delay_threshold_min))              # e.g., 15m
+row_red_thr_td = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))   # hard floor at 30m
 
-# Delays (positive = later than plan)
+now_utc = datetime.now(timezone.utc)
+
+# --- Row-level: operational "no-email" delays ---
+# A) No Departure email yet: late vs scheduled ETD
+no_dep = ~has_dep_series
+dep_lateness = now_utc - df["ETD_UTC"]
+row_dep_yellow = df["ETD_UTC"].notna() & no_dep & (dep_lateness > delay_thr_td) & (dep_lateness < row_red_thr_td)
+row_dep_red    = df["ETD_UTC"].notna() & no_dep & (dep_lateness >= row_red_thr_td)
+
+# B) Departure email exists but no Arrival yet: late vs ETA baseline (prefer ETA(FA), else scheduled ETA)
+has_dep = has_dep_series
+no_arr = ~has_arr_series
+eta_baseline = df["_ETA_FA_ts"].where(df["_ETA_FA_ts"].notna(), df["ETA_UTC"])
+eta_lateness = now_utc - eta_baseline
+row_arr_yellow = eta_baseline.notna() & has_dep & no_arr & (eta_lateness > delay_thr_td) & (eta_lateness < row_red_thr_td)
+row_arr_red    = eta_baseline.notna() & has_dep & no_arr & (eta_lateness >= row_red_thr_td)
+
+row_yellow = row_dep_yellow | row_arr_yellow
+row_red    = row_dep_red    | row_arr_red
+
+# --- Cell-level: planned/forecast vs actual deltas (> threshold) ---
 dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # Off-Block (Actual) - Off-Block (Est)
 eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Est)
 arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # On-Block (Actual) - On-Block (Est)
 
-mask_dep          = dep_delay.notna()       & (dep_delay       > delay_thr_td)
-mask_eta_vs_sched = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
-mask_sched        = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
-
-row_is_delayed = (mask_dep | mask_eta_vs_sched | mask_sched)
+cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
+cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
+cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
@@ -733,31 +753,43 @@ display_cols = [
     "Departs In", "Arrives In",
     "PIC", "SIC", "Workflow", "Status"
 ]
-
 df_display = df[display_cols].copy()
 
-def _highlight_delays(x):
-    # Translucent red fill + left accent bar; keeps text color unchanged (white in dark mode)
-    row_css = (
-        "background-color: rgba(255, 82, 82, 0.16);"
-        "border-left: 6px solid #ff5252;"
-    )
+def _style_ops(x: pd.DataFrame):
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
-    styles.loc[row_is_delayed.reindex(x.index, fill_value=False), :] = row_css
-    return styles
 
+    # Row backgrounds (dark-mode friendly)
+    row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
+    row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
+
+    styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
+    styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css  # overrides yellow if both
+
+    # Cell-only red accents for the three comparison rules
+    cell_css = "background-color: rgba(255, 82, 82, 0.25);"
+
+    idx = cell_dep.reindex(x.index, fill_value=False)
+    styles.loc[idx, "Off-Block (Actual)"] += cell_css   # later than sched ETD
+
+    idx = cell_eta.reindex(x.index, fill_value=False)
+    styles.loc[idx, "ETA (FA)"] += cell_css             # FA ETA later than sched ETA
+
+    idx = cell_arr.reindex(x.index, fill_value=False)
+    styles.loc[idx, "On-Block (Actual)"] += cell_css    # actual arrival later than sched ETA
+
+    return styles
 
 st.subheader(f"Schedule  ·  {len(df_display)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
 st.dataframe(
-    df_display.style.hide(axis="index").apply(_highlight_delays, axis=None),
+    df_display.style.hide(axis="index").apply(_style_ops, axis=None),
     use_container_width=True
 )
 st.caption(
-    f"Rows shaded light red indicate > {int(delay_threshold_min)} min delay: "
-    f"Off-Block (Actual) vs Off-Block (Est), ETA (FA) vs On-Block (Est), "
-    f"or On-Block (Actual) vs On-Block (Est)."
+    "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
+    "Cells in red show specific deltas: Off-Block (Actual)>Est, ETA(FA)>On-Block(Est), or On-Block (Actual)>Est."
 )
+
 
 # ============================
 # Mailbox Polling (IMAP)
