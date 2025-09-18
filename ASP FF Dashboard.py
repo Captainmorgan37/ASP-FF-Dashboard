@@ -50,7 +50,7 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS status_events (
             booking TEXT NOT NULL,
-            event_type TEXT NOT NULL,  -- 'Departure' | 'Arrival' | 'ArrivalForecast' | 'Diversion'
+            event_type TEXT NOT NULL,  -- 'Departure' | 'Arrival' | 'ArrivalForecast' | 'Diversion' | 'EDCT'
             status TEXT NOT NULL,      -- canonical label for that event
             actual_time_utc TEXT,
             delta_min INTEGER,
@@ -135,8 +135,6 @@ init_db()
 # ============================
 # Helpers
 # ============================
-
-# --- Timezone map for body tokens like "02:18PM EDT"
 TZINFOS = {
     "UTC":  tzoffset("UTC", 0),
     "GMT":  tzoffset("GMT", 0),
@@ -203,7 +201,6 @@ def classify_account(account_val: str) -> str:
 def type_badge(flight_type: str) -> str:
     return {"OCS": "🟢 OCS", "Owner": "🔵 Owner"}.get(flight_type, "⚪︎")
 
-# Uniform display for UTC datetimes (match CSV look)
 def fmt_dt_utc(dt: datetime | None) -> str:
     if not dt or (isinstance(dt, float) and pd.isna(dt)):
         return "—"
@@ -243,7 +240,6 @@ SUBJ_PATTERNS = {
     ),
 }
 
-# Do not set actual_time_utc from subject for Arrival/Departure/Diversion
 def parse_subject_line(subject: str, now_utc: datetime):
     if not subject:
         return {"event_type": None}
@@ -288,7 +284,6 @@ def parse_subject_line(subject: str, now_utc: datetime):
 
 # ---- Parse explicit datetime anywhere in text ----
 def parse_any_datetime_to_utc(text: str) -> datetime | None:
-    # ISO-ish
     m_iso = re.search(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+\-]\d{2}:?\d{2})?", text)
     if m_iso:
         try:
@@ -298,7 +293,6 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
             return dt.astimezone(timezone.utc)
         except Exception:
             pass
-    # dd.mm.yyyy HH:MMZ-like or "Sep 18, 2025 01:23 UTC" or "02:18PM MDT"
     m2_date = re.search(r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b", text)
     m2_time = re.search(r"\b(\d{1,2}:\d{2}(:\d{2})?)\s*(Z|UTC|[+\-]\d{2}:?\d{2}|[A-Z]{2,4})?\b", text, re.I)
     try_strings = []
@@ -318,6 +312,17 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
             continue
     return None
 
+def parse_any_dt_string_to_utc(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 # Email Date header → UTC
 def get_email_date_utc(msg) -> datetime | None:
     try:
@@ -332,6 +337,8 @@ def get_email_date_utc(msg) -> datetime | None:
         return None
 
 def extract_event(text: str):
+    if re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I):
+        return "EDCT"
     if re.search(r"\bdiverted\b", text, re.I): return "Diversion"
     if re.search(r"\barriv(?:ed|al)\b", text, re.I): return "Arrival"
     if re.search(r"\bdepart(?:ed|ure)\b", text, re.I): return "Departure"
@@ -345,27 +352,34 @@ def extract_candidates(text: str):
     event = extract_event(text)
     return bookings, tails, event
 
-# ---- BODY parsers for first line info ----
+# ---- BODY parsers ----
 BODY_DEPARTURE_RE = re.compile(
     r"departed\s+.*?\((?P<from>[A-Z]{3,4})\)\s+at\s+"
-    r"(?P<dep_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)"
+    r"(?P<dep_time>\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)"
     r".*?en\s*route\s+to\s+.*?\((?P<to>[A-Z]{3,4})\)"
-    r".*?(?:(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s+(?:at|of)\s+"
-    r"(?P<eta_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)))?",
+    r".*?(?:(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s*(?:at|of)?\s+"
+    r"(?P<eta_time>\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)))?",
     re.I
 )
-
 BODY_ARRIVAL_RE = re.compile(
-    r"arrived\s+at\s+.*?\((?P<at>[A-Z]{3,4})\)\s+at\s+(?P<arr_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4})"
+    r"arrived\s+at\s+.*?\((?P<at>[A-Z]{3,4})\)\s+at\s+(?P<arr_time>\d{1,2}:\d{2}\s*[A-Z0-9 ]+)"
     r".*?from\s+.*?\((?P<from>[A-Z]{3,4})\)",
     re.I
 )
-
 ETA_ANY_RE = re.compile(
-    r"(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s+(?:at|of)\s+)"
-    r"(\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)",
+    r"(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s*(?:at|of)?\s+"
+    r"(\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)",
     re.I
 )
+
+# ---- EDCT email parsers ----
+EDCT_FROM_TO_RE = re.compile(
+    r"your flight from\s+(?P<from>[A-Z]{3,4})\s+to\s+(?P<to>[A-Z]{3,4})",
+    re.I
+)
+EDCT_EDCT_RE = re.compile(r"^\s*EDCT:\s*(?P<edct_line>.+)$", re.I | re.M)
+EDCT_EXP_ARR_RE = re.compile(r"^\s*Expected Arrival Time:\s*(?P<eta_line>.+)$", re.I | re.M)
+EDCT_ORIG_DEP_RE = re.compile(r"^\s*Original Departure Time:\s*(?P<orig_line>.+)$", re.I | re.M)
 
 def _parse_time_token_to_utc(time_token: str, base_date_utc: datetime) -> datetime | None:
     if not time_token:
@@ -402,6 +416,30 @@ def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dic
         info["from"] = m.group("from")
         info["arr_time_utc"] = _parse_time_token_to_utc(m.group("arr_time"), email_date_utc)
         return info
+    # If the event wasn't detected as "Departure", try to capture an ETA anywhere.
+    m_eta = ETA_ANY_RE.search(body)
+    if m_eta:
+        info["eta_time_utc"] = _parse_time_token_to_utc(m_eta.group(1), email_date_utc)
+    return info
+
+def parse_body_edct(body: str) -> dict:
+    """Return {'from','to','edct_time_utc','expected_arrival_utc','original_dep_utc'} if present."""
+    info = {}
+    if not body:
+        return info
+    mft = EDCT_FROM_TO_RE.search(body)
+    if mft:
+        info["from"] = mft.group("from").upper()
+        info["to"] = mft.group("to").upper()
+    m_edct = EDCT_EDCT_RE.search(body)
+    if m_edct:
+        info["edct_time_utc"] = parse_any_dt_string_to_utc(m_edct.group("edct_line"))
+    m_eta = EDCT_EXP_ARR_RE.search(body)
+    if m_eta:
+        info["expected_arrival_utc"] = parse_any_dt_string_to_utc(m_eta.group("eta_line"))
+    m_orig = EDCT_ORIG_DEP_RE.search(body)
+    if m_orig:
+        info["original_dep_utc"] = parse_any_dt_string_to_utc(m_orig.group("orig_line"))
     return info
 
 # ============================
@@ -413,7 +451,6 @@ def normalize_iata(code: str) -> str:
 
 def derive_iata_from_icao(icao: str) -> str:
     c = (icao or "").strip().upper()
-    # Common NA heuristic: C/K + IATA (e.g., CYVR→YVR, KLAX→LAX)
     if len(c) == 4 and c[0] in ("C", "K"):
         return c[1:]
     return ""
@@ -427,19 +464,16 @@ def display_airport(icao: str, iata: str) -> str:
         return a
     return "—"
 
-# ---- Airport-aware, tight-window chooser for booking when not in email ----
+# ---- Booking chooser ----
 def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, event_dt_utc: datetime) -> str | None:
-    if event_dt_utc is None or event not in ("Arrival", "ArrivalForecast", "Departure", "Diversion"):
+    if event_dt_utc is None or event not in ("Arrival", "ArrivalForecast", "Departure", "Diversion", "EDCT"):
         return None
     cand = df_clean.copy()
-
-    # Filter by tail if present
     if tails:
         cand = cand[cand["Aircraft"].isin(tails)]
         if cand.empty:
             return None
 
-    # Raw tokens from subject/body (could be IATA or ICAO)
     raw_at   = (subj_info.get("at_airport") or "").strip().upper()
     raw_from = (subj_info.get("from_airport") or "").strip().upper()
     raw_to   = (subj_info.get("to_airport") or "").strip().upper()
@@ -459,20 +493,19 @@ def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, even
             return cdf
         return cdf[mask]
 
-    # Apply by event type
     if event in ("Arrival", "ArrivalForecast"):
         if raw_at:
             cand = match_token(cand, "To_IATA", "To_ICAO", raw_at)
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETA_UTC"
-    elif event == "Departure":
+    elif event in ("Departure", "EDCT"):
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         if raw_to:
             cand = match_token(cand, "To_IATA", "To_ICAO", raw_to)
         sched_col = "ETD_UTC"
-    else:  # Diversion → match pre-diversion leg; use dep side if given
+    else:
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETD_UTC"
@@ -480,12 +513,11 @@ def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, even
     if cand.empty:
         return None
 
-    # Nearest by time with sane window
     cand = cand.copy()
     cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
     cand = cand.sort_values("Δ")
 
-    MAX_WINDOW = pd.Timedelta(hours=3)  # tune if needed
+    MAX_WINDOW = pd.Timedelta(hours=3)
     best = cand.iloc[0]
     return best["Booking"] if best["Δ"] <= MAX_WINDOW else None
 
@@ -503,7 +535,7 @@ with c3:
 delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
 
 # ============================
-# File upload with persistence (session + SQLite)
+# File upload with persistence
 # ============================
 uploaded = st.file_uploader("Upload your daily flights CSV (FL3XX export)", type=["csv"], key="flights_csv")
 
@@ -521,7 +553,7 @@ with btn_cols[0]:
             conn.execute("DELETE FROM email_cursor")
         st.rerun()
 
-# Priority 1: new upload
+# Priority order: upload → session → DB
 if uploaded is not None:
     csv_bytes = uploaded.getvalue()
     st.session_state["csv_bytes"] = csv_bytes
@@ -529,16 +561,12 @@ if uploaded is not None:
     st.session_state["csv_uploaded_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     save_csv_to_db(uploaded.name, csv_bytes)
     df_raw = _load_csv_from_bytes(csv_bytes)
-
-# Priority 2: existing session cache
 elif "csv_bytes" in st.session_state:
     df_raw = _load_csv_from_bytes(st.session_state["csv_bytes"])
     st.caption(
         f"Using cached CSV: **{st.session_state.get('csv_name','flights.csv')}** "
         f"(uploaded {st.session_state.get('csv_uploaded_at','')})"
     )
-
-# Priority 3: DB fallback (fresh session / restart / redeploy)
 else:
     name, content, uploaded_at = load_csv_from_db()
     if content is not None:
@@ -569,16 +597,12 @@ if missing:
     st.stop()
 
 df = df_raw.copy()
-
-# Scheduled times
 df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
 df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
 
-# Canonical ICAO fields (uppercase)
 df["From_ICAO"] = df["From (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
 df["To_ICAO"]   = df["To (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
 
-# Optional IATA columns: use if present; otherwise derive from ICAO heuristic
 if "From (IATA)" in df_raw.columns:
     df["From_IATA"] = df_raw["From (IATA)"].astype(str).str.strip().str.upper()
 else:
@@ -589,33 +613,26 @@ if "To (IATA)" in df_raw.columns:
 else:
     df["To_IATA"] = df["To_ICAO"].apply(derive_iata_from_icao)
 
-# Filter out fake/non-tail rows
 df["is_real_leg"] = df["Aircraft"].apply(is_real_tail)
 df = df[df["is_real_leg"]].copy()
 
-# Classify & format
 df["Type"] = df["Account"].apply(classify_account)
 df["TypeBadge"] = df["Type"].apply(type_badge)
 
-# Display airports: prefer ICAO if present, else IATA
 df["From"] = [display_airport(i, a) for i, a in zip(df["From_ICAO"], df["From_IATA"])]
 df["To"]   = [display_airport(i, a) for i, a in zip(df["To_ICAO"], df["To_IATA"])]
 df["Route"] = df["From"] + " → " + df["To"]
-# df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
 
-# Relative time columns (initial; we'll blank after email checks)
 now_utc = datetime.now(timezone.utc)
 df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
 df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 
-# Keep pre-filter copy for matching and lookups
 df_clean = df.copy()
 
 # ============================
-# Email-driven status + enrich FA times
+# Email-driven status + enrich FA/EDCT times
 # ============================
 events_map = load_status_map()
-# Overlay in-session updates (from this run's IMAP polling)
 if st.session_state.get("status_updates"):
     for b, upd in st.session_state["status_updates"].items():
         et = upd.get("type") or "Unknown"
@@ -630,17 +647,11 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
     has_arr  = "Arrival" in rec
     has_div  = "Diversion" in rec
 
-    # DIVERTED only if a Departure email exists and a Diversion email arrives after
     if has_dep and has_div:
         return rec["Diversion"].get("status", "🔷 DIVERTED")
-
-    # ARRIVED if Arrival email exists
     if has_arr:
         return "🟣 ARRIVED"
-
-    # DEPARTED / LATE ARRIVAL if Departure email exists but no Arrival yet
     if has_dep and not has_arr:
-        # Use forecast ETA if available, else scheduled ETA
         fore_eta = None
         if "ArrivalForecast" in rec:
             fore_eta = parse_iso_to_utc(rec["ArrivalForecast"].get("actual_time_utc"))
@@ -648,35 +659,41 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
         if pd.notna(eta_for_status) and now > eta_for_status + thr:
             return "🟠 LATE ARRIVAL"
         return "🟢 DEPARTED"
-
-    # No Departure email yet: SCHEDULED (grace until ETD+thr) else DELAY
     if pd.notna(dep_utc):
         return "🟡 SCHEDULED" if now <= dep_utc + thr else "🔴 DELAY"
-
     return "🟡 SCHEDULED"
 
-# Compute Status
 df["Status"] = [compute_status_row(b, dep, eta) for b, dep, eta in zip(df["Booking"], df["ETD_UTC"], df["ETA_UTC"])]
 
-# FlightAware time columns from events_map
-dep_actual_list = []
-eta_fore_list   = []
-arr_actual_list = []
-
+# Pull persisted times
+dep_actual_list, eta_fore_list, arr_actual_list, edct_list = [], [], [], []
 for b in df["Booking"]:
     rec = events_map.get(b, {})
     dep_actual_list.append(parse_iso_to_utc(rec.get("Departure", {}).get("actual_time_utc")))
     eta_fore_list.append(parse_iso_to_utc(rec.get("ArrivalForecast", {}).get("actual_time_utc")))
     arr_actual_list.append(parse_iso_to_utc(rec.get("Arrival", {}).get("actual_time_utc")))
+    edct_list.append(parse_iso_to_utc(rec.get("EDCT", {}).get("actual_time_utc")))
 
-df["Off-Block (Actual)"] = [fmt_dt_utc(x) for x in dep_actual_list]
+# Display columns
+# Off-Block (Actual): show EDCT (purple) until a true Departure arrives, then overwrite with actual time
+offblock_actual_display = []
+for dep_dt, edct_dt in zip(dep_actual_list, edct_list):
+    if dep_dt:
+        offblock_actual_display.append(fmt_dt_utc(dep_dt))
+    elif edct_dt:
+        offblock_actual_display.append(f"EDCT - {fmt_dt_utc(edct_dt)}")
+    else:
+        offblock_actual_display.append("—")
+
+df["Off-Block (Actual)"] = offblock_actual_display
 df["ETA (FA)"]           = [fmt_dt_utc(x) for x in eta_fore_list]
 df["On-Block (Actual)"]  = [fmt_dt_utc(x) for x in arr_actual_list]
 
-# Keep raw timestamps for delay calculations (hidden)
-df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)
+# Hidden raw timestamps for styling/calcs (do NOT treat EDCT as actual)
+df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)     # True actual OUT only
 df["_ETA_FA_ts"]    = pd.to_datetime(eta_fore_list,   utc=True)
 df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
+df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
 
 # Blank countdowns when appropriate
 has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
@@ -689,7 +706,6 @@ df.loc[has_arr_series, "Arrives In"] = "—"
 # ============================
 st.markdown("### Quick Filters")
 tails_opts = sorted(df["Aircraft"].dropna().unique().tolist())
-# Build airport options from displayed codes (already ICAO else IATA)
 airports_opts = sorted(pd.unique(pd.concat([df["From"].fillna("—"), df["To"].fillna("—")], ignore_index=True)).tolist())
 workflows_opts = sorted(df["Workflow"].fillna("").unique().tolist())
 
@@ -709,24 +725,21 @@ if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
 # ============================
-# Sort, compute row highlight masks, display
+# Sort, compute row/cell highlights, display
 # ============================
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
 
-# Thresholds
-delay_thr_td = pd.Timedelta(minutes=int(delay_threshold_min))              # e.g., 15m
-row_red_thr_td = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))   # hard floor at 30m
+delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))   # e.g., 15m
+row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # ≥30m
 
 now_utc = datetime.now(timezone.utc)
 
-# --- Row-level: operational "no-email" delays ---
-# A) No Departure email yet: late vs scheduled ETD
+# Row-level operational "no-email" delays
 no_dep = ~has_dep_series
 dep_lateness = now_utc - df["ETD_UTC"]
 row_dep_yellow = df["ETD_UTC"].notna() & no_dep & (dep_lateness > delay_thr_td) & (dep_lateness < row_red_thr_td)
 row_dep_red    = df["ETD_UTC"].notna() & no_dep & (dep_lateness >= row_red_thr_td)
 
-# B) Departure email exists but no Arrival yet: late vs ETA baseline (prefer ETA(FA), else scheduled ETA)
 has_dep = has_dep_series
 no_arr = ~has_arr_series
 eta_baseline = df["_ETA_FA_ts"].where(df["_ETA_FA_ts"].notna(), df["ETA_UTC"])
@@ -737,8 +750,8 @@ row_arr_red    = eta_baseline.notna() & has_dep & no_arr & (eta_lateness >= row_
 row_yellow = row_dep_yellow | row_arr_yellow
 row_red    = row_dep_red    | row_arr_red
 
-# --- Cell-level: planned/forecast vs actual deltas (> threshold) ---
-dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # Off-Block (Actual) - Off-Block (Est)
+# Cell-level red accents (do not count EDCT as actual departure)
+dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # Off-Block (Actual true) - Off-Block (Est)
 eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Est)
 arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # On-Block (Actual) - On-Block (Est)
 
@@ -758,24 +771,29 @@ df_display = df[display_cols].copy()
 def _style_ops(x: pd.DataFrame):
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
 
-    # Row backgrounds (dark-mode friendly)
+    # Row backgrounds (yellow/red)
     row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
     row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
-
     styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
-    styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css  # overrides yellow if both
+    styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css  # red overrides yellow
 
-    # Cell-only red accents for the three comparison rules
+    # Cell-only red accents for variance rules
     cell_css = "background-color: rgba(255, 82, 82, 0.25);"
 
     idx = cell_dep.reindex(x.index, fill_value=False)
-    styles.loc[idx, "Off-Block (Actual)"] += cell_css   # later than sched ETD
+    styles.loc[idx, "Off-Block (Actual)"] += cell_css
 
     idx = cell_eta.reindex(x.index, fill_value=False)
-    styles.loc[idx, "ETA (FA)"] += cell_css             # FA ETA later than sched ETA
+    styles.loc[idx, "ETA (FA)"] += cell_css
 
     idx = cell_arr.reindex(x.index, fill_value=False)
-    styles.loc[idx, "On-Block (Actual)"] += cell_css    # actual arrival later than sched ETA
+    styles.loc[idx, "On-Block (Actual)"] += cell_css
+
+    # EDCT: purple cell on Off-Block (Actual) when EDCT exists & no true departure yet.
+    cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
+    idx_edct = (df["_EDCT_ts"].notna() & df["_DepActual_ts"].isna()).reindex(x.index, fill_value=False)
+    # Apply AFTER row styles so purple wins even if the row is red.
+    styles.loc[idx_edct, "Off-Block (Actual)"] += cell_edct_css
 
     return styles
 
@@ -787,9 +805,9 @@ st.dataframe(
 )
 st.caption(
     "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
-    "Cells in red show specific deltas: Off-Block (Actual)>Est, ETA(FA)>On-Block(Est), or On-Block (Actual)>Est."
+    "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
+    "When an EDCT email arrives, **Off-Block (Actual)** shows “EDCT - …” in purple until a Departure email is received."
 )
-
 
 # ============================
 # Mailbox Polling (IMAP)
@@ -826,7 +844,6 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
         except: pass
         return 0
 
-    # Search only newer UIDs (server-side) with fallback if FROM filter yields nothing
     last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
     if IMAP_SENDER:
         typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
@@ -880,27 +897,33 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
             subj_info = parse_subject_line(subject or "", now_utc)
             event = subj_info.get("event_type")
 
-            # Event time precedence: body OUT/IN (if found) > explicit timestamp in text > subject-derived (forecast only) > email Date header > now
+            # Times / body parses
             hdr_dt = get_email_date_utc(msg)
             explicit_dt = parse_any_datetime_to_utc(text)
             body_info = parse_body_firstline(event, body, hdr_dt or now_utc)
+            edct_info = parse_body_edct(body)
 
+            # If nothing matched but looks like EDCT, set event
+            if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
+                event = "EDCT"
+
+            # Prefer EDCT/Body airports when subject lacks them
+            if edct_info.get("from") and not subj_info.get("from_airport"):
+                subj_info["from_airport"] = edct_info["from"]
+            if edct_info.get("to") and not subj_info.get("to_airport"):
+                subj_info["to_airport"] = edct_info["to"]
+
+            # Event time selection
             if event == "Departure":
                 actual_dt_utc = body_info.get("dep_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
             elif event == "Arrival":
                 actual_dt_utc = body_info.get("arr_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+            elif event == "EDCT":
+                actual_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt or now_utc
             else:
                 actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
 
-            # Enrich airports from body if present (keep raw token; matcher will check IATA/ICAO)
-            if body_info.get("from") and not subj_info.get("from_airport"):
-                subj_info["from_airport"] = body_info["from"].upper()
-            if body_info.get("to") and not subj_info.get("to_airport"):
-                subj_info["to_airport"] = body_info["to"].upper()
-            if body_info.get("at") and not subj_info.get("at_airport"):
-                subj_info["at_airport"] = body_info["at"].upper()
-
-            # Booking directly from text; else choose by tail+airports+tight time window
+            # Booking selection
             bookings = extract_candidates(text)[0]
             booking = bookings[0] if bookings else None
 
@@ -912,12 +935,11 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
             if not booking:
                 booking = choose_booking_for_event(subj_info, tails, event, actual_dt_utc)
 
-            # If still no confident match, skip to avoid mis-assigning
             if not (booking and event and actual_dt_utc):
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                 continue
 
-            # Compute delta_min for reference
+            # Delta reference (not used for status)
             row = df_clean[df_clean["Booking"] == booking]
             planned = None
             if not row.empty:
@@ -926,7 +948,7 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
             if planned is not None and pd.notna(planned):
                 delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
 
-            # Canonical event -> persisted status (facts only)
+            # Canonical event -> status text
             if event == "Diversion":
                 status = f"🔷 DIVERTED to {subj_info.get('to_airport','—')}"
             elif event == "ArrivalForecast":
@@ -935,6 +957,8 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 status = "🟣 ARRIVED"
             elif event == "Departure":
                 status = "🟢 DEPARTED"
+            elif event == "EDCT":
+                status = "🟪 EDCT"
             else:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                 continue
@@ -949,17 +973,11 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
             }
             upsert_status(booking, event, status, actual_dt_utc.isoformat(), delta_min)
 
-            # If a Departure email contains an updated ETA, persist it as an ArrivalForecast event
-            if event == "Departure" and body_info.get("eta_time_utc"):
-                eta_iso = body_info["eta_time_utc"].isoformat()
-                st.session_state["status_updates"][booking] = {
-                    **st.session_state["status_updates"].get(booking, {}),
-                    "type": "ArrivalForecast",
-                    "actual_time_utc": eta_iso,
-                    "delta_min": None,
-                    "status": "🟦 ARRIVING SOON",
-                }
-                upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", eta_iso, None)
+            # Persist ArrivalForecast if present (from EDCT or Departure emails)
+            if edct_info.get("expected_arrival_utc"):
+                upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", edct_info["expected_arrival_utc"].isoformat(), None)
+            elif event == "Departure" and body_info.get("eta_time_utc"):
+                upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", body_info["eta_time_utc"].isoformat(), None)
 
             if debug:
                 st.write({
@@ -968,9 +986,10 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                     "event": event,
                     "from_airport": subj_info.get("from_airport"),
                     "to_airport": subj_info.get("to_airport"),
-                    "at_airport": subj_info.get("at_airport"),
                     "tails": tails,
                     "actual_dt_utc": actual_dt_utc.isoformat() if actual_dt_utc else None,
+                    "eta_forecast": (edct_info.get("expected_arrival_utc") or body_info.get("eta_time_utc")).isoformat()
+                                     if (edct_info.get("expected_arrival_utc") or body_info.get("eta_time_utc")) else None,
                     "booking": booking,
                 })
 
@@ -996,13 +1015,16 @@ if enable_poll:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
                 st.success("IMAP cursor reset to 0 (statuses preserved).")
 
+        # Optional: control batch size if you expect backlogs
+        max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
+
         if st.button("Poll now"):
-            applied = imap_poll_once(debug=debug_poll)
+            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
             st.success(f"Applied {applied} update(s) from mailbox.")
 
         if poll_on_refresh:
             try:
-                applied = imap_poll_once(debug=debug_poll)
+                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
                 if applied:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
