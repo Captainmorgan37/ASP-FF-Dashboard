@@ -2,6 +2,7 @@
 import re
 import sqlite3
 import imaplib, email
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -210,6 +211,7 @@ SUBJ_PATTERNS = {
     ),
 }
 
+# ---- FIX 1: Do not set actual_time_utc from subject for Arrival/Departure/Diversion ----
 def parse_subject_line(subject: str, now_utc: datetime):
     if not subject:
         return {"event_type": None}
@@ -227,7 +229,6 @@ def parse_subject_line(subject: str, now_utc: datetime):
         result["event_type"] = "Arrival"
         result["at_airport"] = m.group("at")
         result["from_airport"] = m.groupdict().get("from")
-        result["actual_time_utc"] = now_utc
         return result
 
     m = SUBJ_PATTERNS["ArrivalForecast"].search(subject)
@@ -243,18 +244,17 @@ def parse_subject_line(subject: str, now_utc: datetime):
         result["event_type"] = "Departure"
         result["from_airport"] = m.group("from")
         result["to_airport"] = m.groupdict().get("to")
-        result["actual_time_utc"] = now_utc
         return result
 
     m = SUBJ_PATTERNS["Diversion"].search(subject)
     if m:
         result["event_type"] = "Diversion"
         result["to_airport"] = m.group("to")
-        result["actual_time_utc"] = now_utc
         return result
 
     return result
 
+# ---- Parse explicit datetime anywhere in text ----
 def parse_any_datetime_to_utc(text: str) -> datetime | None:
     # ISO-ish
     m_iso = re.search(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+\-]\d{2}:?\d{2})?", text)
@@ -286,6 +286,19 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
             continue
     return None
 
+# ---- FIX 2a: Email Date header → UTC ----
+def get_email_date_utc(msg) -> datetime | None:
+    try:
+        d = msg.get('Date')
+        if not d:
+            return None
+        dt = parsedate_to_datetime(d)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 def extract_event(text: str):
     if re.search(r"\bdiverted\b", text, re.I): return "Diversion"
     if re.search(r"\barriv(?:ed|al)\b", text, re.I): return "Arrival"
@@ -299,6 +312,46 @@ def extract_candidates(text: str):
     tails = sorted(set(re.findall(r"\bC-[A-Z0-9]{4}\b", text)))
     event = extract_event(text)
     return bookings, tails, event
+
+# ---- FIX 2b: Airport-aware, tight-window chooser for booking when not in email ----
+def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, event_dt_utc: datetime) -> str | None:
+    if event_dt_utc is None or event not in ("Arrival", "ArrivalForecast", "Departure", "Diversion"):
+        return None
+    cand = df_clean.copy()
+
+    # Narrow by tail if present
+    if tails:
+        cand = cand[cand["Aircraft"].isin(tails)]
+        if cand.empty:
+            return None
+
+    # Narrow by airports
+    at_ap   = subj_info.get("at_airport")
+    from_ap = subj_info.get("from_airport")
+    to_ap   = subj_info.get("to_airport")
+
+    if event in ("Arrival", "ArrivalForecast"):
+        if at_ap:   cand = cand[cand["To"] == at_ap]
+        if from_ap: cand = cand[cand["From"] == from_ap]
+        sched_col = "ETA_UTC"
+    elif event == "Departure":
+        if from_ap: cand = cand[cand["From"] == from_ap]
+        if to_ap:   cand = cand[cand["To"] == to_ap]
+        sched_col = "ETD_UTC"
+    else:  # Diversion → match pre-diversion leg; use dep side if given
+        if from_ap: cand = cand[cand["From"] == from_ap]
+        sched_col = "ETD_UTC"
+
+    if cand.empty:
+        return None
+
+    cand = cand.copy()
+    cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
+    cand = cand.sort_values("Δ")
+
+    MAX_WINDOW = pd.Timedelta(hours=3)
+    best = cand.iloc[0]
+    return best["Booking"] if best["Δ"] <= MAX_WINDOW else None
 
 # ============================
 # Controls
@@ -400,7 +453,7 @@ now_utc = datetime.now(timezone.utc)
 df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
 df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 
-# Keep pre-filter copy for lookups (email matching etc.)
+# Keep pre-filter copy for lookups
 df_clean = df.copy()
 
 # ============================
@@ -421,7 +474,7 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
     has_dep  = "Departure" in rec
     has_arr  = "Arrival" in rec
     has_div  = "Diversion" in rec
-    # has_fore = "ArrivalForecast" in rec  # intentionally not shown in final status per spec
+    # has_fore = "ArrivalForecast" in rec  # optional surface if desired
 
     # DIVERTED only if a Departure email exists and a Diversion email arrives after
     if has_dep and has_div:
@@ -565,34 +618,27 @@ def imap_poll_once(max_to_process: int = 25) -> int:
             # Subject-first
             subj_info = parse_subject_line(subject or "", now_utc)
             event = subj_info.get("event_type")
-            actual_dt_utc = subj_info.get("actual_time_utc")
 
-            # Fallbacks
-            if not event:
-                event = extract_event(text)
-            if actual_dt_utc is None:
-                actual_dt_utc = parse_any_datetime_to_utc(text) or now_utc
+            # Event time precedence: explicit timestamp in text > subject-derived (forecast only) > email Date header > now
+            explicit_dt = parse_any_datetime_to_utc(text)
+            hdr_dt = get_email_date_utc(msg)
+            actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
 
-            # Booking
+            # Booking directly from text if present
             bookings = extract_candidates(text)[0]
             booking = bookings[0] if bookings else None
 
+            # Collect tails from subject/body
             tails = []
             if subj_info.get("tail"): tails.append(subj_info["tail"])
             tails += re.findall(r"\bC-[A-Z0-9]{4}\b", text)
             tails = sorted(set(tails))
 
-            if not booking and tails and actual_dt_utc:
-                rows = df_clean[df_clean["Aircraft"].isin(tails)].copy()
-                if not rows.empty:
-                    if event in ("Arrival", "ArrivalForecast"):
-                        rows["Δ"] = (rows["ETA_UTC"] - actual_dt_utc).abs()
-                    else:
-                        rows["Δ"] = (rows["ETD_UTC"] - actual_dt_utc).abs()
-                    rows = rows.sort_values("Δ")
-                    if not rows.empty and rows.iloc[0]["Δ"] <= pd.Timedelta(hours=12):
-                        booking = rows.iloc[0]["Booking"]
+            # If no explicit booking, choose by tail+airports+tight time window
+            if not booking:
+                booking = choose_booking_for_event(subj_info, tails, event, actual_dt_utc)
 
+            # If still no confident match, skip to avoid mis-assigning
             if not (booking and event and actual_dt_utc):
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                 continue
