@@ -347,9 +347,13 @@ def extract_candidates(text: str):
 
 # ---- BODY parsers for first line info ----
 BODY_DEPARTURE_RE = re.compile(
-    r"departed\s+.*?\((?P<from>[A-Z]{3,4})\)\s+at\s+(?P<dep_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4})"
-    r".*?enroute\s+to\s+.*?\((?P<to>[A-Z]{3,4})\).*?"
-    r"(?:estimated\s+arrival\s+(?:at|time\s+of)\s+(?P<eta_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4}))?",
+    r"departed\s+.*?\((?P<from>[A-Z]{3,4})\)\s+at\s+"
+    r"(?P<dep_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)"
+    r".*?en\s*route\s+to\s+.*?\((?P<to>[A-Z]{3,4})\)"
+    r".*?(?:"
+    r"(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s+(?:at|of)\s+"
+    r"(?P<eta_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?))"
+    r")?",
     re.I
 )
 
