@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dateparse
+from dateutil.tz import tzoffset
 
 # ============================
 # Page config
@@ -134,6 +135,31 @@ init_db()
 # ============================
 # Helpers
 # ============================
+
+# --- Timezone map for body tokens like "02:18PM EDT"
+TZINFOS = {
+    "UTC":  tzoffset("UTC", 0),
+    "GMT":  tzoffset("GMT", 0),
+
+    "AST":  tzoffset("AST",  -4*3600),
+    "ADT":  tzoffset("ADT",  -3*3600),
+    "EST":  tzoffset("EST",  -5*3600),
+    "EDT":  tzoffset("EDT",  -4*3600),
+    "CST":  tzoffset("CST",  -6*3600),
+    "CDT":  tzoffset("CDT",  -5*3600),
+    "MST":  tzoffset("MST",  -7*3600),
+    "MDT":  tzoffset("MDT",  -6*3600),
+    "PST":  tzoffset("PST",  -8*3600),
+    "PDT":  tzoffset("PDT",  -7*3600),
+
+    "AKST": tzoffset("AKST", -9*3600),
+    "AKDT": tzoffset("AKDT", -8*3600),
+    "HST":  tzoffset("HST", -10*3600),
+
+    "NST":  tzoffset("NST",  -(3*3600 + 1800)),
+    "NDT":  tzoffset("NDT",  -(2*3600 + 1800)),
+}
+
 FAKE_TAIL_PATTERNS = [
     re.compile(r"^\s*(add|remove)\b", re.I),
     re.compile(r"\b(ocs|emb)\b", re.I),
@@ -266,13 +292,13 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
     m_iso = re.search(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+\-]\d{2}:?\d{2})?", text)
     if m_iso:
         try:
-            dt = dateparse.parse(m_iso.group(0))
+            dt = dateparse.parse(m_iso.group(0), tzinfos=TZINFOS)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
         except Exception:
             pass
-    # dd.mm.yyyy HH:MMZ-like or "Sep 18, 2025 01:23 UTC"
+    # dd.mm.yyyy HH:MMZ-like or "Sep 18, 2025 01:23 UTC" or "02:18PM MDT"
     m2_date = re.search(r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b", text)
     m2_time = re.search(r"\b(\d{1,2}:\d{2}(:\d{2})?)\s*(Z|UTC|[+\-]\d{2}:?\d{2}|[A-Z]{2,4})?\b", text, re.I)
     try_strings = []
@@ -284,7 +310,7 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
 
     for s in try_strings:
         try:
-            dt = dateparse.parse(s, fuzzy=True)
+            dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
@@ -339,7 +365,7 @@ def _parse_time_token_to_utc(time_token: str, base_date_utc: datetime) -> dateti
     base_day = (base_date_utc or datetime.now(timezone.utc)).date()
     s = f"{base_day.isoformat()} {time_token}"
     try:
-        dt = dateparse.parse(s, fuzzy=True)
+        dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -370,7 +396,7 @@ def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dic
 # CSV IATA/ICAO support
 # ============================
 def normalize_iata(code: str) -> str:
-    c = (code or "").strip().upper()
+    c = (code or "").strip().str.upper() if isinstance(code, pd.Series) else (code or "").strip().upper()
     return c if len(c) == 3 else ""
 
 def derive_iata_from_icao(icao: str) -> str:
