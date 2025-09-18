@@ -99,6 +99,11 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
         """, (booking, event_type, status, actual_time_iso,
               int(delta_min) if delta_min is not None else None))
 
+def delete_status(booking: str, event_type: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM status_events WHERE booking=? AND event_type=?", (booking, event_type))
+
+
 def save_csv_to_db(name: str, content_bytes: bytes):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -216,6 +221,12 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+def utc_datetime_picker(label: str, default_dt_utc: datetime) -> datetime:
+    d = st.date_input(f"{label} — Date (UTC)", value=default_dt_utc.date(), key=f"{label}-date")
+    t = st.time_input(f"{label} — Time (UTC)", value=default_dt_utc.time().replace(microsecond=0), key=f"{label}-time")
+    return datetime.combine(d, t).replace(tzinfo=timezone.utc)
+
 
 # ---------- Subject-aware parsing ----------
 SUBJ_TAIL_RE = re.compile(r"\bC-[A-Z0-9]{4}\b")
@@ -808,6 +819,91 @@ st.caption(
     "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
     "When an EDCT email arrives, **Off-Block (Actual)** shows “EDCT - …” in purple until a Departure email is received."
 )
+
+# ============================
+# Manual Overrides (Departure / Arrival)
+# ============================
+st.markdown("### Manual Overrides (Departure / Arrival)")
+with st.expander("Set or clear an actual OUT / IN time when an email is missing"):
+    if df_clean.empty:
+        st.info("No flights loaded.")
+    else:
+        col_ov1, col_ov2 = st.columns([2, 1])
+        with col_ov1:
+            sel_booking = st.selectbox("Booking", sorted(df_clean["Booking"].astype(str).unique().tolist()))
+            row = df_clean[df_clean["Booking"] == sel_booking].iloc[0]
+            planned_dep = row["ETD_UTC"]
+            planned_arr = row["ETA_UTC"]
+
+            st.caption(
+                f"Planned: Off-Block (Est) **{fmt_dt_utc(planned_dep) if pd.notna(planned_dep) else '—'}**, "
+                f"On-Block (Est) **{fmt_dt_utc(planned_arr) if pd.notna(planned_arr) else '—'}**"
+            )
+
+        with col_ov2:
+            set_dep = st.checkbox("Set Actual Departure (OUT)")
+            set_arr = st.checkbox("Set Actual Arrival (IN)")
+
+        override_dep_dt = None
+        override_arr_dt = None
+        if set_dep:
+            override_dep_dt = utc_datetime_picker("Actual Departure (UTC)", default_dt_utc=datetime.now(timezone.utc))
+        if set_arr:
+            override_arr_dt = utc_datetime_picker("Actual Arrival (UTC)", default_dt_utc=datetime.now(timezone.utc))
+
+        cbtn1, cbtn2, cbtn3 = st.columns([1,1,2])
+        with cbtn1:
+            if st.button("Save override(s)"):
+                st.session_state.setdefault("status_updates", {})
+
+                if set_dep and override_dep_dt:
+                    # Compute delta vs scheduled ETD (for reference)
+                    delta_min = None
+                    if pd.notna(planned_dep):
+                        delta_min = int(round((override_dep_dt - planned_dep).total_seconds() / 60.0))
+
+                    # Persist as a normal Departure event (board will treat it like an email)
+                    upsert_status(sel_booking, "Departure", "🟢 DEPARTED", override_dep_dt.isoformat(), delta_min)
+                    st.session_state["status_updates"][sel_booking] = {
+                        **st.session_state["status_updates"].get(sel_booking, {}),
+                        "type": "Departure",
+                        "actual_time_utc": override_dep_dt.isoformat(),
+                        "delta_min": delta_min,
+                        "status": "🟢 DEPARTED",
+                    }
+
+                if set_arr and override_arr_dt:
+                    # Compute delta vs scheduled ETA (for reference)
+                    delta_min = None
+                    if pd.notna(planned_arr):
+                        delta_min = int(round((override_arr_dt - planned_arr).total_seconds() / 60.0))
+
+                    # Persist as a normal Arrival event
+                    upsert_status(sel_booking, "Arrival", "🟣 ARRIVED", override_arr_dt.isoformat(), delta_min)
+                    st.session_state["status_updates"][sel_booking] = {
+                        **st.session_state["status_updates"].get(sel_booking, {}),
+                        "type": "Arrival",
+                        "actual_time_utc": override_arr_dt.isoformat(),
+                        "delta_min": delta_min,
+                        "status": "🟣 ARRIVED",
+                    }
+
+                st.success("Override(s) saved. The table will reflect this immediately.")
+
+        with cbtn2:
+            if st.button("Clear selected"):
+                # Clear whichever boxes are checked
+                if set_dep:
+                    delete_status(sel_booking, "Departure")
+                    # Remove from session_state if present
+                    if st.session_state.get("status_updates", {}).get(sel_booking, {}).get("type") == "Departure":
+                        st.session_state["status_updates"].pop(sel_booking, None)
+                if set_arr:
+                    delete_status(sel_booking, "Arrival")
+                    if st.session_state.get("status_updates", {}).get(sel_booking, {}).get("type") == "Arrival":
+                        st.session_state["status_updates"].pop(sel_booking, None)
+                st.success("Selected override(s) cleared.")
+
 
 # ============================
 # Mailbox Polling (IMAP)
