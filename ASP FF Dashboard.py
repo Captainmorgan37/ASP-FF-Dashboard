@@ -350,16 +350,20 @@ BODY_DEPARTURE_RE = re.compile(
     r"departed\s+.*?\((?P<from>[A-Z]{3,4})\)\s+at\s+"
     r"(?P<dep_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)"
     r".*?en\s*route\s+to\s+.*?\((?P<to>[A-Z]{3,4})\)"
-    r".*?(?:"
-    r"(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s+(?:at|of)\s+"
-    r"(?P<eta_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?))"
-    r")?",
+    r".*?(?:(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s+(?:at|of)\s+"
+    r"(?P<eta_time>\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)))?",
     re.I
 )
 
 BODY_ARRIVAL_RE = re.compile(
     r"arrived\s+at\s+.*?\((?P<at>[A-Z]{3,4})\)\s+at\s+(?P<arr_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4})"
     r".*?from\s+.*?\((?P<from>[A-Z]{3,4})\)",
+    re.I
+)
+
+ETA_ANY_RE = re.compile(
+    r"(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s+(?:at|of)\s+)"
+    r"(\d{1,2}:\d{2}\s*[AP]M(?:\s*[A-Z]{2,4})?)",
     re.I
 )
 
@@ -387,6 +391,10 @@ def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dic
         info["dep_time_utc"] = _parse_time_token_to_utc(m.group("dep_time"), email_date_utc)
         if m.group("eta_time"):
             info["eta_time_utc"] = _parse_time_token_to_utc(m.group("eta_time"), email_date_utc)
+        if not info.get("eta_time_utc"):
+            m_eta = ETA_ANY_RE.search(body)
+            if m_eta:
+                info["eta_time_utc"] = _parse_time_token_to_utc(m_eta.group(1), email_date_utc)
         return info
     m = BODY_ARRIVAL_RE.search(body)
     if event == "Arrival" and m:
@@ -400,7 +408,7 @@ def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dic
 # CSV IATA/ICAO support
 # ============================
 def normalize_iata(code: str) -> str:
-    c = (code or "").strip().str.upper() if isinstance(code, pd.Series) else (code or "").strip().upper()
+    c = (code or "").strip().upper()
     return c if len(c) == 3 else ""
 
 def derive_iata_from_icao(icao: str) -> str:
@@ -665,6 +673,11 @@ df["Off-Block (Actual)"] = [fmt_dt_utc(x) for x in dep_actual_list]
 df["ETA (FA)"]           = [fmt_dt_utc(x) for x in eta_fore_list]
 df["On-Block (Actual)"]  = [fmt_dt_utc(x) for x in arr_actual_list]
 
+# Keep raw timestamps for delay calculations (hidden)
+df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)
+df["_ETA_FA_ts"]    = pd.to_datetime(eta_fore_list,   utc=True)
+df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
+
 # Blank countdowns when appropriate
 has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
 has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
@@ -695,16 +708,24 @@ if airports_sel:
 if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
-# Time-window filters
-now_utc = datetime.now(timezone.utc)
-if limit_next_hours:
-    window_end = now_utc + pd.Timedelta(hours=int(next_hours))
-    df = df[(df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)) & (df["ETD_UTC"] <= window_end)]
-elif show_only_upcoming:
-    df = df[df["ETD_UTC"] >= now_utc - pd.Timedelta(minutes=5)]
-
-# Sort & display
+# ============================
+# Sort, compute row highlight masks, display
+# ============================
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
+
+delay_thr_td = pd.Timedelta(minutes=int(delay_threshold_min))
+
+# Delays (positive = later than plan)
+dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # Off-Block (Actual) - Off-Block (Est)
+eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Est)
+arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # On-Block (Actual) - On-Block (Est)
+
+mask_dep          = dep_delay.notna()       & (dep_delay       > delay_thr_td)
+mask_eta_vs_sched = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
+mask_sched        = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
+
+row_is_delayed = (mask_dep | mask_eta_vs_sched | mask_sched)
+
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Est)", "Off-Block (Actual)", "ETA (FA)",
@@ -712,9 +733,27 @@ display_cols = [
     "Departs In", "Arrives In",
     "PIC", "SIC", "Workflow", "Status"
 ]
-st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
+
+df_display = df[display_cols].copy()
+
+def _highlight_delays(x):
+    # Light red background
+    bg = "background-color: #ffe0e0"
+    styles = pd.DataFrame("", index=x.index, columns=x.columns)
+    styles.loc[row_is_delayed.reindex(x.index, fill_value=False), :] = bg
+    return styles
+
+st.subheader(f"Schedule  ·  {len(df_display)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
-st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+st.dataframe(
+    df_display.style.hide(axis="index").apply(_highlight_delays, axis=None),
+    use_container_width=True
+)
+st.caption(
+    f"Rows shaded light red indicate > {int(delay_threshold_min)} min delay: "
+    f"Off-Block (Actual) vs Off-Block (Est), ETA (FA) vs On-Block (Est), "
+    f"or On-Block (Actual) vs On-Block (Est)."
+)
 
 # ============================
 # Mailbox Polling (IMAP)
@@ -842,7 +881,7 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                 continue
 
-            # Compute delta_min for reference (not used to decide canonical status)
+            # Compute delta_min for reference
             row = df_clean[df_clean["Booking"] == booking]
             planned = None
             if not row.empty:
