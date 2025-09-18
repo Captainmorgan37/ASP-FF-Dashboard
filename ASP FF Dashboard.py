@@ -521,28 +521,34 @@ def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, even
         else:
             return cdf
         return cdf[mask]
-
+    
     if event in ("Arrival", "ArrivalForecast"):
         if raw_at:
             cand = match_token(cand, "To_IATA", "To_ICAO", raw_at)
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETA_UTC"
+    
     elif event in ("Departure", "EDCT"):
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         if raw_to:
             cand = match_token(cand, "To_IATA", "To_ICAO", raw_to)
         sched_col = "ETD_UTC"
-    else:
-        if raw_from:
-            cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
-        sched_col = "ETD_UTC"
+    
     elif event == "Diversion":
+        # Diversions happen closer to arrival — match on ETA
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETA_UTC"
-
+    
+    else:
+        # Fallback: use dep side if given
+        if raw_from:
+            cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
+        sched_col = "ETD_UTC"
+    
+    
 
     if cand.empty:
         return None
