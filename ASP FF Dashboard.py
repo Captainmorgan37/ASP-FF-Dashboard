@@ -222,10 +222,28 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
     except Exception:
         return None
 
-def utc_datetime_picker(label: str, default_dt_utc: datetime) -> datetime:
-    d = st.date_input(f"{label} — Date (UTC)", value=default_dt_utc.date(), key=f"{label}-date")
-    t = st.time_input(f"{label} — Time (UTC)", value=default_dt_utc.time().replace(microsecond=0), key=f"{label}-time")
+# REPLACE your existing utc_datetime_picker with this:
+
+def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = None) -> datetime:
+    """Stateful UTC datetime picker (persists across reruns/auto-refresh)."""
+    if initial_dt_utc is None:
+        initial_dt_utc = datetime.now(timezone.utc)
+
+    date_key = f"{key}__date"
+    time_key = f"{key}__time"
+
+    # Seed once (only if not already set)
+    if date_key not in st.session_state:
+        st.session_state[date_key] = initial_dt_utc.date()
+    if time_key not in st.session_state:
+        st.session_state[time_key] = initial_dt_utc.time().replace(microsecond=0)
+
+    # Use session state as the single source of truth (no dynamic 'value=')
+    d = st.date_input(f"{label} — Date (UTC)", key=date_key)
+    t = st.time_input(f"{label} — Time (UTC)", key=time_key)
+
     return datetime.combine(d, t).replace(tzinfo=timezone.utc)
+
 
 
 # ---------- Subject-aware parsing ----------
@@ -847,9 +865,13 @@ with st.expander("Set or clear an actual OUT / IN time when an email is missing"
         override_dep_dt = None
         override_arr_dt = None
         if set_dep:
-            override_dep_dt = utc_datetime_picker("Actual Departure (UTC)", default_dt_utc=datetime.now(timezone.utc))
+            dep_seed = (row["ETD_UTC"].to_pydatetime() if pd.notna(row["ETD_UTC"]) else datetime.now(timezone.utc))
+            override_dep_dt = utc_datetime_picker("Actual Departure (UTC)", key="override_dep", initial_dt_utc=dep_seed)
+        
         if set_arr:
-            override_arr_dt = utc_datetime_picker("Actual Arrival (UTC)", default_dt_utc=datetime.now(timezone.utc))
+            arr_seed = (row["ETA_UTC"].to_pydatetime() if pd.notna(row["ETA_UTC"]) else datetime.now(timezone.utc))
+            override_arr_dt = utc_datetime_picker("Actual Arrival (UTC)", key="override_arr", initial_dt_utc=arr_seed)
+
 
         cbtn1, cbtn2, cbtn3 = st.columns([1,1,2])
         with cbtn1:
