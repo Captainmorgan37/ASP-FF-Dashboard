@@ -177,8 +177,25 @@ def classify_account(account_val: str) -> str:
 def type_badge(flight_type: str) -> str:
     return {"OCS": "🟢 OCS", "Owner": "🔵 Owner"}.get(flight_type, "⚪︎")
 
+# Uniform display for UTC datetimes (match CSV look)
+def fmt_dt_utc(dt: datetime | None) -> str:
+    if not dt or (isinstance(dt, float) and pd.isna(dt)):
+        return "—"
+    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
+
+def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
+    if not dt_str:
+        return None
+    try:
+        dt = dateparse.parse(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 def default_status(dep_utc: pd.Timestamp, eta_utc: pd.Timestamp) -> str:
-    # Kept for reference; no longer used to auto-flip states
+    # Kept for reference; not used to auto-flip
     now = datetime.now(timezone.utc)
     if pd.notna(dep_utc) and now < dep_utc:
         return "🟡 SCHEDULED"
@@ -211,7 +228,7 @@ SUBJ_PATTERNS = {
     ),
 }
 
-# ---- FIX 1: Do not set actual_time_utc from subject for Arrival/Departure/Diversion ----
+# Do not set actual_time_utc from subject for Arrival/Departure/Diversion
 def parse_subject_line(subject: str, now_utc: datetime):
     if not subject:
         return {"event_type": None}
@@ -286,7 +303,7 @@ def parse_any_datetime_to_utc(text: str) -> datetime | None:
             continue
     return None
 
-# ---- FIX 2a: Email Date header → UTC ----
+# Email Date header → UTC
 def get_email_date_utc(msg) -> datetime | None:
     try:
         d = msg.get('Date')
@@ -313,7 +330,54 @@ def extract_candidates(text: str):
     event = extract_event(text)
     return bookings, tails, event
 
-# ---- FIX 2b: Airport-aware, tight-window chooser for booking when not in email ----
+# ---- BODY parsers for first line info ----
+BODY_DEPARTURE_RE = re.compile(
+    r"departed\s+.*?\((?P<from>[A-Z]{3,4})\)\s+at\s+(?P<dep_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4})"
+    r".*?enroute\s+to\s+.*?\((?P<to>[A-Z]{3,4})\).*?"
+    r"(?:estimated\s+arrival\s+(?:at|time\s+of)\s+(?P<eta_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4}))?",
+    re.I
+)
+
+BODY_ARRIVAL_RE = re.compile(
+    r"arrived\s+at\s+.*?\((?P<at>[A-Z]{3,4})\)\s+at\s+(?P<arr_time>\d{1,2}:\d{2}\s*[AP]M\s*[A-Z]{2,4})"
+    r".*?from\s+.*?\((?P<from>[A-Z]{3,4})\)",
+    re.I
+)
+
+def _parse_time_token_to_utc(time_token: str, base_date_utc: datetime) -> datetime | None:
+    if not time_token:
+        return None
+    base_day = (base_date_utc or datetime.now(timezone.utc)).date()
+    s = f"{base_day.isoformat()} {time_token}"
+    try:
+        dt = dateparse.parse(s, fuzzy=True)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dict:
+    info = {}
+    if not body:
+        return info
+    m = BODY_DEPARTURE_RE.search(body)
+    if event == "Departure" and m:
+        info["from"] = m.group("from")
+        info["to"] = m.group("to")
+        info["dep_time_utc"] = _parse_time_token_to_utc(m.group("dep_time"), email_date_utc)
+        if m.group("eta_time"):
+            info["eta_time_utc"] = _parse_time_token_to_utc(m.group("eta_time"), email_date_utc)
+        return info
+    m = BODY_ARRIVAL_RE.search(body)
+    if event == "Arrival" and m:
+        info["at"] = m.group("at")
+        info["from"] = m.group("from")
+        info["arr_time_utc"] = _parse_time_token_to_utc(m.group("arr_time"), email_date_utc)
+        return info
+    return info
+
+# ---- Airport-aware, tight-window chooser for booking when not in email ----
 def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, event_dt_utc: datetime) -> str | None:
     if event_dt_utc is None or event not in ("Arrival", "ArrivalForecast", "Departure", "Diversion"):
         return None
@@ -412,7 +476,7 @@ else:
         df_raw = _load_csv_from_bytes(content)
         st.caption(
             f"Loaded CSV from storage: **{st.session_state['csv_name']}** "
-            f"(uploaded {st.session_state['csv_uploaded_at']})"
+            f"(uploaded {st.session_state['uploaded_at']})"
         )
     else:
         st.info("Upload today’s FL3XX flights CSV to begin.")
@@ -448,16 +512,16 @@ df["To"] = df["To (ICAO)"].fillna("—").replace({"nan": "—"})
 df["Route"] = df["From"] + " → " + df["To"]
 # df["Sched FT"] = df["Flight time (Est)"].apply(flight_time_hhmm_from_decimal)
 
-# Relative time columns (for display only)
+# Relative time columns (initial; we'll blank after email checks)
 now_utc = datetime.now(timezone.utc)
 df["Departs In"] = (df["ETD_UTC"] - now_utc).apply(fmt_td)
 df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 
-# Keep pre-filter copy for lookups
+# Keep pre-filter copy for matching
 df_clean = df.copy()
 
 # ============================
-# Email-driven status (no auto flips)
+# Email-driven status + enrich FA times
 # ============================
 events_map = load_status_map()
 # Overlay in-session updates (from this run's IMAP polling)
@@ -474,7 +538,6 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
     has_dep  = "Departure" in rec
     has_arr  = "Arrival" in rec
     has_div  = "Diversion" in rec
-    # has_fore = "ArrivalForecast" in rec  # optional surface if desired
 
     # DIVERTED only if a Departure email exists and a Diversion email arrives after
     if has_dep and has_div:
@@ -486,7 +549,12 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
 
     # DEPARTED / LATE ARRIVAL if Departure email exists but no Arrival yet
     if has_dep and not has_arr:
-        if pd.notna(eta_utc) and now > eta_utc + thr:
+        # Use forecast ETA if available, else scheduled ETA
+        fore_eta = None
+        if "ArrivalForecast" in rec:
+            fore_eta = parse_iso_to_utc(rec["ArrivalForecast"].get("actual_time_utc"))
+        eta_for_status = fore_eta or eta_utc
+        if pd.notna(eta_for_status) and now > eta_for_status + thr:
             return "🟠 LATE ARRIVAL"
         return "🟢 DEPARTED"
 
@@ -496,7 +564,29 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
 
     return "🟡 SCHEDULED"
 
+# Compute Status
 df["Status"] = [compute_status_row(b, dep, eta) for b, dep, eta in zip(df["Booking"], df["ETD_UTC"], df["ETA_UTC"])]
+
+# Build FA time columns from events_map
+dep_actual_list = []
+eta_fore_list   = []
+arr_actual_list = []
+
+for b in df["Booking"]:
+    rec = events_map.get(b, {})
+    dep_actual_list.append(parse_iso_to_utc(rec.get("Departure", {}).get("actual_time_utc")))
+    eta_fore_list.append(parse_iso_to_utc(rec.get("ArrivalForecast", {}).get("actual_time_utc")))
+    arr_actual_list.append(parse_iso_to_utc(rec.get("Arrival", {}).get("actual_time_utc")))
+
+df["Off-Block (Actual)"] = [fmt_dt_utc(x) for x in dep_actual_list]
+df["ETA (FA)"]           = [fmt_dt_utc(x) for x in eta_fore_list]
+df["On-Block (Actual)"]  = [fmt_dt_utc(x) for x in arr_actual_list]
+
+# Blank countdowns when appropriate
+has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
+has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
+df.loc[has_dep_series, "Departs In"] = "—"
+df.loc[has_arr_series, "Arrives In"] = "—"
 
 # ============================
 # Quick Filters
@@ -533,7 +623,9 @@ elif show_only_upcoming:
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
-    "Off-Block (Est)", "On-Block (Est)", "Departs In", "Arrives In",
+    "Off-Block (Est)", "Off-Block (Actual)", "ETA (FA)",
+    "On-Block (Est)", "On-Block (Actual)",
+    "Departs In", "Arrives In",
     "PIC", "SIC", "Workflow", "Status"
 ]
 st.subheader(f"Schedule  ·  {len(df)} flight(s) shown")
@@ -619,22 +711,35 @@ def imap_poll_once(max_to_process: int = 25) -> int:
             subj_info = parse_subject_line(subject or "", now_utc)
             event = subj_info.get("event_type")
 
-            # Event time precedence: explicit timestamp in text > subject-derived (forecast only) > email Date header > now
-            explicit_dt = parse_any_datetime_to_utc(text)
+            # Event time precedence: body OUT/IN (if found) > explicit timestamp in text > subject-derived (forecast only) > email Date header > now
             hdr_dt = get_email_date_utc(msg)
-            actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+            explicit_dt = parse_any_datetime_to_utc(text)
+            body_info = parse_body_firstline(event, body, hdr_dt or now_utc)
 
-            # Booking directly from text if present
+            if event == "Departure":
+                actual_dt_utc = body_info.get("dep_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+            elif event == "Arrival":
+                actual_dt_utc = body_info.get("arr_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+            else:
+                actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+
+            # Enrich airports from body if present
+            if body_info.get("from") and not subj_info.get("from_airport"):
+                subj_info["from_airport"] = body_info["from"]
+            if body_info.get("to") and not subj_info.get("to_airport"):
+                subj_info["to_airport"] = body_info["to"]
+            if body_info.get("at") and not subj_info.get("at_airport"):
+                subj_info["at_airport"] = body_info["at"]
+
+            # Booking directly from text; else choose by tail+airports+tight window
             bookings = extract_candidates(text)[0]
             booking = bookings[0] if bookings else None
 
-            # Collect tails from subject/body
             tails = []
             if subj_info.get("tail"): tails.append(subj_info["tail"])
             tails += re.findall(r"\bC-[A-Z0-9]{4}\b", text)
             tails = sorted(set(tails))
 
-            # If no explicit booking, choose by tail+airports+tight time window
             if not booking:
                 booking = choose_booking_for_event(subj_info, tails, event, actual_dt_utc)
 
@@ -652,7 +757,7 @@ def imap_poll_once(max_to_process: int = 25) -> int:
             if planned is not None and pd.notna(planned):
                 delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
 
-            # Canonical event -> persisted status (facts only; no delay logic stored)
+            # Canonical event -> persisted status (facts only)
             if event == "Diversion":
                 status = f"🔷 DIVERTED to {subj_info.get('to_airport','—')}"
             elif event == "ArrivalForecast":
@@ -665,6 +770,7 @@ def imap_poll_once(max_to_process: int = 25) -> int:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                 continue
 
+            # Persist/update the primary event
             st.session_state.setdefault("status_updates", {})
             st.session_state["status_updates"][booking] = {
                 "type": event,
@@ -673,6 +779,19 @@ def imap_poll_once(max_to_process: int = 25) -> int:
                 "status": status,
             }
             upsert_status(booking, event, status, actual_dt_utc.isoformat(), delta_min)
+
+            # If a Departure email contains an updated ETA, persist it as an ArrivalForecast event
+            if event == "Departure" and body_info.get("eta_time_utc"):
+                eta_iso = body_info["eta_time_utc"].isoformat()
+                st.session_state["status_updates"][booking] = {
+                    **st.session_state["status_updates"].get(booking, {}),
+                    "type": "ArrivalForecast",
+                    "actual_time_utc": eta_iso,
+                    "delta_min": None,
+                    "status": "🟦 ARRIVING SOON",
+                }
+                upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", eta_iso, None)
+
             applied += 1
         finally:
             set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
