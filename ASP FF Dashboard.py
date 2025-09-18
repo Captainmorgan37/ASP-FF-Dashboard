@@ -737,11 +737,15 @@ display_cols = [
 df_display = df[display_cols].copy()
 
 def _highlight_delays(x):
-    # Light red background
-    bg = "background-color: #ffe0e0"
+    # Translucent red fill + left accent bar; keeps text color unchanged (white in dark mode)
+    row_css = (
+        "background-color: rgba(255, 82, 82, 0.16);"
+        "border-left: 6px solid #ff5252;"
+    )
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
-    styles.loc[row_is_delayed.reindex(x.index, fill_value=False), :] = bg
+    styles.loc[row_is_delayed.reindex(x.index, fill_value=False), :] = row_css
     return styles
+
 
 st.subheader(f"Schedule  ·  {len(df_display)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
