@@ -1258,7 +1258,7 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                     if not teams:
                         st.error("No TELUS teams configured in secrets.")
                     else:
-                       ok, err = post_to_telus_team(
+                        ok, err = post_to_telus_team(
                             team=teams[0],
                             text=build_stateful_notify_message(row),
                         )
@@ -1266,6 +1266,7 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
                         else:
                             st.error(f"Failed: {err}")
+
 # -------- end Quick Notify panel --------
 
 
