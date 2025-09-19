@@ -967,12 +967,10 @@ view_df["Off-Block (Actual)"] = view_df.apply(_offblock_actual_display, axis=1)
 
 df_display = view_df[display_cols].copy()
 
-# ----------------- Per-leg 📣 Notify buttons + single editor panel -----------------
-# Helpers to prefill the message:
+# ----------------- Notify toolbar (stable, aligned with table) -----------------
 local_tz = tzlocal.get_localzone()
 
 def _default_minutes_delta(row) -> int:
-    # Prefer FA ETA delta vs sched ETA; positive = LATE, negative = EARLY
     if pd.notna(row["_ETA_FA_ts"]) and pd.notna(row["ETA_UTC"]):
         return int(round((row["_ETA_FA_ts"] - row["ETA_UTC"]).total_seconds() / 60.0))
     return 0
@@ -984,50 +982,63 @@ def _default_eta_hhmm(row) -> str:
     ts = pd.Timestamp(base).tz_convert(local_tz)
     return ts.strftime("%H%M")
 
-# Lay out notify column + table column
-act_col, table_col = st.columns([1.2, 8.8])
+_show_df = (df_view if delayed_view else df).reset_index(drop=True)
 
-with act_col:
-    st.markdown("**Notify**")
-    teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
-    if not teams:
-        st.warning("Add TELUS_WEBHOOKS to secrets to enable notifications.")
+# Compact “pick a leg → prepare” toolbar right above the table
+tcol1, tcol2, tcol3 = st.columns([3.5, 1.2, 5.3])
+with tcol1:
+    st.markdown("**Notify a leg**")
+    if _show_df.empty:
+        sel_idx = None
+        st.selectbox("No rows to notify", options=[], disabled=True, key="notify_picker")
     else:
-        _show_df = (df_view if delayed_view else df).reset_index(drop=True)
-        for i, row in _show_df.iterrows():
-            booking = str(row["Booking"])
-            tail = str(row["Aircraft"])
-            default_delta = _default_minutes_delta(row)
-            default_eta = _default_eta_hhmm(row)
-            key_base = f"notify_{booking}_{i}"
-            if st.button("📣", key=f"{key_base}_btn"):
-                st.session_state["notify_ctx"] = {
-                    "booking": booking,
-                    "tail": tail,
-                    "delta": int(default_delta),
-                    "eta": default_eta,
-                }
+        options = []
+        for i, r in _show_df.iterrows():
+            etd_txt = r["ETD_UTC"].strftime("%H:%MZ") if pd.notna(r["ETD_UTC"]) else "—"
+            options.append(f"{r['Booking']} · {r['Aircraft']} · {r['Route']} · ETD {etd_txt}")
+        sel_idx = st.selectbox(
+            "Select leg",
+            options=list(range(len(options))),
+            format_func=lambda ix: options[ix],
+            key="notify_picker",
+        )
+with tcol2:
+    st.write("")  # spacing
+    if st.button("📣 Prepare", disabled=(_show_df.empty or sel_idx is None), key="notify_prepare"):
+        row = _show_df.iloc[int(sel_idx)]
+        st.session_state["notify_ctx"] = {
+            "booking": str(row["Booking"]),
+            "tail": str(row["Aircraft"]),
+            "delta": _default_minutes_delta(row),
+            "eta": _default_eta_hhmm(row),
+        }
+with tcol3:
+    st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
 
-# Single notify editor panel (appears when a row's 📣 was clicked)
+# Single notify editor panel (appears after “Prepare”)
 if st.session_state.get("notify_ctx"):
     ctx = st.session_state["notify_ctx"]
     with st.expander(f"Send notice · Booking {ctx['booking']} · Tail {ctx['tail']}", expanded=True):
         teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
-        team = st.selectbox("Team", teams, index=0, key="notify_team")
-        delta = st.number_input("Δ minutes (+late / -early)", value=ctx["delta"], step=1, key="notify_delta")
-        eta_hhmm = st.text_input("Updated ETA (HHMM / HH:MM)", value=ctx["eta"], key="notify_eta")
+        if not teams:
+            st.warning("Add TELUS_WEBHOOKS to secrets to enable notifications.")
+        else:
+            team = st.selectbox("Team", teams, index=0, key="notify_team")
+            delta = st.number_input("Δ minutes (+late / -early)", value=ctx["delta"], step=1, key="notify_delta")
+            eta_hhmm = st.text_input("Updated ETA (HHMM / HH:MM)", value=ctx["eta"], key="notify_eta")
 
-        csend, ccancel = st.columns([1, 1])
-        if csend.button("Send", key="notify_send"):
-            notify_delay_chat(team, ctx["tail"], ctx["booking"], int(st.session_state["notify_delta"]), st.session_state["notify_eta"])
-            st.session_state.pop("notify_ctx", None)
-            st.experimental_rerun()
-        if ccancel.button("Cancel", key="notify_cancel"):
-            st.session_state.pop("notify_ctx", None)
-            st.experimental_rerun()
+            csend, ccancel = st.columns([1, 1])
+            if csend.button("Send", key="notify_send"):
+                notify_delay_chat(team, ctx["tail"], ctx["booking"],
+                                  int(st.session_state["notify_delta"]),
+                                  st.session_state["notify_eta"])
+                st.session_state.pop("notify_ctx", None)
+                st.experimental_rerun()
+            if ccancel.button("Cancel", key="notify_cancel"):
+                st.session_state.pop("notify_ctx", None)
+                st.experimental_rerun()
+# ----------------- end notify toolbar -----------------
 
-with table_col:
-    st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
 
     # ---------- Styling masks + _style_ops (define before building styler) ----------
     _base = view_df  # same frame used to make df_display; contains internal *_ts columns
