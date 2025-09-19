@@ -1020,24 +1020,33 @@ if st.session_state.get("notify_ctx"):
     ctx = st.session_state["notify_ctx"]
     with st.expander(f"Send notice · Booking {ctx['booking']} · Tail {ctx['tail']}", expanded=True):
         teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
+
+        team = None
         if not teams:
             st.warning("Add TELUS_WEBHOOKS to secrets to enable notifications.")
         else:
             team = st.selectbox("Team", teams, index=0, key="notify_team")
-            delta = st.number_input("Δ minutes (+late / -early)", value=ctx["delta"], step=1, key="notify_delta")
-            eta_hhmm = st.text_input("Updated ETA (HHMM / HH:MM)", value=ctx["eta"], key="notify_eta")
+            st.number_input("Δ minutes (+late / -early)", value=ctx["delta"], step=1, key="notify_delta")
+            st.text_input("Updated ETA (HHMM / HH:MM)", value=ctx["eta"], key="notify_eta")
 
-            csend, ccancel = st.columns([1, 1])
-if csend.button("Send", key="notify_send"):
-    notify_delay_chat(team, ctx["tail"], ctx["booking"],
-                      int(st.session_state["notify_delta"]),
-                      st.session_state["notify_eta"])
-    st.session_state.pop("notify_ctx", None)
-    st.rerun()
+        send_clicked   = st.button("Send",   disabled=(not teams), key="notify_send")
+        cancel_clicked = st.button("Cancel",                      key="notify_cancel")
 
-if ccancel.button("Cancel", key="notify_cancel"):
-    st.session_state.pop("notify_ctx", None)
-    st.rerun()
+        if send_clicked and team:
+            notify_delay_chat(
+                team,
+                ctx["tail"],
+                ctx["booking"],
+                int(st.session_state["notify_delta"]),
+                st.session_state["notify_eta"],
+            )
+            st.session_state.pop("notify_ctx", None)
+            st.rerun()
+
+        if cancel_clicked:
+            st.session_state.pop("notify_ctx", None)
+            st.rerun()
+
 
 # ----------------- end notify toolbar -----------------
 
