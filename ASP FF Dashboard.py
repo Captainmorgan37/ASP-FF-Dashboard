@@ -553,10 +553,28 @@ def parse_iso_to_utc(s: str | None) -> pd.Timestamp | None:
         return None
 
 # pull into working df
-df["_DepActual_ts"] = df["Booking"].map(lambda b: parse_iso_to_utc(events_map.get(b, {}).get("Departure", {}).get("actual_time_utc")))
-df["_ArrActual_ts"] = df["Booking"].map(lambda b: parse_iso_to_utc(events_map.get(b, {}).get("Arrival", {}).get("actual_time_utc")))
-df["_ETA_FA_ts"]   = df["Booking"].map(lambda b: parse_iso_to_utc(events_map.get(b, {}).get("ArrivalForecast", {}).get("actual_time_utc")))
-df["_EDCT_ts"]     = df["Booking"].map(lambda b: parse_iso_to_utc(events_map.get(b, {}).get("EDCT", {}).get("actual_time_utc")))
+events_map = load_status_map()
+
+def _to_utc_ts(s: str | None) -> pd.Timestamp | None:
+    if not s:
+        return pd.NaT
+    try:
+        dt = dateparse.parse(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return pd.Timestamp(dt.astimezone(timezone.utc))
+    except Exception:
+        return pd.NaT
+
+df["_DepActual_ts"] = df["Booking"].map(lambda b: _to_utc_ts(events_map.get(b, {}).get("Departure", {}).get("actual_time_utc")))
+df["_ArrActual_ts"] = df["Booking"].map(lambda b: _to_utc_ts(events_map.get(b, {}).get("Arrival", {}).get("actual_time_utc")))
+df["_ETA_FA_ts"]   = df["Booking"].map(lambda b: _to_utc_ts(events_map.get(b, {}).get("ArrivalForecast", {}).get("actual_time_utc")))
+df["_EDCT_ts"]     = df["Booking"].map(lambda b: _to_utc_ts(events_map.get(b, {}).get("EDCT", {}).get("actual_time_utc")))
+
+# Ensure dtype is datetime64[ns, UTC] (not object)
+for c in ["_DepActual_ts", "_ArrActual_ts", "_ETA_FA_ts", "_EDCT_ts"]:
+    df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
+
 
 # blank countdowns when actuals exist
 df["Departs In"] = df.apply(lambda r: "—" if pd.notna(r["_DepActual_ts"]) else fmt_td(r["ETD_UTC"] - now_utc), axis=1)
@@ -649,8 +667,7 @@ display_cols = [
 # Prepare display frame (with FA/scheduled columns materialized)
 df_display_base = df_view if delayed_view else df
 df_display = df_display_base.copy()
-df_display["Off-Block (Actual)"] = df_display["_DepActual_ts"].apply(lambda x: x.strftime("%Y-%m-%d %H:%MZ") if pd.notna(x) else ("EDCT " + df_display["_EDCT_ts"].dt.strftime("%Y-%m-%d %H:%MZ")) if False else (df_display["_EDCT_ts"].dt.strftime("%Y-%m-%d %H:%MZ") if pd.notna(df_display["_EDCT_ts"]).any() else "—"))
-# The above line needs row-wise; fix with apply:
+
 def _fmt_dep_actual(row):
     if pd.notna(row["_DepActual_ts"]):
         return row["_DepActual_ts"].strftime("%Y-%m-%d %H:%MZ")
