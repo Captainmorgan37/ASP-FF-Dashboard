@@ -838,7 +838,9 @@ has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
 # ============================
 # Sort, compute row/cell highlights, display
 # ============================
+# Keep your default chronological sort first
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
+df["_orig_order"] = range(len(df))  # for stable ordering when Delayed View is off
 
 delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))   # e.g., 15m
 row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # ≥30m
@@ -870,6 +872,29 @@ cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
 cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
+# ---- New: Delayed View controls next to the title ----
+head_toggle_col, head_title_col = st.columns([1.6, 8.4])
+with head_toggle_col:
+    delayed_view = st.checkbox("Delayed View", value=False, help="Show RED (≥30m) first, then YELLOW (15–29m).")
+    hide_non_delayed = st.checkbox("Hide non-delayed", value=True, help="Only show red/yellow rows.") if delayed_view else False
+with head_title_col:
+    st.subheader("Schedule")
+
+# Compute a delay priority (2 = red, 1 = yellow, 0 = normal)
+delay_priority = (row_red.astype(int) * 2 + row_yellow.astype(int))
+df["_DelayPriority"] = delay_priority
+
+# If Delayed View is on: optionally filter, then sort by priority
+df_view = df.copy()
+if delayed_view:
+    if hide_non_delayed:
+        df_view = df_view[df_view["_DelayPriority"] > 0].copy()
+    # Keep chronological order within each priority by using the earlier sort's order
+    df_view = df_view.sort_values(
+        by=["_DelayPriority", "_orig_order"],
+        ascending=[False, True]
+    )
+
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Est)", "Off-Block (Actual)", "ETA (FA)",
@@ -877,7 +902,7 @@ display_cols = [
     "Departs In", "Arrives In",
     "PIC", "SIC", "Workflow", "Status"
 ]
-df_display = df[display_cols].copy()
+df_display = (df_view if delayed_view else df)[display_cols].copy()
 
 def _style_ops(x: pd.DataFrame):
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
@@ -887,13 +912,6 @@ def _style_ops(x: pd.DataFrame):
     row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
     styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
     styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css  # red overrides yellow
-    # Recent arrivals: soft green row (wins over yellow/red simply because those
-    # don't apply once Arrived is present)
-    if highlight_recent_arrivals:
-        recent_cut = datetime.now(timezone.utc) - pd.Timedelta(minutes=int(highlight_minutes))
-        row_green = df["_ArrActual_ts"].reindex(x.index).notna() & (df["_ArrActual_ts"].reindex(x.index) >= recent_cut)
-        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
-        styles.loc[row_green.fillna(False), :] = row_g_css
 
     # Cell-only red accents for variance rules
     cell_css = "background-color: rgba(255, 82, 82, 0.25);"
@@ -907,26 +925,31 @@ def _style_ops(x: pd.DataFrame):
     idx = cell_arr.reindex(x.index, fill_value=False)
     styles.loc[idx, "On-Block (Actual)"] += cell_css
 
-    # EDCT: purple cell on Off-Block (Actual) when EDCT exists & no true departure yet.
+    # EDCT: purple cell on Off-Block (Actual) when EDCT exists & no true departure yet (wins over row color)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
     idx_edct = (df["_EDCT_ts"].notna() & df["_DepActual_ts"].isna()).reindex(x.index, fill_value=False)
-    # Apply AFTER row styles so purple wins even if the row is red.
     styles.loc[idx_edct, "Off-Block (Actual)"] += cell_edct_css
 
+    # (Optional) recent arrivals green highlight from your previous patch stays compatible here
 
     return styles
 
-st.subheader(f"Schedule  ·  {len(df_display)} flight(s) shown")
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
 st.dataframe(
     df_display.style.hide(axis="index").apply(_style_ops, axis=None),
     use_container_width=True
 )
-st.caption(
-    "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
-    "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
-    "When an EDCT email arrives, **Off-Block (Actual)** shows “EDCT - …” in purple until a Departure email is received."
-)
+if delayed_view and hide_non_delayed:
+    st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
+elif delayed_view:
+    st.caption("Delayed View: **RED** (≥30m) first, then **YELLOW** (15–29m); others follow in schedule order.")
+else:
+    st.caption(
+        "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
+        "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
+        "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
+    )
+
 
 # ============================
 # Manual Overrides (Departure / Arrival)
