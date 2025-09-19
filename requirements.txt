@@ -2,3 +2,4 @@ streamlit
 pandas
 streamlit-autorefresh
 python-dateutil
+tzlocal
