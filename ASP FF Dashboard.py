@@ -733,7 +733,7 @@ expected_cols = [
 ]
 missing = [c for c in expected_cols if c not in df_raw.columns]
 if missing:
-    st.error(f"Missing expected columns: {missing}")
+    st.error(f"Missing expected columns= {missing}")
     st.stop()
 
 df = df_raw.copy()
@@ -743,12 +743,12 @@ df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
 df["From_ICAO"] = df["From (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
 df["To_ICAO"]   = df["To (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
 
-if "From (IATA)" in df_raw.columns:
+if "From (IATA)" in df_raw.columns=
     df["From_IATA"] = df_raw["From (IATA)"].astype(str).str.strip().str.upper()
 else:
     df["From_IATA"] = df["From_ICAO"].apply(derive_iata_from_icao)
 
-if "To (IATA)" in df_raw.columns:
+if "To (IATA)" in df_raw.columns=
     df["To_IATA"] = df_raw["To (IATA)"].astype(str).str.strip().str.upper()
 else:
     df["To_IATA"] = df["To_ICAO"].apply(derive_iata_from_icao)
@@ -1060,7 +1060,7 @@ row_green = _base["_ArrActual_ts"].notna() & (_base["_ArrActual_ts"] >= recent_c
 idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
 
 def _style_ops(x: pd.DataFrame):
-    styles = pd.DataFrame("", index=x.index, columns:x.columns)
+    styles = pd.DataFrame("", index=x.index, columns=x.columns)
 
     # 1) Row backgrounds: YELLOW then RED
     row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
