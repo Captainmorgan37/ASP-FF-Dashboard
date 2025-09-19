@@ -765,6 +765,29 @@ if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
 # ============================
+# Post-arrival visibility controls
+# ============================
+v1, v2, v3 = st.columns([1, 1, 1])
+with v1:
+    highlight_recent_arrivals = st.checkbox("Highlight recently landed", value=True)
+with v2:
+    highlight_minutes = st.number_input("Highlight window (min)", min_value=10, max_value=240, value=60, step=5)
+with v3:
+    auto_hide_landed = st.checkbox("Auto-hide landed", value=True)
+hide_hours = st.number_input("Hide landed after (hours)", min_value=1, max_value=24, value=2, step=1)
+
+# Hide legs that landed more than N hours ago (if enabled)
+now_utc = datetime.now(timezone.utc)
+if auto_hide_landed:
+    cutoff_hide = now_utc - pd.Timedelta(hours=int(hide_hours))
+    df = df[~(df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] < cutoff_hide))].copy()
+
+# (Re)compute these after filtering so masks align cleanly
+has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
+has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
+
+
+# ============================
 # Sort, compute row/cell highlights, display
 # ============================
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
@@ -834,6 +857,13 @@ def _style_ops(x: pd.DataFrame):
     idx_edct = (df["_EDCT_ts"].notna() & df["_DepActual_ts"].isna()).reindex(x.index, fill_value=False)
     # Apply AFTER row styles so purple wins even if the row is red.
     styles.loc[idx_edct, "Off-Block (Actual)"] += cell_edct_css
+    # Recent arrivals: soft green row (wins over yellow/red simply because those
+    # don't apply once Arrived is present)
+    if highlight_recent_arrivals:
+        recent_cut = datetime.now(timezone.utc) - pd.Timedelta(minutes=int(highlight_minutes))
+        row_green = df["_ArrActual_ts"].reindex(x.index).notna() & (df["_ArrActual_ts"].reindex(x.index) >= recent_cut)
+        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
+        styles.loc[row_green.fillna(False), :] = row_g_css
 
     return styles
 
