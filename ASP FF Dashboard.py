@@ -1113,29 +1113,47 @@ except Exception:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
 
-# -------- Compact Quick Notify panel (only delayed visible flights) --------
+# -------- Quick Notify (ANY triggered delay: row yellow/red OR red cell accents) --------
 _show = (df_view if delayed_view else df).reset_index(drop=True)
 
-# Recompute "delayed" masks for the currently visible rows
 _now = datetime.now(timezone.utc)
-_thr = pd.Timedelta(minutes=int(delay_threshold_min))
+thr = pd.Timedelta(minutes=int(delay_threshold_min))                # e.g., 15
+red_thr = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))   # red at 30+
 
+# Recompute masks on the currently visible rows
 no_dep = _show["_DepActual_ts"].isna()
+has_dep = _show["_DepActual_ts"].notna()
 no_arr = _show["_ArrActual_ts"].isna()
+
+dep_lateness = _now - _show["ETD_UTC"]
 eta_base = _show["_ETA_FA_ts"].where(_show["_ETA_FA_ts"].notna(), _show["ETA_UTC"])
+eta_lateness = _now - eta_base
 
-dep_side_delay = _show["ETD_UTC"].notna() & no_dep & ((_now - _show["ETD_UTC"]) > _thr)
-arr_side_delay = eta_base.notna() & (~no_dep) & no_arr & ((_now - eta_base) > _thr)
+# Row delays (same logic as styling)
+row_dep_yellow = _show["ETD_UTC"].notna() & no_dep & (dep_lateness > thr) & (dep_lateness < red_thr)
+row_dep_red    = _show["ETD_UTC"].notna() & no_dep & (dep_lateness >= red_thr)
 
-delayed_mask = dep_side_delay | arr_side_delay
-_delayed = _show[delayed_mask].reset_index(drop=True)
+row_arr_yellow = eta_base.notna() & has_dep & no_arr & (eta_lateness > thr) & (eta_lateness < red_thr)
+row_arr_red    = eta_base.notna() & has_dep & no_arr & (eta_lateness >= red_thr)
 
-with st.expander(
-    "Quick Notify (delayed flights only)",
-    expanded=bool(len(_delayed) > 0)
-):
+row_yellow = row_dep_yellow | row_arr_yellow
+row_red    = row_dep_red    | row_arr_red
+
+# Red cell accents (variance > threshold vs scheduled)
+dep_var = _show["_DepActual_ts"] - _show["ETD_UTC"]
+eta_var = _show["_ETA_FA_ts"]    - _show["ETA_UTC"]
+arr_var = _show["_ArrActual_ts"] - _show["ETA_UTC"]
+
+cell_dep = dep_var.notna() & (dep_var > thr)
+cell_eta = eta_var.notna() & (eta_var > thr)
+cell_arr = arr_var.notna() & (arr_var > thr)
+
+any_delay = row_yellow | row_red | cell_dep | cell_eta | cell_arr
+_delayed = _show[any_delay].reset_index(drop=True)
+
+with st.expander("Quick Notify (any triggered delays)", expanded=bool(len(_delayed) > 0)):
     if _delayed.empty:
-        st.caption("No delayed flights right now 🎉")
+        st.caption("No triggered delays right now 🎉")
     else:
         st.caption("Click to post a one-click update to Telus BC. ETA shows destination **local time**.")
         for i, row in _delayed.iterrows():
