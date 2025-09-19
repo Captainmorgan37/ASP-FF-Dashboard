@@ -839,6 +839,13 @@ def _style_ops(x: pd.DataFrame):
     row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
     styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
     styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css  # red overrides yellow
+    # Recent arrivals: soft green row (wins over yellow/red simply because those
+    # don't apply once Arrived is present)
+    if highlight_recent_arrivals:
+        recent_cut = datetime.now(timezone.utc) - pd.Timedelta(minutes=int(highlight_minutes))
+        row_green = df["_ArrActual_ts"].reindex(x.index).notna() & (df["_ArrActual_ts"].reindex(x.index) >= recent_cut)
+        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
+        styles.loc[row_green.fillna(False), :] = row_g_css
 
     # Cell-only red accents for variance rules
     cell_css = "background-color: rgba(255, 82, 82, 0.25);"
@@ -857,13 +864,7 @@ def _style_ops(x: pd.DataFrame):
     idx_edct = (df["_EDCT_ts"].notna() & df["_DepActual_ts"].isna()).reindex(x.index, fill_value=False)
     # Apply AFTER row styles so purple wins even if the row is red.
     styles.loc[idx_edct, "Off-Block (Actual)"] += cell_edct_css
-    # Recent arrivals: soft green row (wins over yellow/red simply because those
-    # don't apply once Arrived is present)
-    if highlight_recent_arrivals:
-        recent_cut = datetime.now(timezone.utc) - pd.Timedelta(minutes=int(highlight_minutes))
-        row_green = df["_ArrActual_ts"].reindex(x.index).notna() & (df["_ArrActual_ts"].reindex(x.index) >= recent_cut)
-        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
-        styles.loc[row_green.fillna(False), :] = row_g_css
+
 
     return styles
 
