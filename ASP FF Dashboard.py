@@ -1097,9 +1097,6 @@ fmt_map = {
 
 # ----------------- Schedule render with inline Notify -----------------
 
-# Add placeholder Notify column (text only, keeps pretty styling)
-df_display["📣 Notify"] = [f"notify_{b}" for b in view_df["Booking"]]
-
 styler = df_display.style
 if hasattr(styler, "hide_index"):
     styler = styler.hide_index()
