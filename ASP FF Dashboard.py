@@ -222,38 +222,36 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
     except Exception:
         return None
 
+# Drop-in replacement: single time box (no st.time_input)
 def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = None) -> datetime:
-    """Stateful UTC datetime picker with a quick 'HHMM' text box.
-    Accepts '1005', '10:05', '4pm', '4:05pm', '2205', etc."""
+    """Stateful UTC datetime picker with ONE time box that accepts 1005, 10:05, 4pm, etc."""
     if initial_dt_utc is None:
         initial_dt_utc = datetime.now(timezone.utc)
 
     date_key = f"{key}__date"
-    time_key = f"{key}__time"
-    quick_key = f"{key}__quick"
+    time_txt_key = f"{key}__time_txt"
+    time_obj_key = f"{key}__time_obj"  # last good parsed time
 
     # Seed once
     if date_key not in st.session_state:
         st.session_state[date_key] = initial_dt_utc.date()
-    if time_key not in st.session_state:
-        st.session_state[time_key] = initial_dt_utc.time().replace(microsecond=0)
-    if quick_key not in st.session_state:
-        st.session_state[quick_key] = ""
+    if time_obj_key not in st.session_state:
+        st.session_state[time_obj_key] = initial_dt_utc.time().replace(microsecond=0)
+    if time_txt_key not in st.session_state:
+        st.session_state[time_txt_key] = st.session_state[time_obj_key].strftime("%H:%M")
 
-    # Widgets
     d = st.date_input(f"{label} — Date (UTC)", key=date_key)
-    t = st.time_input(f"{label} — Time (UTC)", key=time_key)
+    txt = st.text_input(
+        f"{label} — Time (UTC)",
+        key=time_txt_key,
+        placeholder="e.g., 1005 or 10:05 or 4pm",
+    )
 
-    # Quick time entry that also accepts 1005, 4pm, etc.
-    q = st.text_input(f"{label} — Quick time (HHMM / HH:MM / 4pm)", key=quick_key, placeholder="e.g., 1005")
-
-    # Parse quick time if provided; update the main time widget's state
-    def _parse_loose_time(txt: str):
-        s = (txt or "").strip().lower().replace(" ", "")
+    def _parse_loose_time(s: str):
+        s = (s or "").strip().lower().replace(" ", "")
         if not s:
             return None
-
-        # Extract and strip am/pm
+        # strip am/pm
         ampm = None
         if s.endswith("am") or s.endswith("pm"):
             ampm = s[-2:]
@@ -266,38 +264,34 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
                 hh, mm = int(hh_str), int(mm_str)
             except Exception:
                 return None
-        else:
-            # Accept 3–4 digits (HHMM) or 1–2 digits (HH)
-            if s.isdigit():
-                if len(s) in (3, 4):
-                    s = s.zfill(4)
-                    hh, mm = int(s[:2]), int(s[2:])
-                elif len(s) in (1, 2):
-                    hh, mm = int(s), 0
-                else:
-                    return None
+        elif s.isdigit():
+            # accept HHMM (3–4 digits) or HH (1–2 digits)
+            if len(s) in (3, 4):
+                s = s.zfill(4)
+                hh, mm = int(s[:2]), int(s[2:])
+            elif len(s) in (1, 2):
+                hh, mm = int(s), 0
             else:
                 return None
+        else:
+            return None
 
-        # Apply am/pm if present
         if ampm:
             if hh == 12:
                 hh = 0
             if ampm == "pm":
                 hh += 12
-
         if not (0 <= hh <= 23 and 0 <= mm <= 59):
             return None
-
-        # Build a time object via strptime to avoid needing datetime.time import
         return datetime.strptime(f"{hh:02d}:{mm:02d}", "%H:%M").time()
 
-    if q:
-        parsed_t = _parse_loose_time(q)
-        if parsed_t is not None:
-            st.session_state[time_key] = parsed_t
+    parsed = _parse_loose_time(txt)
+    if parsed is not None:
+        st.session_state[time_obj_key] = parsed
+        # normalize textbox to HH:MM so it stays consistent
+        st.session_state[time_txt_key] = parsed.strftime("%H:%M")
 
-
+    return datetime.combine(st.session_state[date_key], st.session_state[time_obj_key]).replace(tzinfo=timezone.utc)
 
 
 # ---------- Subject-aware parsing ----------
