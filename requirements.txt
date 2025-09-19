@@ -3,3 +3,4 @@ pandas
 streamlit-autorefresh
 python-dateutil
 tzlocal
+timezonefinder
