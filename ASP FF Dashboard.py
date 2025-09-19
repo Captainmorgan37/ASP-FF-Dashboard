@@ -222,27 +222,81 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
     except Exception:
         return None
 
-# REPLACE your existing utc_datetime_picker with this:
-
 def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = None) -> datetime:
-    """Stateful UTC datetime picker (persists across reruns/auto-refresh)."""
+    """Stateful UTC datetime picker with a quick 'HHMM' text box.
+    Accepts '1005', '10:05', '4pm', '4:05pm', '2205', etc."""
     if initial_dt_utc is None:
         initial_dt_utc = datetime.now(timezone.utc)
 
     date_key = f"{key}__date"
     time_key = f"{key}__time"
+    quick_key = f"{key}__quick"
 
-    # Seed once (only if not already set)
+    # Seed once
     if date_key not in st.session_state:
         st.session_state[date_key] = initial_dt_utc.date()
     if time_key not in st.session_state:
         st.session_state[time_key] = initial_dt_utc.time().replace(microsecond=0)
+    if quick_key not in st.session_state:
+        st.session_state[quick_key] = ""
 
-    # Use session state as the single source of truth (no dynamic 'value=')
+    # Widgets
     d = st.date_input(f"{label} — Date (UTC)", key=date_key)
     t = st.time_input(f"{label} — Time (UTC)", key=time_key)
 
-    return datetime.combine(d, t).replace(tzinfo=timezone.utc)
+    # Quick time entry that also accepts 1005, 4pm, etc.
+    q = st.text_input(f"{label} — Quick time (HHMM / HH:MM / 4pm)", key=quick_key, placeholder="e.g., 1005")
+
+    # Parse quick time if provided; update the main time widget's state
+    def _parse_loose_time(txt: str):
+        s = (txt or "").strip().lower().replace(" ", "")
+        if not s:
+            return None
+
+        # Extract and strip am/pm
+        ampm = None
+        if s.endswith("am") or s.endswith("pm"):
+            ampm = s[-2:]
+            s = s[:-2]
+
+        hh = mm = None
+        if ":" in s:
+            try:
+                hh_str, mm_str = s.split(":", 1)
+                hh, mm = int(hh_str), int(mm_str)
+            except Exception:
+                return None
+        else:
+            # Accept 3–4 digits (HHMM) or 1–2 digits (HH)
+            if s.isdigit():
+                if len(s) in (3, 4):
+                    s = s.zfill(4)
+                    hh, mm = int(s[:2]), int(s[2:])
+                elif len(s) in (1, 2):
+                    hh, mm = int(s), 0
+                else:
+                    return None
+            else:
+                return None
+
+        # Apply am/pm if present
+        if ampm:
+            if hh == 12:
+                hh = 0
+            if ampm == "pm":
+                hh += 12
+
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+
+        # Build a time object via strptime to avoid needing datetime.time import
+        return datetime.strptime(f"{hh:02d}:{mm:02d}", "%H:%M").time()
+
+    if q:
+        parsed_t = _parse_loose_time(q)
+        if parsed_t is not None:
+            st.session_state[time_key] = parsed_t
+
 
 
 
