@@ -1,4 +1,5 @@
-# daily_ops_dashboard.py
+# daily_ops_dashboard.py  — FF Dashboard with inline Notify + local ETA conversion
+
 import re
 import sqlite3
 import imaplib, email
@@ -11,7 +12,7 @@ import streamlit as st
 from dateutil import parser as dateparse
 from dateutil.tz import tzoffset
 import tzlocal  # for local-time HHMM in the notify message
-
+import pytz  # NEW: for airport-local ETA conversion
 
 # ============================
 # Page config
@@ -232,14 +233,26 @@ def _build_delay_msg(tail: str, booking: str, minutes_delta: int, new_eta_hhmm: 
     label = "LATE" if int(minutes_delta) >= 0 else "EARLY"
     mins = abs(int(minutes_delta))
 
-    # Accept "2032", "20:32", "2032 LT", "20:32 LT" → normalize to "2032 LT"
-    s = re.sub(r"[^0-9]", "", new_eta_hhmm or "")
-    eta_lt = (s if len(s) == 4 else s.zfill(4)) + " LT"
+    # If caller already passed "HHMM LT"/"HHMM UTC", keep it; else normalize HHMM → "HHMM LT"
+    s = (new_eta_hhmm or "").strip()
+    if not s:
+        eta_disp = ""
+    else:
+        if re.search(r"\b(LT|UTC)\b$", s):
+            eta_disp = s
+        else:
+            # Accept "2032" or "20:32" and tag as LT by default
+            digits = re.sub(r"[^0-9]", "", s)
+            if len(digits) in (3, 4):
+                digits = digits.zfill(4)
+                eta_disp = f"{digits} LT"
+            else:
+                eta_disp = f"{s} LT"
 
     return (
         f"TAIL#/BOOKING#: {tail_disp}//{booking}\n"
         f"{label}: {mins} minutes\n"
-        f"UPDATED ETA: {eta_lt}"
+        f"UPDATED ETA: {eta_disp}"
     )
 
 def post_to_telus_team(team: str, text: str) -> tuple[bool, str]:
@@ -967,13 +980,15 @@ view_df["Off-Block (Actual)"] = view_df.apply(_offblock_actual_display, axis=1)
 
 df_display = view_df[display_cols].copy()
 
-# ----------------- Inline Notify (per-row buttons) -----------------
-import pytz
-from timezonefinder import TimezoneFinder
+# ----------------- Notify helpers used by buttons -----------------
+local_tz = tzlocal.get_localzone()
 
-tf = TimezoneFinder()
+def _default_minutes_delta(row) -> int:
+    if pd.notna(row["_ETA_FA_ts"]) and pd.notna(row["ETA_UTC"]):
+        return int(round((row["_ETA_FA_ts"] - row["ETA_UTC"]).total_seconds() / 60.0))
+    return 0
 
-# Map ICAO codes to timezones (expand as needed)
+# NEW: airport-local ETA string for notifications (HHMM LT) with fallback to UTC
 ICAO_TZ_MAP = {
     "CYYZ": "America/Toronto",
     "CYUL": "America/Toronto",
@@ -986,66 +1001,24 @@ ICAO_TZ_MAP = {
     "CYQB": "America/Toronto",
     "CYXE": "America/Regina",
     "CYQR": "America/Regina",
-    # Add more as needed
+    # add more as needed
 }
-
 def get_local_eta_str(row) -> str:
-    """Convert ETA (forecast or scheduled) to local time at arrival airport."""
     base = row["_ETA_FA_ts"] if pd.notna(row["_ETA_FA_ts"]) else row["ETA_UTC"]
     if pd.isna(base):
         return ""
     icao = str(row["To_ICAO"]).upper()
     if not icao or len(icao) != 4:
-        return base.strftime("%H%M UTC")
-
+        return pd.Timestamp(base).strftime("%H%M UTC")
     try:
         tzname = ICAO_TZ_MAP.get(icao)
         if not tzname:
-            return base.strftime("%H%M UTC")
-
-        local_tz = pytz.timezone(tzname)
-        ts = pd.Timestamp(base).tz_convert(local_tz)
+            return pd.Timestamp(base).strftime("%H%M UTC")
+        local = pytz.timezone(tzname)
+        ts = pd.Timestamp(base).tz_convert(local)
         return ts.strftime("%H%M LT")
     except Exception:
-        return base.strftime("%H%M UTC")
-
-# Inline renderer
-st.markdown("### Schedule with Inline Notify")
-_show_df = (df_view if delayed_view else df).reset_index(drop=True)
-
-for i, row in _show_df.iterrows():
-    cols = st.columns([10, 2])
-    with cols[0]:
-        etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
-        st.write(
-            f"**{row['Booking']} · {row['Aircraft']}** | "
-            f"{row['Route']} | ETD {etd_txt} | "
-            f"ETA {get_local_eta_str(row)} | Status: {row['Status']}"
-        )
-    with cols[1]:
-        if st.button("📣 Notify", key=f"notify_{row['Booking']}"):
-            # Default to first configured team
-            teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
-            if not teams:
-                st.error("No TELUS teams configured in secrets.")
-            else:
-                ok, err = post_to_telus_team(
-                    team=teams[0],
-                    text=_build_delay_msg(
-                        row["Aircraft"],
-                        row["Booking"],
-                        _default_minutes_delta(row),
-                        get_local_eta_str(row),
-                    ),
-                )
-                if ok:
-                    st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
-                else:
-                    st.error(f"Failed: {err}")
-
-# ----------------- end inline notify -----------------
-
-# ===== Schedule table render (NOT inside any tcol) =====
+        return pd.Timestamp(base).strftime("%H%M UTC")
 
 # ---------- Styling masks + _style_ops (define before building styler) ----------
 _base = view_df  # same frame used to make df_display; contains internal *_ts columns
@@ -1087,7 +1060,7 @@ row_green = _base["_ArrActual_ts"].notna() & (_base["_ArrActual_ts"] >= recent_c
 idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
 
 def _style_ops(x: pd.DataFrame):
-    styles = pd.DataFrame("", index=x.index, columns=x.columns)
+    styles = pd.DataFrame("", index=x.index, columns:x.columns)
 
     # 1) Row backgrounds: YELLOW then RED
     row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
@@ -1124,10 +1097,9 @@ fmt_map = {
 
 # ----------------- Schedule render with inline Notify -----------------
 
-# Add placeholder Notify column (real buttons rendered separately)
-df_display["📣 Notify"] = [f"notify_{b}" for b in df_display["Booking"]]
+# Add placeholder Notify column (text only, keeps pretty styling)
+df_display["📣 Notify"] = [f"notify_{b}" for b in view_df["Booking"]]
 
-# Keep underlying datetimes for sort, apply styling
 styler = df_display.style
 if hasattr(styler, "hide_index"):
     styler = styler.hide_index()
@@ -1144,20 +1116,21 @@ except Exception:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
 
-# Render actual Notify buttons (keeps table pretty + functional)
-for _, row in df.iterrows():
+# Render one-click Notify buttons (kept separate so we don't break table styling)
+_show_df_for_buttons = (df_view if delayed_view else df).reset_index(drop=True)
+for _, row in _show_df_for_buttons.iterrows():
     if st.button("📣 Notify", key=f"notify_{row['Booking']}"):
         teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
         if not teams:
             st.error("No TELUS teams configured in secrets.")
         else:
             ok, err = post_to_telus_team(
-                team=teams[0],  # default to first configured team
+                team=teams[0],  # default first team
                 text=_build_delay_msg(
                     row["Aircraft"],
                     row["Booking"],
                     _default_minutes_delta(row),
-                    get_local_eta_str(row),  # local ETA conversion
+                    get_local_eta_str(row),  # HHMM LT (or HHMM UTC fallback)
                 ),
             )
             if ok:
@@ -1165,7 +1138,6 @@ for _, row in df.iterrows():
             else:
                 st.error(f"Failed: {err}")
 
-# Caption logic preserved
 if delayed_view and hide_non_delayed:
     st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
 elif delayed_view:
@@ -1176,9 +1148,8 @@ else:
         "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
         "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
     )
-# ----------------- end schedule render -----------------
 
-    
+# ----------------- end schedule render -----------------
 
 
 # ============================
