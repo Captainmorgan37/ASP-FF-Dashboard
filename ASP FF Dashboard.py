@@ -1122,6 +1122,12 @@ fmt_map = {
     # NOTE: "Off-Block (Actual)" is already a string with optional EDCT prefix
 }
 
+# ----------------- Schedule render with inline Notify -----------------
+
+# Add placeholder Notify column (real buttons rendered separately)
+df_display["📣 Notify"] = [f"notify_{b}" for b in df_display["Booking"]]
+
+# Keep underlying datetimes for sort, apply styling
 styler = df_display.style
 if hasattr(styler, "hide_index"):
     styler = styler.hide_index()
@@ -1138,6 +1144,28 @@ except Exception:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
 
+# Render actual Notify buttons (keeps table pretty + functional)
+for _, row in df.iterrows():
+    if st.button("📣 Notify", key=f"notify_{row['Booking']}"):
+        teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
+        if not teams:
+            st.error("No TELUS teams configured in secrets.")
+        else:
+            ok, err = post_to_telus_team(
+                team=teams[0],  # default to first configured team
+                text=_build_delay_msg(
+                    row["Aircraft"],
+                    row["Booking"],
+                    _default_minutes_delta(row),
+                    get_local_eta_str(row),  # local ETA conversion
+                ),
+            )
+            if ok:
+                st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+            else:
+                st.error(f"Failed: {err}")
+
+# Caption logic preserved
 if delayed_view and hide_non_delayed:
     st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
 elif delayed_view:
@@ -1148,6 +1176,7 @@ else:
         "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
         "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
     )
+# ----------------- end schedule render -----------------
 
     
 
