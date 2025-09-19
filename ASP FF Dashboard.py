@@ -1096,27 +1096,45 @@ def _style_ops(x: pd.DataFrame):
 # ---------- end styling block ----------
 
     
-    # Time-only display, but keep sorting by underlying datetimes (except Off-Block (Actual), which is text)
-    styler = df_display.style.hide(axis="index").apply(_style_ops, axis=None).format({
-        "Off-Block (Est)":   lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-        "On-Block (Est)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-        "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-        "On-Block (Actual)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-        # "Off-Block (Actual)" stays as text (EDCT prefix handled above)
-    })
+# Time-only display, but keep sorting by underlying datetimes
+fmt_map = {
+    "Off-Block (Est)":   lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "On-Block (Est)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "On-Block (Actual)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    # NOTE: "Off-Block (Actual)" stays as text (handles EDCT prefix earlier)
+}
 
+styler = df_display.style
+# Hide index (pandas 1.x vs 2.x)
+if hasattr(styler, "hide_index"):
+    styler = styler.hide_index()
+else:
+    styler = styler.hide(axis="index")
+
+try:
+    # Some envs choke on axis=None; if so we fall back below
+    styler = styler.apply(_style_ops, axis=None).format(fmt_map)
     st.dataframe(styler, use_container_width=True)
+except Exception:
+    # Fallback: show plain table (still time-only), no styling
+    st.warning("Styling disabled (env compatibility). Showing plain table.")
+    tmp = df_display.copy()
+    for c in ["Off-Block (Est)", "On-Block (Est)", "ETA (FA)", "On-Block (Actual)"]:
+        tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
+    st.dataframe(tmp, use_container_width=True)
 
-    if delayed_view and hide_non_delayed:
-        st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
-    elif delayed_view:
-        st.caption("Delayed View: **RED** (≥30m) first, then **YELLOW** (15–29m); others follow in schedule order.")
-    else:
-        st.caption(
-            "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
-            "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
-            "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
-        )
+if delayed_view and hide_non_delayed:
+    st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
+elif delayed_view:
+    st.caption("Delayed View: **RED** (≥30m) first, then **YELLOW** (15–29m); others follow in schedule order.")
+else:
+    st.caption(
+        "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
+        "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
+        "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
+    )
+
 
 
 
