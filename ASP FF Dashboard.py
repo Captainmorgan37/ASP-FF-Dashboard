@@ -1114,12 +1114,11 @@ except Exception:
     st.dataframe(tmp, use_container_width=True)
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
-_show = (df_view if delayed_view else df).reset_index(drop=True)
+_show = (df_view if delayed_view else df)  # NOTE: keep original index; do NOT reset here
 
-_now = datetime.now(timezone.utc)
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
-# Variances vs schedule (same as styling logic)
+# Variances vs schedule (same as styling)
 dep_var = _show["_DepActual_ts"] - _show["ETD_UTC"]   # Off-Block (Actual) − Off-Block (Est)
 eta_var = _show["_ETA_FA_ts"]    - _show["ETA_UTC"]   # ETA(FA) − On-Block (Est)
 arr_var = _show["_ArrActual_ts"] - _show["ETA_UTC"]   # On-Block (Actual) − On-Block (Est)
@@ -1130,33 +1129,29 @@ cell_arr = arr_var.notna() & (arr_var > thr)
 
 # Only flights with any red cell accent
 any_cell_delay = cell_dep | cell_eta | cell_arr
-_delayed = _show[any_cell_delay].reset_index(drop=True)
+_delayed = _show[any_cell_delay].copy()  # keep original index for mask lookup
 
 def _mins(td: pd.Timedelta | None) -> int:
     if td is None or pd.isna(td): return 0
     return int(round(td.total_seconds() / 60.0))
 
-def _top_reason(i: int) -> tuple[str, int]:
+def _min_word(n: int) -> str:
+    return "min" if abs(int(n)) == 1 else "mins"
+
+def _top_reason(idx) -> tuple[str, int]:
     """
     Return (reason_text, minutes) using priority:
     On-Block Actual > ETA(FA) > Off-Block Actual
     """
-    # 1) On-Block (Actual) vs On-Block (Est)
-    if bool(cell_arr.iloc[i]):
-        m = _mins(arr_var.iloc[i])
-        return (f"🔴 **On-Block (Actual)** is {m} min later than **On-Block (Est)**", m)
-
-    # 2) ETA (FA) vs On-Block (Est)
-    if bool(cell_eta.iloc[i]):
-        m = _mins(eta_var.iloc[i])
-        return (f"🔴 **ETA (FA)** is {m} min later than **On-Block (Est)**", m)
-
-    # 3) Off-Block (Actual) vs Off-Block (Est)
-    if bool(cell_dep.iloc[i]):
-        m = _mins(dep_var.iloc[i])
-        return (f"🔴 **Off-Block (Actual)** is {m} min later than **Off-Block (Est)**", m)
-
-    # Fallback (shouldn't happen)
+    if bool(cell_arr.loc[idx]):
+        m = _mins(arr_var.loc[idx])
+        return (f"🔴 Aircraft **arrived** {m} {_min_word(m)} later than **scheduled**.", m)
+    if bool(cell_eta.loc[idx]):
+        m = _mins(eta_var.loc[idx])
+        return (f"🔴 Current **ETA** is {m} {_min_word(m)} past **scheduled ETA**.", m)
+    if bool(cell_dep.loc[idx]):
+        m = _mins(dep_var.loc[idx])
+        return (f"🔴 **Actual off-block** was {m} {_min_word(m)} later than **scheduled**.", m)
     return ("Delay detected by rules, details not classifiable.", 0)
 
 with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_delayed) > 0)):
@@ -1164,32 +1159,31 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
         st.caption("No triggered cell-level delays right now 🎉")
     else:
         st.caption("Click to post a one-click update to Telus BC. ETA shows destination **local time**.")
-        for i, row in _delayed.iterrows():
+        for idx, row in _delayed.iterrows():  # use original index
             info_col, btn_col = st.columns([12, 4])
             with info_col:
                 etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
                 eta_local = get_local_eta_str(row) or "—"
-                reason_text, reason_min = _top_reason(i)
+                reason_text, _reason_min = _top_reason(idx)
                 st.markdown(
                     f"**{row['Booking']} · {row['Aircraft']}** — {row['Route']}  "
                     f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}  \n"
                     f"{reason_text}"
                 )
             with btn_col:
-                btn_key = f"notify_{row['Booking']}_{i}"
+                btn_key = f"notify_{row['Booking']}_{idx}"
                 if st.button("📣 Notify", key=btn_key):
                     teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
                     if not teams:
                         st.error("No TELUS teams configured in secrets.")
                     else:
-                        # For the message, keep using your default delta (FA ETA - sched ETA) and local ETA string
                         ok, err = post_to_telus_team(
                             team=teams[0],
                             text=_build_delay_msg(
                                 row["Aircraft"],
                                 row["Booking"],
-                                int(_default_minutes_delta(row)),
-                                get_local_eta_str(row),  # HHMM LT (or UTC fallback)
+                                int(_default_minutes_delta(row)),  # FA ETA - sched ETA if available
+                                get_local_eta_str(row),             # HHMM LT (or UTC fallback)
                             ),
                         )
                         if ok:
@@ -1197,6 +1191,7 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                         else:
                             st.error(f"Failed: {err}")
 # -------- end Quick Notify panel --------
+
 
 
 if delayed_view and hide_non_delayed:
