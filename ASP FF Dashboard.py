@@ -867,6 +867,10 @@ row_red    = row_dep_red    | row_arr_red
 dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # Off-Block (Actual true) - Off-Block (Est)
 eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Est)
 arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # On-Block (Actual) - On-Block (Est)
+# Recent arrivals green mask (keep this near your other masks)
+recent_cut = datetime.now(timezone.utc) - pd.Timedelta(minutes=int(highlight_minutes))
+row_green = df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] >= recent_cut)
+
 
 cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
@@ -907,15 +911,19 @@ df_display = (df_view if delayed_view else df)[display_cols].copy()
 def _style_ops(x: pd.DataFrame):
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
 
-    # Row backgrounds (yellow/red)
+    # 1) Row backgrounds: YELLOW then RED
     row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
     row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
     styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
     styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css  # red overrides yellow
 
-    # Cell-only red accents for variance rules
-    cell_css = "background-color: rgba(255, 82, 82, 0.25);"
+    # 2) Row overlay: GREEN (applied after Y/R so it wins at row level)
+    if highlight_recent_arrivals:
+        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
+        styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
 
+    # 3) Cell-level red accents (applied last, so specific cells stay red even on green rows)
+    cell_css = "background-color: rgba(255, 82, 82, 0.25);"
     idx = cell_dep.reindex(x.index, fill_value=False)
     styles.loc[idx, "Off-Block (Actual)"] += cell_css
 
@@ -925,14 +933,13 @@ def _style_ops(x: pd.DataFrame):
     idx = cell_arr.reindex(x.index, fill_value=False)
     styles.loc[idx, "On-Block (Actual)"] += cell_css
 
-    # EDCT: purple cell on Off-Block (Actual) when EDCT exists & no true departure yet (wins over row color)
+    # Keep EDCT LAST so the purple cell wins over row colors
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
     idx_edct = (df["_EDCT_ts"].notna() & df["_DepActual_ts"].isna()).reindex(x.index, fill_value=False)
     styles.loc[idx_edct, "Off-Block (Actual)"] += cell_edct_css
 
-    # (Optional) recent arrivals green highlight from your previous patch stays compatible here
-
     return styles
+
 
 st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
 st.dataframe(
