@@ -222,6 +222,55 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
     except Exception:
         return None
 
+import re, requests, streamlit as st
+
+def _build_delay_msg(tail: str, booking: str, minutes_delta: int, new_eta_hhmm: str) -> str:
+    # Tail like "C-FASW" or "CFASW" → "CFASW"
+    tail_disp = (tail or "").replace("-", "").upper()
+    label = "LATE" if int(minutes_delta) >= 0 else "EARLY"
+    mins = abs(int(minutes_delta))
+
+    # Accept "2032", "20:32", "2032 LT", "20:32 LT" → normalize to "2032 LT"
+    s = re.sub(r"[^0-9]", "", new_eta_hhmm or "")
+    eta_lt = (s if len(s) == 4 else s.zfill(4)) + " LT"
+
+    return (
+        f"TAIL#/BOOKING#: {tail_disp}//{booking}\n"
+        f"{label}: {mins} minutes\n"
+        f"UPDATED ETA: {eta_lt}"
+    )
+
+def post_to_telus_team(team: str, text: str) -> tuple[bool, str]:
+    url = st.secrets.get("TELUS_WEBHOOKS", {}).get(team)
+    if not url:
+        return False, f"No webhook configured for team '{team}'."
+    try:
+        r = requests.post(url, json={"text": text}, timeout=10)
+        ok = 200 <= r.status_code < 300
+        return ok, ("" if ok else f"{r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        return False, str(e)
+
+def notify_delay_chat(team: str, tail: str, booking: str, minutes_delta: int, new_eta_hhmm: str):
+    msg = _build_delay_msg(tail, booking, minutes_delta, new_eta_hhmm)
+    ok, err = post_to_telus_team(team, msg)
+    if ok:
+        st.success("Posted to TELUS BC team.")
+    else:
+        st.error(f"Post failed: {err}")
+
+with st.expander("Notify TELUS BC (Delay/Early)"):
+    team = st.selectbox("Team", list(st.secrets.get("TELUS_WEBHOOKS", {}).keys()))
+    tail = st.text_input("Tail", "C-FASW")
+    booking = st.text_input("Booking", "SOWUZ1")
+    minutes_delta = st.number_input("+late / -early (minutes)", value=55, step=1)
+    eta_hhmm = st.text_input("Updated ETA (local, HHMM or HH:MM)", "2032")
+
+    if st.button("Send to Team"):
+        notify_delay_chat(team, tail, booking, minutes_delta, eta_hhmm)
+
+
+
 # Drop-in replacement: single time box (no writes back to the widget key)
 def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = None) -> datetime:
     """Stateful UTC datetime picker with ONE time box that accepts 1005, 10:05, 4pm, etc."""
