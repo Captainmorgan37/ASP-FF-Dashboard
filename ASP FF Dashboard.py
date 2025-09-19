@@ -1028,15 +1028,17 @@ if st.session_state.get("notify_ctx"):
             eta_hhmm = st.text_input("Updated ETA (HHMM / HH:MM)", value=ctx["eta"], key="notify_eta")
 
             csend, ccancel = st.columns([1, 1])
-            if csend.button("Send", key="notify_send"):
-                notify_delay_chat(team, ctx["tail"], ctx["booking"],
-                                  int(st.session_state["notify_delta"]),
-                                  st.session_state["notify_eta"])
-                st.session_state.pop("notify_ctx", None)
-                st.experimental_rerun()
-            if ccancel.button("Cancel", key="notify_cancel"):
-                st.session_state.pop("notify_ctx", None)
-                st.experimental_rerun()
+if csend.button("Send", key="notify_send"):
+    notify_delay_chat(team, ctx["tail"], ctx["booking"],
+                      int(st.session_state["notify_delta"]),
+                      st.session_state["notify_eta"])
+    st.session_state.pop("notify_ctx", None)
+    st.rerun()
+
+if ccancel.button("Cancel", key="notify_cancel"):
+    st.session_state.pop("notify_ctx", None)
+    st.rerun()
+
 # ----------------- end notify toolbar -----------------
 
 # ===== Schedule table render (NOT inside any tcol) =====
