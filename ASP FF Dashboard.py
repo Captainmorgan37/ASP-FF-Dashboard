@@ -1113,42 +1113,60 @@ except Exception:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
 
-# -------- Compact Quick Notify panel (for currently visible rows) --------
-with st.expander("Quick Notify (visible flights)", expanded=False):
-    _show_df_for_buttons = (df_view if delayed_view else df).reset_index(drop=True)
+# -------- Compact Quick Notify panel (only delayed visible flights) --------
+_show = (df_view if delayed_view else df).reset_index(drop=True)
 
-    # a thin header
-    st.caption("Click to post a one-click update to Telus BC. ETA shows destination **local time**.")
-    for i, row in _show_df_for_buttons.iterrows():
-        # 12/4 grid keeps the button aligned close to the row info
-        info_col, btn_col = st.columns([12, 4])
-        with info_col:
-            etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
-            eta_local = get_local_eta_str(row) or "—"
-            st.markdown(
-                f"**{row['Booking']} · {row['Aircraft']}** — {row['Route']}  "
-                f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}"
-            )
-        with btn_col:
-            btn_key = f"notify_{row['Booking']}_{i}"
-            if st.button("📣 Notify", key=btn_key):
-                teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
-                if not teams:
-                    st.error("No TELUS teams configured in secrets.")
-                else:
-                    ok, err = post_to_telus_team(
-                        team=teams[0],
-                        text=_build_delay_msg(
-                            row["Aircraft"],
-                            row["Booking"],
-                            int(_default_minutes_delta(row)),
-                            get_local_eta_str(row),  # HHMM LT (or UTC fallback)
-                        ),
-                    )
-                    if ok:
-                        st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+# Recompute "delayed" masks for the currently visible rows
+_now = datetime.now(timezone.utc)
+_thr = pd.Timedelta(minutes=int(delay_threshold_min))
+
+no_dep = _show["_DepActual_ts"].isna()
+no_arr = _show["_ArrActual_ts"].isna()
+eta_base = _show["_ETA_FA_ts"].where(_show["_ETA_FA_ts"].notna(), _show["ETA_UTC"])
+
+dep_side_delay = _show["ETD_UTC"].notna() & no_dep & ((_now - _show["ETD_UTC"]) > _thr)
+arr_side_delay = eta_base.notna() & (~no_dep) & no_arr & ((_now - eta_base) > _thr)
+
+delayed_mask = dep_side_delay | arr_side_delay
+_delayed = _show[delayed_mask].reset_index(drop=True)
+
+with st.expander(
+    "Quick Notify (delayed flights only)",
+    expanded=bool(len(_delayed) > 0)
+):
+    if _delayed.empty:
+        st.caption("No delayed flights right now 🎉")
+    else:
+        st.caption("Click to post a one-click update to Telus BC. ETA shows destination **local time**.")
+        for i, row in _delayed.iterrows():
+            info_col, btn_col = st.columns([12, 4])
+            with info_col:
+                etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
+                eta_local = get_local_eta_str(row) or "—"
+                st.markdown(
+                    f"**{row['Booking']} · {row['Aircraft']}** — {row['Route']}  "
+                    f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}"
+                )
+            with btn_col:
+                btn_key = f"notify_{row['Booking']}_{i}"
+                if st.button("📣 Notify", key=btn_key):
+                    teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
+                    if not teams:
+                        st.error("No TELUS teams configured in secrets.")
                     else:
-                        st.error(f"Failed: {err}")
+                        ok, err = post_to_telus_team(
+                            team=teams[0],
+                            text=_build_delay_msg(
+                                row["Aircraft"],
+                                row["Booking"],
+                                int(_default_minutes_delta(row)),
+                                get_local_eta_str(row),  # HHMM LT (or UTC fallback)
+                            ),
+                        )
+                        if ok:
+                            st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+                        else:
+                            st.error(f"Failed: {err}")
 # -------- end Quick Notify panel --------
 
 
