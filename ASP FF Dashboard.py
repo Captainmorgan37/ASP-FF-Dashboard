@@ -967,88 +967,83 @@ view_df["Off-Block (Actual)"] = view_df.apply(_offblock_actual_display, axis=1)
 
 df_display = view_df[display_cols].copy()
 
-# ----------------- Notify toolbar (stable, aligned with table) -----------------
-local_tz = tzlocal.get_localzone()
+# ----------------- Inline Notify (per-row buttons) -----------------
+import pytz
+from timezonefinder import TimezoneFinder
 
-def _default_minutes_delta(row) -> int:
-    if pd.notna(row["_ETA_FA_ts"]) and pd.notna(row["ETA_UTC"]):
-        return int(round((row["_ETA_FA_ts"] - row["ETA_UTC"]).total_seconds() / 60.0))
-    return 0
+tf = TimezoneFinder()
 
-def _default_eta_hhmm(row) -> str:
+# Map ICAO codes to timezones (expand as needed)
+ICAO_TZ_MAP = {
+    "CYYZ": "America/Toronto",
+    "CYUL": "America/Toronto",
+    "CYOW": "America/Toronto",
+    "CYHZ": "America/Halifax",
+    "CYVR": "America/Vancouver",
+    "CYYC": "America/Edmonton",
+    "CYEG": "America/Edmonton",
+    "CYWG": "America/Winnipeg",
+    "CYQB": "America/Toronto",
+    "CYXE": "America/Regina",
+    "CYQR": "America/Regina",
+    # Add more as needed
+}
+
+def get_local_eta_str(row) -> str:
+    """Convert ETA (forecast or scheduled) to local time at arrival airport."""
     base = row["_ETA_FA_ts"] if pd.notna(row["_ETA_FA_ts"]) else row["ETA_UTC"]
     if pd.isna(base):
         return ""
-    ts = pd.Timestamp(base).tz_convert(local_tz)
-    return ts.strftime("%H%M")
+    icao = str(row["To_ICAO"]).upper()
+    if not icao or len(icao) != 4:
+        return base.strftime("%H%M UTC")
 
+    try:
+        tzname = ICAO_TZ_MAP.get(icao)
+        if not tzname:
+            return base.strftime("%H%M UTC")
+
+        local_tz = pytz.timezone(tzname)
+        ts = pd.Timestamp(base).tz_convert(local_tz)
+        return ts.strftime("%H%M LT")
+    except Exception:
+        return base.strftime("%H%M UTC")
+
+# Inline renderer
+st.markdown("### Schedule with Inline Notify")
 _show_df = (df_view if delayed_view else df).reset_index(drop=True)
 
-# Compact “pick a leg → prepare” toolbar right above the table
-tcol1, tcol2, tcol3 = st.columns([3.5, 1.2, 5.3])
-with tcol1:
-    st.markdown("**Notify a leg**")
-    if _show_df.empty:
-        sel_idx = None
-        st.selectbox("No rows to notify", options=[], disabled=True, key="notify_picker")
-    else:
-        options = []
-        for i, r in _show_df.iterrows():
-            etd_txt = r["ETD_UTC"].strftime("%H:%MZ") if pd.notna(r["ETD_UTC"]) else "—"
-            options.append(f"{r['Booking']} · {r['Aircraft']} · {r['Route']} · ETD {etd_txt}")
-        sel_idx = st.selectbox(
-            "Select leg",
-            options=list(range(len(options))),
-            format_func=lambda ix: options[ix],
-            key="notify_picker",
+for i, row in _show_df.iterrows():
+    cols = st.columns([10, 2])
+    with cols[0]:
+        etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
+        st.write(
+            f"**{row['Booking']} · {row['Aircraft']}** | "
+            f"{row['Route']} | ETD {etd_txt} | "
+            f"ETA {get_local_eta_str(row)} | Status: {row['Status']}"
         )
-with tcol2:
-    st.write("")  # spacing
-    if st.button("📣 Prepare", disabled=(_show_df.empty or sel_idx is None), key="notify_prepare"):
-        row = _show_df.iloc[int(sel_idx)]
-        st.session_state["notify_ctx"] = {
-            "booking": str(row["Booking"]),
-            "tail": str(row["Aircraft"]),
-            "delta": _default_minutes_delta(row),
-            "eta": _default_eta_hhmm(row),
-        }
-with tcol3:
-    st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
+    with cols[1]:
+        if st.button("📣 Notify", key=f"notify_{row['Booking']}"):
+            # Default to first configured team
+            teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
+            if not teams:
+                st.error("No TELUS teams configured in secrets.")
+            else:
+                ok, err = post_to_telus_team(
+                    team=teams[0],
+                    text=_build_delay_msg(
+                        row["Aircraft"],
+                        row["Booking"],
+                        _default_minutes_delta(row),
+                        get_local_eta_str(row),
+                    ),
+                )
+                if ok:
+                    st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+                else:
+                    st.error(f"Failed: {err}")
 
-# Single notify editor panel (appears after “Prepare”)
-if st.session_state.get("notify_ctx"):
-    ctx = st.session_state["notify_ctx"]
-    with st.expander(f"Send notice · Booking {ctx['booking']} · Tail {ctx['tail']}", expanded=True):
-        teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
-
-        team = None
-        if not teams:
-            st.warning("Add TELUS_WEBHOOKS to secrets to enable notifications.")
-        else:
-            team = st.selectbox("Team", teams, index=0, key="notify_team")
-            st.number_input("Δ minutes (+late / -early)", value=ctx["delta"], step=1, key="notify_delta")
-            st.text_input("Updated ETA (HHMM / HH:MM)", value=ctx["eta"], key="notify_eta")
-
-        send_clicked   = st.button("Send",   disabled=(not teams), key="notify_send")
-        cancel_clicked = st.button("Cancel",                      key="notify_cancel")
-
-        if send_clicked and team:
-            notify_delay_chat(
-                team,
-                ctx["tail"],
-                ctx["booking"],
-                int(st.session_state["notify_delta"]),
-                st.session_state["notify_eta"],
-            )
-            st.session_state.pop("notify_ctx", None)
-            st.rerun()
-
-        if cancel_clicked:
-            st.session_state.pop("notify_ctx", None)
-            st.rerun()
-
-
-# ----------------- end notify toolbar -----------------
+# ----------------- end inline notify -----------------
 
 # ===== Schedule table render (NOT inside any tcol) =====
 
