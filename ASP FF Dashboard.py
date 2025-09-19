@@ -1116,20 +1116,22 @@ except Exception:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
 
-# Render one-click Notify buttons (kept separate so we don't break table styling)
+# Render one-click Notify buttons (unique keys)
 _show_df_for_buttons = (df_view if delayed_view else df).reset_index(drop=True)
-for _, row in _show_df_for_buttons.iterrows():
-    if st.button("📣 Notify", key=f"notify_{row['Booking']}"):
+
+for i, row in _show_df_for_buttons.iterrows():
+    btn_key = f"notify_{row['Booking']}_{i}"  # ensure uniqueness even if Booking repeats
+    if st.button("📣 Notify", key=btn_key):
         teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
         if not teams:
             st.error("No TELUS teams configured in secrets.")
         else:
             ok, err = post_to_telus_team(
-                team=teams[0],  # default first team
+                team=teams[0],
                 text=_build_delay_msg(
                     row["Aircraft"],
                     row["Booking"],
-                    _default_minutes_delta(row),
+                    int(_default_minutes_delta(row)),
                     get_local_eta_str(row),  # HHMM LT (or HHMM UTC fallback)
                 ),
             )
@@ -1137,6 +1139,7 @@ for _, row in _show_df_for_buttons.iterrows():
                 st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
             else:
                 st.error(f"Failed: {err}")
+
 
 if delayed_view and hide_non_delayed:
     st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
