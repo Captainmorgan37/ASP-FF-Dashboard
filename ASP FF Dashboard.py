@@ -1029,6 +1029,73 @@ if st.session_state.get("notify_ctx"):
 with table_col:
     st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}")
 
+# ---------- Styling masks + _style_ops (define before building styler) ----------
+_base = view_df  # same frame used to make df_display; contains internal *_ts columns
+now_utc = datetime.now(timezone.utc)
+
+delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))           # e.g. 15
+row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # 30+
+
+# Row-level operational delays (no-email state)
+no_dep = _base["_DepActual_ts"].isna()
+dep_lateness = now_utc - _base["ETD_UTC"]
+row_dep_yellow = _base["ETD_UTC"].notna() & no_dep & (dep_lateness > delay_thr_td) & (dep_lateness < row_red_thr_td)
+row_dep_red    = _base["ETD_UTC"].notna() & no_dep & (dep_lateness >= row_red_thr_td)
+
+has_dep = _base["_DepActual_ts"].notna()
+no_arr  = _base["_ArrActual_ts"].isna()
+eta_baseline = _base["_ETA_FA_ts"].where(_base["_ETA_FA_ts"].notna(), _base["ETA_UTC"])
+eta_lateness = now_utc - eta_baseline
+row_arr_yellow = eta_baseline.notna() & has_dep & no_arr & (eta_lateness > delay_thr_td) & (eta_lateness < row_red_thr_td)
+row_arr_red    = eta_baseline.notna() & has_dep & no_arr & (eta_lateness >= row_red_thr_td)
+
+row_yellow = (row_dep_yellow | row_arr_yellow)
+row_red    = (row_dep_red    | row_arr_red)
+
+# Cell-level variance checks
+dep_delay        = _base["_DepActual_ts"] - _base["ETD_UTC"]   # Off-Block (Actual) − Off-Block (Est)
+eta_fa_vs_sched  = _base["_ETA_FA_ts"]    - _base["ETA_UTC"]   # ETA(FA) − On-Block (Est)
+arr_vs_sched     = _base["_ArrActual_ts"] - _base["ETA_UTC"]   # On-Block (Actual) − On-Block (Est)
+
+cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
+cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
+cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
+
+# Recent-arrival green overlay
+recent_cut = now_utc - pd.Timedelta(minutes=int(highlight_minutes))
+row_green = _base["_ArrActual_ts"].notna() & (_base["_ArrActual_ts"] >= recent_cut)
+
+# EDCT purple (until true departure is received)
+idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
+
+def _style_ops(x: pd.DataFrame):
+    styles = pd.DataFrame("", index=x.index, columns=x.columns)
+
+    # 1) Row backgrounds: YELLOW then RED
+    row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
+    row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
+    styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
+    styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css
+
+    # 2) GREEN overlay for recent arrivals (applied after Y/R so it wins at row level)
+    if 'highlight_recent_arrivals' in globals() and highlight_recent_arrivals:
+        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
+        styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
+
+    # 3) Cell-level red accents (apply after row colors so cells stay visible even on green rows)
+    cell_css = "background-color: rgba(255, 82, 82, 0.25);"
+    styles.loc[cell_dep.reindex(x.index, fill_value=False), "Off-Block (Actual)"] += cell_css
+    styles.loc[cell_eta.reindex(x.index, fill_value=False), "ETA (FA)"] += cell_css
+    styles.loc[cell_arr.reindex(x.index, fill_value=False), "On-Block (Actual)"] += cell_css
+
+    # 4) EDCT purple on Off-Block (Actual) (applied last so it wins for that cell)
+    cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
+    styles.loc[idx_edct.reindex(x.index, fill_value=False), "Off-Block (Actual)"] += cell_edct_css
+
+    return styles
+# ---------- end styling block ----------
+
+    
     # Time-only display, but keep sorting by underlying datetimes (except Off-Block (Actual), which is text)
     styler = df_display.style.hide(axis="index").apply(_style_ops, axis=None).format({
         "Off-Block (Est)":   lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
