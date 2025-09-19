@@ -222,15 +222,15 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
     except Exception:
         return None
 
-# Drop-in replacement: single time box (no st.time_input)
+# Drop-in replacement: single time box (no writes back to the widget key)
 def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = None) -> datetime:
     """Stateful UTC datetime picker with ONE time box that accepts 1005, 10:05, 4pm, etc."""
     if initial_dt_utc is None:
         initial_dt_utc = datetime.now(timezone.utc)
 
     date_key = f"{key}__date"
-    time_txt_key = f"{key}__time_txt"
-    time_obj_key = f"{key}__time_obj"  # last good parsed time
+    time_txt_key = f"{key}__time_txt"   # bound to st.text_input
+    time_obj_key = f"{key}__time_obj"   # internal parsed time we control
 
     # Seed once
     if date_key not in st.session_state:
@@ -238,6 +238,7 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
     if time_obj_key not in st.session_state:
         st.session_state[time_obj_key] = initial_dt_utc.time().replace(microsecond=0)
     if time_txt_key not in st.session_state:
+        # only seed the textbox once; after that, don't programmatically change it
         st.session_state[time_txt_key] = st.session_state[time_obj_key].strftime("%H:%M")
 
     d = st.date_input(f"{label} — Date (UTC)", key=date_key)
@@ -251,7 +252,7 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
         s = (s or "").strip().lower().replace(" ", "")
         if not s:
             return None
-        # strip am/pm
+        # am/pm suffix
         ampm = None
         if s.endswith("am") or s.endswith("pm"):
             ampm = s[-2:]
@@ -265,11 +266,10 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
             except Exception:
                 return None
         elif s.isdigit():
-            # accept HHMM (3–4 digits) or HH (1–2 digits)
-            if len(s) in (3, 4):
+            if len(s) in (3, 4):          # HHMM (accept 3 or 4 digits)
                 s = s.zfill(4)
                 hh, mm = int(s[:2]), int(s[2:])
-            elif len(s) in (1, 2):
+            elif len(s) in (1, 2):        # HH
                 hh, mm = int(s), 0
             else:
                 return None
@@ -283,13 +283,13 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
                 hh += 12
         if not (0 <= hh <= 23 and 0 <= mm <= 59):
             return None
+
         return datetime.strptime(f"{hh:02d}:{mm:02d}", "%H:%M").time()
 
     parsed = _parse_loose_time(txt)
     if parsed is not None:
+        # update only the internal time; DO NOT write back to time_txt_key
         st.session_state[time_obj_key] = parsed
-        # normalize textbox to HH:MM so it stays consistent
-        st.session_state[time_txt_key] = parsed.strftime("%H:%M")
 
     return datetime.combine(st.session_state[date_key], st.session_state[time_obj_key]).replace(tzinfo=timezone.utc)
 
