@@ -345,6 +345,87 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
 
     return datetime.combine(st.session_state[date_key], st.session_state[time_obj_key]).replace(tzinfo=timezone.utc)
 
+def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
+    """Return 'HHMM LT' at the airport's local time (fallback 'HHMM UTC')."""
+    if ts is None or pd.isna(ts): 
+        return ""
+    icao = (icao or "").upper()
+    try:
+        if icao in ICAO_TZ_MAP:
+            tz = pytz.timezone(ICAO_TZ_MAP[icao])
+            return pd.Timestamp(ts).tz_convert(tz).strftime("%H%M LT")
+        return pd.Timestamp(ts).strftime("%H%M UTC")
+    except Exception:
+        return pd.Timestamp(ts).strftime("%H%M UTC")
+
+def _late_early_label(delta_min: int) -> tuple[str, int]:
+    # positive => late; negative => early
+    label = "LATE" if delta_min >= 0 else "EARLY"
+    return label, abs(int(delta_min))
+
+def build_stateful_notify_message(row: pd.Series) -> str:
+    """
+    Build a Telus BC message whose contents depend on flight state.
+    Priority for reason if multiple cells are red:
+      1) On-Block (Actual)   2) ETA(FA)   3) Off-Block (Actual)
+    """
+    tail = row.get("Aircraft", "")
+    booking = row.get("Booking", "")
+    dep_ts   = row.get("_DepActual_ts")
+    arr_ts   = row.get("_ArrActual_ts")
+    eta_fa   = row.get("_ETA_FA_ts")
+    etd_est  = row.get("ETD_UTC")
+    eta_est  = row.get("ETA_UTC")
+    from_icao= row.get("From_ICAO", "")
+    to_icao  = row.get("To_ICAO", "")
+
+    # Compute cell variances (same definitions as styling)
+    dep_var = (dep_ts - etd_est) if (pd.notna(dep_ts) and pd.notna(etd_est)) else None
+    eta_var = (eta_fa - eta_est) if (pd.notna(eta_fa) and pd.notna(eta_est)) else None
+    arr_var = (arr_ts - eta_est) if (pd.notna(arr_ts) and pd.notna(eta_est)) else None
+
+    # Derive state & choose priority reason
+    if pd.notna(arr_var):  # ARRIVED late/early
+        delta_min = int(round(arr_var.total_seconds()/60.0))
+        label, mins = _late_early_label(delta_min)
+        arr_local = local_hhmm(arr_ts, to_icao)
+        body = (
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{label}: {mins} minutes\n"
+            f"ARRIVAL: {arr_local}"
+        )
+        return body
+
+    if pd.notna(eta_var):  # ENROUTE with FA ETA variance
+        delta_min = int(round(eta_var.total_seconds()/60.0))
+        label, mins = _late_early_label(delta_min)
+        eta_local = local_hhmm(eta_fa, to_icao)
+        body = (
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{label}: {mins} minutes\n"
+            f"UPDATED ETA: {eta_local}"
+        )
+        return body
+
+    if pd.notna(dep_var):  # OFF-BLOCK variance (usually already enroute)
+        delta_min = int(round(dep_var.total_seconds()/60.0))
+        label, mins = _late_early_label(delta_min)
+        dep_local = local_hhmm(dep_ts, from_icao)
+        body = (
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{label}: {mins} minutes\n"
+            f"OFF-BLOCK (ACTUAL): {dep_local}"
+        )
+        return body
+
+    # Fallback: keep current generic builder (should rarely hit with our panel filters)
+    return _build_delay_msg(
+        tail=tail,
+        booking=booking,
+        minutes_delta=int(_default_minutes_delta(row)),
+        new_eta_hhmm=get_local_eta_str(row)  # ETA LT or UTC
+    )
+
 
 # ---------- Subject-aware parsing ----------
 SUBJ_TAIL_RE = re.compile(r"\bC-[A-Z0-9]{4}\b")
@@ -1177,14 +1258,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                     if not teams:
                         st.error("No TELUS teams configured in secrets.")
                     else:
-                        ok, err = post_to_telus_team(
+                       ok, err = post_to_telus_team(
                             team=teams[0],
-                            text=_build_delay_msg(
-                                row["Aircraft"],
-                                row["Booking"],
-                                int(_default_minutes_delta(row)),  # FA ETA - sched ETA if available
-                                get_local_eta_str(row),             # HHMM LT (or UTC fallback)
-                            ),
+                            text=build_stateful_notify_message(row),
                         )
                         if ok:
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
