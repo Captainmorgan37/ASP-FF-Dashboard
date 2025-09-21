@@ -1,4 +1,15 @@
-# ASP FF Dashboard — Full app with Turn Before Next + Quick Notify (cell-level delays) + stateful Telus messages
+# daily_ops_dashboard.py  — FF Dashboard with inline Notify + Turn Before Next
+# (merged into your ASP FF Dashboard (16).py baseline)
+# ---------------------------------------------------------------------------
+# NOTE: This version adds:
+#  - Turn Before Next calculation (Actual IN -> FA ETA -> sched ETA), red if < 45m
+#  - Keeps your existing Quick Notify (cell-level delays only) with priority:
+#       On-Block (Actual) > ETA(FA) > Off-Block (Actual)
+#  - Stateful Telus message builder:
+#       Arrived = shows ARRIVAL (LT), delta from On-Block(Est)
+#       Enroute = shows UPDATED ETA (LT), delta from On-Block(Est)
+#       Off-block-only variance = shows OFF-BLOCK (ACTUAL) (LT), delta from Off-Block(Est)
+# ---------------------------------------------------------------------------
 
 import re
 import sqlite3
@@ -273,21 +284,82 @@ ICAO_TZ_MAP = {
 }
 
 def get_local_eta_str(row) -> str:
-    base = row["_ArrActual_ts"] if pd.notna(row["_ArrActual_ts"]) else (
-        row["_ETA_FA_ts"] if pd.notna(row["_ETA_FA_ts"]) else row["ETA_UTC"]
-    )
+    base = row["_ETA_FA_ts"] if pd.notna(row["_ETA_FA_ts"]) else row["ETA_UTC"]
     if pd.isna(base):
         return ""
     icao = str(row["To_ICAO"]).upper()
+    if not icao or len(icao) != 4:
+        return pd.Timestamp(base).strftime("%H%M UTC")
     try:
         tzname = ICAO_TZ_MAP.get(icao)
-        if tzname:
-            local_tz = pytz.timezone(tzname)
-            ts = pd.Timestamp(base).tz_convert(local_tz)
-            return ts.strftime("%H%M LT")
-        return pd.Timestamp(base).strftime("%H%M UTC")
+        if not tzname:
+            return pd.Timestamp(base).strftime("%H%M UTC")
+        local = pytz.timezone(tzname)
+        ts = pd.Timestamp(base).tz_convert(local)
+        return ts.strftime("%H%M LT")
     except Exception:
         return pd.Timestamp(base).strftime("%H%M UTC")
+
+# ---------- Stateful Telus message (depends on state) ----------
+def build_stateful_notify_message(row: pd.Series) -> str:
+    """
+    Build a Telus BC message whose contents depend on flight state.
+    Priority for reason if multiple cells are red:
+      1) On-Block (Actual)   2) ETA(FA)   3) Off-Block (Actual)
+    """
+    tail = row.get("Aircraft", "")
+    booking = row.get("Booking", "")
+    dep_ts   = row.get("_DepActual_ts")
+    arr_ts   = row.get("_ArrActual_ts")
+    eta_fa   = row.get("_ETA_FA_ts")
+    etd_est  = row.get("ETD_UTC")
+    eta_est  = row.get("ETA_UTC")
+    from_icao= row.get("From_ICAO", "")
+    to_icao  = row.get("To_ICAO", "")
+
+    # Compute cell variances (same definitions as styling)
+    dep_var = (dep_ts - etd_est) if (pd.notna(dep_ts) and pd.notna(etd_est)) else None
+    eta_var = (eta_fa - eta_est) if (pd.notna(eta_fa) and pd.notna(eta_est)) else None
+    arr_var = (arr_ts - eta_est) if (pd.notna(arr_ts) and pd.notna(eta_est)) else None
+
+    # Derive state & choose priority reason
+    if pd.notna(arr_var):  # ARRIVED late/early
+        delta_min = int(round(arr_var.total_seconds()/60.0))
+        label, mins = _late_early_label(delta_min)
+        arr_local = local_hhmm(arr_ts, to_icao)
+        return (
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{label}: {mins} minutes\n"
+            f"ARRIVAL: {arr_local}"
+        )
+
+    if pd.notna(eta_var):  # ENROUTE with FA ETA variance
+        delta_min = int(round(eta_var.total_seconds()/60.0))
+        label, mins = _late_early_label(delta_min)
+        eta_local = local_hhmm(eta_fa, to_icao)
+        return (
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{label}: {mins} minutes\n"
+            f"UPDATED ETA: {eta_local}"
+        )
+
+    if pd.notna(dep_var):  # OFF-BLOCK variance (usually already enroute)
+        delta_min = int(round(dep_var.total_seconds()/60.0))
+        label, mins = _late_early_label(delta_min)
+        dep_local = local_hhmm(dep_ts, from_icao)
+        return (
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{label}: {mins} minutes\n"
+            f"OFF-BLOCK (ACTUAL): {dep_local}"
+        )
+
+    # Fallback (should rarely hit)
+    return _build_delay_msg(
+        tail=tail,
+        booking=booking,
+        minutes_delta=int(row.get("_default_minutes_delta", 0) if "_default_minutes_delta" in row else 0),
+        new_eta_hhmm=get_local_eta_str(row),
+    )
 
 def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
     if ts is None or pd.isna(ts):
@@ -300,273 +372,6 @@ def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
         return pd.Timestamp(ts).strftime("%H%M UTC")
     except Exception:
         return pd.Timestamp(ts).strftime("%H%M UTC")
-
-# ---------- Stateful Telus message (depends on state) ----------
-def build_stateful_notify_message(row: pd.Series) -> str:
-    tail = row.get("Aircraft", "")
-    booking = row.get("Booking", "")
-    dep_ts   = row.get("_DepActual_ts")
-    arr_ts   = row.get("_ArrActual_ts")
-    eta_fa   = row.get("_ETA_FA_ts")
-    etd_est  = row.get("ETD_UTC")
-    eta_est  = row.get("ETA_UTC")
-    from_icao= row.get("From_ICAO", "")
-    to_icao  = row.get("To_ICAO", "")
-
-    dep_var = (dep_ts - etd_est) if (pd.notna(dep_ts) and pd.notna(etd_est)) else None
-    eta_var = (eta_fa - eta_est) if (pd.notna(eta_fa) and pd.notna(eta_est)) else None
-    arr_var = (arr_ts - eta_est) if (pd.notna(arr_ts) and pd.notna(eta_est)) else None
-
-    if pd.notna(arr_var):
-        delta_min = int(round(arr_var.total_seconds()/60.0))
-        label, mins = _late_early_label(delta_min)
-        arr_local = local_hhmm(arr_ts, to_icao)
-        return (
-            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
-            f"{label}: {mins} minutes\n"
-            f"ARRIVAL: {arr_local}"
-        )
-
-    if pd.notna(eta_var):
-        delta_min = int(round(eta_var.total_seconds()/60.0))
-        label, mins = _late_early_label(delta_min)
-        eta_local = local_hhmm(eta_fa, to_icao)
-        return (
-            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
-            f"{label}: {mins} minutes\n"
-            f"UPDATED ETA: {eta_local}"
-        )
-
-    if pd.notna(dep_var):
-        delta_min = int(round(dep_var.total_seconds()/60.0))
-        label, mins = _late_early_label(delta_min)
-        dep_local = local_hhmm(dep_ts, from_icao)
-        return (
-            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
-            f"{label}: {mins} minutes\n"
-            f"OFF-BLOCK (ACTUAL): {dep_local}"
-        )
-
-    # Fallback
-    return _build_delay_msg(
-        tail=tail,
-        booking=booking,
-        minutes_delta=int(row.get("_default_minutes_delta", 0) if "_default_minutes_delta" in row else 0),
-        new_eta_hhmm=get_local_eta_str(row),
-    )
-
-# ---------- Subject/body parsing ----------
-SUBJ_TAIL_RE = re.compile(r"\bC-[A-Z0-9]{4}\b")
-SUBJ_CALLSIGN_RE = re.compile(r"\bASP\d{3,4}\b")
-
-SUBJ_PATTERNS = {
-    "Arrival": re.compile(
-        r"\barrived\b.*\bat\s+(?P<at>[A-Z]{3,4})\b(?:.*\bfrom\s+(?P<from>[A-Z]{3,4})\b)?",
-        re.I,
-    ),
-    "ArrivalForecast": re.compile(
-        r"\b(?:expected to arrive|arriving soon)\b.*\bat\s+(?P<at>[A-Z]{3,4})\b.*\bin\s+(?P<mins>\d+)\s*(?:min|mins|minutes)\b",
-        re.I,
-    ),
-    "Departure": re.compile(
-        r"\b(?:has\s+)?departed\b.*?(?:from\s+)?(?P<from>[A-Z]{3,4})\b(?:.*?\b(?:for|to)\s+(?P<to>[A-Z]{3,4})\b)?",
-        re.I,
-    ),
-    "Diversion": re.compile(r"\bdiverted to\s+(?P<to>[A-Z]{3,4})\b", re.I),
-}
-
-def parse_subject_line(subject: str, now_utc: datetime):
-    if not subject:
-        return {"event_type": None}
-    tail_m = SUBJ_TAIL_RE.search(subject)
-    tail = tail_m.group(0) if tail_m else None
-    callsign_m = SUBJ_CALLSIGN_RE.search(subject)
-    callsign = callsign_m.group(0) if callsign_m else None
-
-    result = {"event_type": None, "tail": tail, "callsign": callsign,
-              "at_airport": None, "from_airport": None, "to_airport": None,
-              "minutes_until": None, "actual_time_utc": None}
-
-    m = SUBJ_PATTERNS["Arrival"].search(subject)
-    if m:
-        result["event_type"] = "Arrival"
-        result["at_airport"] = m.group("at")
-        result["from_airport"] = m.groupdict().get("from")
-        return result
-
-    m = SUBJ_PATTERNS["ArrivalForecast"].search(subject)
-    if m:
-        result["event_type"] = "ArrivalForecast"
-        result["at_airport"] = m.group("at")
-        result["minutes_until"] = int(m.group("mins"))
-        result["actual_time_utc"] = now_utc + timedelta(minutes=result["minutes_until"])
-        return result
-
-    m = SUBJ_PATTERNS["Departure"].search(subject)
-    if m:
-        result["event_type"] = "Departure"
-        result["from_airport"] = m.group("from")
-        result["to_airport"] = m.groupdict().get("to")
-        return result
-
-    m = SUBJ_PATTERNS["Diversion"].search(subject)
-    if m:
-        result["event_type"] = "Diversion"
-        result["to_airport"] = m.group("to")
-        return result
-
-    return result
-
-ETA_ANY_RE = re.compile(
-    r"(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s*(?:at|of)?\s+"
-    r"(\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)",
-    re.I
-)
-BODY_DEPARTURE_RE = re.compile(
-    r"departed\s+.*?\((?P<from>[A-Z]{3,4})\)\s+at\s+"
-    r"(?P<dep_time>\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)"
-    r".*?en\s*route\s+to\s+.*?\((?P<to>[A-Z]{3,4})\)"
-    r".*?(?:(?:(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s*(?:at|of)?\s+"
-    r"(?P<eta_time>\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)))?",
-    re.I
-)
-BODY_ARRIVAL_RE = re.compile(
-    r"arrived\s+at\s+.*?\((?P<at>[A-Z]{3,4})\)\s+at\s+(?P<arr_time>\d{1,2}:\d{2}\s*[A-Z0-9 ]+)"
-    r".*?from\s+.*?\((?P<from>[A-Z]{3,4})\)",
-    re.I
-)
-
-def parse_any_datetime_to_utc(text: str) -> datetime | None:
-    m_iso = re.search(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(Z|[+\-]\d{2}:?\d{2})?", text)
-    if m_iso:
-        try:
-            dt = dateparse.parse(m_iso.group(0), tzinfos=TZINFOS)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            pass
-    m2_date = re.search(r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b", text)
-    m2_time = re.search(r"\b(\d{1,2}:\d{2}(:\d{2})?)\s*(Z|UTC|[+\-]\d{2}:?\d{2}|[A-Z]{2,4})?\b", text, re.I)
-    try_strings = []
-    if m2_date and m2_time:
-        try_strings.append(m2_date.group(0) + " " + m2_time.group(0))
-    elif m2_time:
-        assumed = datetime.now(timezone.utc).strftime("%Y-%m-%d ") + m2_time.group(0)
-        try_strings.append(assumed)
-
-    for s in try_strings:
-        try:
-            dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            continue
-    return None
-
-def parse_any_dt_string_to_utc(s: str) -> datetime | None:
-    if not s:
-        return None
-    try:
-        dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def get_email_date_utc(msg) -> datetime | None:
-    try:
-        d = msg.get('Date')
-        if not d:
-            return None
-        dt = parsedate_to_datetime(d)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def extract_event(text: str):
-    if re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I):
-        return "EDCT"
-    if re.search(r"\bdiverted\b", text, re.I): return "Diversion"
-    if re.search(r"\barriv(?:ed|al)\b", text, re.I): return "Arrival"
-    if re.search(r"\bdepart(?:ed|ure)\b", text, re.I): return "Departure"
-    return None
-
-def extract_candidates(text: str):
-    bookings_all = set(re.findall(r"\b([A-Z0-9]{5})\b", text))
-    valid_bookings = set(df_clean["Booking"].astype(str).unique().tolist()) if 'df_clean' in globals() else set()
-    bookings = sorted([b for b in bookings_all if b in valid_bookings]) if valid_bookings else sorted(bookings_all)
-    tails = sorted(set(re.findall(r"\bC-[A-Z0-9]{4}\b", text)))
-    event = extract_event(text)
-    return bookings, tails, event
-
-def _parse_time_token_to_utc(time_token: str, base_date_utc: datetime) -> datetime | None:
-    if not time_token:
-        return None
-    base_day = (base_date_utc or datetime.now(timezone.utc)).date()
-    s = f"{base_day.isoformat()} {time_token}"
-    try:
-        dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dict:
-    info = {}
-    if not body:
-        return info
-    m = BODY_DEPARTURE_RE.search(body)
-    if event == "Departure" and m:
-        info["from"] = m.group("from")
-        info["to"] = m.group("to")
-        info["dep_time_utc"] = _parse_time_token_to_utc(m.group("dep_time"), email_date_utc)
-        if m.group("eta_time"):
-            info["eta_time_utc"] = _parse_time_token_to_utc(m.group("eta_time"), email_date_utc)
-        if not info.get("eta_time_utc"):
-            m_eta = ETA_ANY_RE.search(body)
-            if m_eta:
-                info["eta_time_utc"] = _parse_time_token_to_utc(m_eta.group(1), email_date_utc)
-        return info
-    m = BODY_ARRIVAL_RE.search(body)
-    if event == "Arrival" and m:
-        info["at"] = m.group("at")
-        info["from"] = m.group("from")
-        info["arr_time_utc"] = _parse_time_token_to_utc(m.group("arr_time"), email_date_utc)
-        return info
-    m_eta = ETA_ANY_RE.search(body)
-    if m_eta:
-        info["eta_time_utc"] = _parse_time_token_to_utc(m_eta.group(1), email_date_utc)
-    return info
-
-EDCT_FROM_TO_RE = re.compile(r"your flight from\s+(?P<from>[A-Z]{3,4})\s+to\s+(?P<to>[A-Z]{3,4})", re.I)
-EDCT_EDCT_RE = re.compile(r"^\s*EDCT:\s*(?P<edct_line>.+)$", re.I | re.M)
-EDCT_EXP_ARR_RE = re.compile(r"^\s*Expected Arrival Time:\s*(?P<eta_line>.+)$", re.I | re.M)
-EDCT_ORIG_DEP_RE = re.compile(r"^\s*Original Departure Time:\s*(?P<orig_line>.+)$", re.I | re.M)
-
-def parse_body_edct(body: str) -> dict:
-    info = {}
-    if not body:
-        return info
-    mft = EDCT_FROM_TO_RE.search(body)
-    if mft:
-        info["from"] = mft.group("from").upper()
-        info["to"] = mft.group("to").upper()
-    m_edct = EDCT_EDCT_RE.search(body)
-    if m_edct:
-        info["edct_time_utc"] = parse_any_dt_string_to_utc(m_edct.group("edct_line"))
-    m_eta = EDCT_EXP_ARR_RE.search(body)
-    if m_eta:
-        info["expected_arrival_utc"] = parse_any_dt_string_to_utc(m_eta.group("eta_line"))
-    m_orig = EDCT_ORIG_DEP_RE.search(body)
-    if m_orig:
-        info["original_dep_utc"] = parse_any_dt_string_to_utc(m_orig.group("orig_line"))
-    return info
 
 # ============================
 # Controls
@@ -730,20 +535,28 @@ for b in df["Booking"]:
     arr_actual_list.append(parse_iso_to_utc(rec.get("Arrival", {}).get("actual_time_utc")))
     edct_list.append(parse_iso_to_utc(rec.get("EDCT", {}).get("actual_time_utc")))
 
-df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)
+# Visible strings for time-only table
+offblock_actual_display = []
+for dep_dt, edct_dt in zip(dep_actual_list, edct_list):
+    if dep_dt:
+        offblock_actual_display.append(f"{fmt_dt_utc(dep_dt)}")
+    elif edct_dt:
+        offblock_actual_display.append(f"EDCT - {fmt_dt_utc(edct_dt)}")
+    else:
+        offblock_actual_display.append("—")
+
+df["Off-Block (Actual)"] = offblock_actual_display
+df["ETA (FA)"]           = [fmt_dt_utc(x) for x in eta_fore_list]
+df["On-Block (Actual)"]  = [fmt_dt_utc(x) for x in arr_actual_list]
+
+# Hidden raw timestamps for styling/calcs (do NOT treat EDCT as actual)
+df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)     # True actual OUT only
 df["_ETA_FA_ts"]    = pd.to_datetime(eta_fore_list,   utc=True)
 df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
 df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
 
-# Clean countdowns when appropriate
-has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
-has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
-df.loc[has_dep_series, "Departs In"] = "—"
-df.loc[has_arr_series, "Arrives In"] = "—"
-
-# ============================
-# Turn Before Next computation
-# ============================
+# ---------------- Turn-before-next computation ----------------
+# Arrival baseline: prefer Actual IN, else FA ETA, else scheduled ETA
 df["_ArrBaseline_ts"] = df["_ArrActual_ts"].where(
     df["_ArrActual_ts"].notna(),
     df["_ETA_FA_ts"].where(df["_ETA_FA_ts"].notna(), df["ETA_UTC"])
@@ -758,6 +571,7 @@ for idx, r in df.iterrows():
         turn_min_list.append(pd.NA)
         continue
 
+    # Next leg for same tail, departing from this arrival airport at/after arrival baseline
     cand = df[
         (df["Aircraft"] == tail) &
         (df["From_ICAO"].astype(str).str.upper() == arr_aprt) &
@@ -772,6 +586,12 @@ for idx, r in df.iterrows():
         turn_min_list.append(delta_min)
 
 df["_TurnMin"] = pd.to_numeric(turn_min_list, errors="coerce")
+
+# Blank countdowns when appropriate
+has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
+has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
+df.loc[has_dep_series, "Departs In"] = "—"
+df.loc[has_arr_series, "Arrives In"] = "—"
 
 # ============================
 # Quick Filters
@@ -857,7 +677,7 @@ row_green = df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] >= recent_cut)
 # EDCT purple
 idx_edct = df["_EDCT_ts"].notna() & df["_DepActual_ts"].isna()
 
-# Turn red (< 45 min)
+# Tight turn alert (< 45 min)
 cell_turn_red = df["_TurnMin"].notna() & (df["_TurnMin"] < 45)
 
 # Delayed view toggle
@@ -877,26 +697,7 @@ if delayed_view:
         df_view = df_view[df_view["_DelayPriority"] > 0].copy()
     df_view = df_view.sort_values(by=["_DelayPriority", "_orig_order"], ascending=[False, True])
 
-# Build the view
-view_df = (df_view if delayed_view else df).copy()
-view_df["Off-Block (Est)"]   = view_df["ETD_UTC"]
-view_df["On-Block (Est)"]    = view_df["ETA_UTC"]
-view_df["ETA (FA)"]          = view_df["_ETA_FA_ts"]
-view_df["On-Block (Actual)"] = view_df["_ArrActual_ts"]
-
-def _offblock_actual_display(row):
-    if pd.notna(row["_DepActual_ts"]):
-        return row["_DepActual_ts"].strftime("%H:%MZ")
-    if pd.notna(row["_EDCT_ts"]):
-        return "EDCT " + row["_EDCT_ts"].strftime("%H:%MZ")
-    return "—"
-view_df["Off-Block (Actual)"] = view_df.apply(_offblock_actual_display, axis=1)
-
-# Turn Before Next as timedelta for nice HH:MM
-view_df["Turn Before Next"] = view_df["_TurnMin"].apply(
-    lambda m: (pd.Timedelta(minutes=int(m)) if pd.notna(m) else pd.NaT)
-)
-
+# ---- Build a view that keeps REAL datetimes for sorting, but shows time-only ----
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Est)", "Off-Block (Actual)", "ETA (FA)",
@@ -905,55 +706,147 @@ display_cols = [
     "Turn Before Next",
     "PIC", "SIC", "Workflow", "Status"
 ]
+
+view_df = (df_view if delayed_view else df).copy()
+
+# Keep underlying dtypes as datetimes for sorting:
+view_df["Off-Block (Est)"]  = view_df["ETD_UTC"]          # datetime
+view_df["On-Block (Est)"]   = view_df["ETA_UTC"]          # datetime
+view_df["ETA (FA)"]         = view_df["_ETA_FA_ts"]       # datetime or NaT
+view_df["On-Block (Actual)"] = view_df["_ArrActual_ts"]   # datetime or NaT
+
+# Off-Block (Actual) needs "EDCT " prefix when we only have EDCT and no real OUT;
+# we'll keep it as a STRING column (sorting by this one won't be chronological — others will).
+def _offblock_actual_display(row):
+    if pd.notna(row["_DepActual_ts"]):
+        return row["_DepActual_ts"].strftime("%H:%MZ")
+    if pd.notna(row["_EDCT_ts"]):
+        return "EDCT " + row["_EDCT_ts"].strftime("%H:%MZ")
+    return "—"
+view_df["Off-Block (Actual)"] = view_df.apply(_offblock_actual_display, axis=1)
+
+# Compute displayable Turn Before Next as timedelta for HH:MM formatting
+view_df["Turn Before Next"] = view_df["_TurnMin"].apply(
+    lambda m: (pd.Timedelta(minutes=int(m)) if pd.notna(m) else pd.NaT)
+)
+
 df_display = view_df[display_cols].copy()
 
-# Styling masks need the same index/shape as df_display; keep a reference
-_base = view_df
+# ----------------- Notify helpers used by buttons -----------------
+local_tz = tzlocal.get_localzone()
+
+def _default_minutes_delta(row) -> int:
+    if pd.notna(row["_ETA_FA_ts"]) and pd.notna(row["ETA_UTC"]):
+        return int(round((row["_ETA_FA_ts"] - row["ETA_UTC"]).total_seconds() / 60.0))
+    return 0
+
+# ICAO time zone mappings (used for "ETA LT" in notify text)
+ICAO_TZ_MAP = {
+    "CYYZ": "America/Toronto",
+    "CYUL": "America/Toronto",
+    "CYOW": "America/Toronto",
+    "CYHZ": "America/Halifax",
+    "CYVR": "America/Vancouver",
+    "CYYC": "America/Edmonton",
+    "CYEG": "America/Edmonton",
+    "CYWG": "America/Winnipeg",
+    "CYQB": "America/Toronto",
+    "CYXE": "America/Regina",
+    "CYQR": "America/Regina",
+    # add more as needed
+}
+def get_local_eta_str(row) -> str:
+    base = row["_ETA_FA_ts"] if pd.notna(row["_ETA_FA_ts"]) else row["ETA_UTC"]
+    if pd.isna(base):
+        return ""
+    icao = str(row["To_ICAO"]).upper()
+    if not icao or len(icao) != 4:
+        return pd.Timestamp(base).strftime("%H%M UTC")
+    try:
+        tzname = ICAO_TZ_MAP.get(icao)
+        if not tzname:
+            return pd.Timestamp(base).strftime("%H%M UTC")
+        local = pytz.timezone(tzname)
+        ts = pd.Timestamp(base).tz_convert(local)
+        return ts.strftime("%H%M LT")
+    except Exception:
+        return pd.Timestamp(base).strftime("%H%M UTC")
+
+# ---------- Styling masks + _style_ops (define before building styler) ----------
+_base = view_df  # same frame used to make df_display; contains internal *_ts columns
+now_utc = datetime.now(timezone.utc)
+
+delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))           # e.g. 15
+row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # 30+
+
+# Row-level operational delays (no-email state)
+no_dep = _base["_DepActual_ts"].isna()
+dep_lateness = now_utc - _base["ETD_UTC"]
+row_dep_yellow = _base["ETD_UTC"].notna() & no_dep & (dep_lateness > delay_thr_td) & (dep_lateness < row_red_thr_td)
+row_dep_red    = _base["ETD_UTC"].notna() & no_dep & (dep_lateness >= row_red_thr_td)
+
+has_dep = _base["_DepActual_ts"].notna()
+no_arr  = _base["_ArrActual_ts"].isna()
+eta_baseline = _base["_ETA_FA_ts"].where(_base["_ETA_FA_ts"].notna(), _base["ETA_UTC"])
+eta_lateness = now_utc - eta_baseline
+row_arr_yellow = eta_baseline.notna() & has_dep & no_arr & (eta_lateness > delay_thr_td) & (eta_lateness < row_red_thr_td)
+row_arr_red    = eta_baseline.notna() & has_dep & no_arr & (eta_lateness >= row_red_thr_td)
+
+row_yellow = (row_dep_yellow | row_arr_yellow)
+row_red    = (row_dep_red    | row_arr_red)
+
+# Cell-level variance checks
+dep_delay        = _base["_DepActual_ts"] - _base["ETD_UTC"]   # Off-Block (Actual) − Off-Block (Est)
+eta_fa_vs_sched  = _base["_ETA_FA_ts"]    - _base["ETA_UTC"]   # ETA(FA) − On-Block (Est)
+arr_vs_sched     = _base["_ArrActual_ts"] - _base["ETA_UTC"]   # On-Block (Actual) − On-Block (Est)
+
+cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
+cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
+cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
+
+# EDCT purple (until true departure is received)
+idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
 
 def _style_ops(x: pd.DataFrame):
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
 
-    # Row backgrounds
+    # 1) Row backgrounds: YELLOW then RED
     row_y_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #ffc107;"
     row_r_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
+    styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
+    styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css
 
-    # Align masks to x
-    ry = row_yellow.reindex(_base.index).reindex(x.index, fill_value=False)
-    rr = row_red.reindex(_base.index).reindex(x.index, fill_value=False)
-    rg = row_green.reindex(_base.index).reindex(x.index, fill_value=False)
-    cd = cell_dep.reindex(_base.index).reindex(x.index, fill_value=False)
-    ce = cell_eta.reindex(_base.index).reindex(x.index, fill_value=False)
-    ca = cell_arr.reindex(_base.index).reindex(x.index, fill_value=False)
-    ce_turn = cell_turn_red.reindex(_base.index).reindex(x.index, fill_value=False)
-    edct = idx_edct.reindex(_base.index).reindex(x.index, fill_value=False)
-
-    styles.loc[ry, :] = row_y_css
-    styles.loc[rr, :] = row_r_css
-
+    # 2) GREEN overlay for recent arrivals (applied after Y/R so it wins at row level)
     if 'highlight_recent_arrivals' in globals() and highlight_recent_arrivals:
         row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
-        styles.loc[rg, :] = row_g_css
+        styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
 
+    # 3) Cell-level red accents (apply after row colors so cells stay visible even on green rows)
     cell_css = "background-color: rgba(255, 82, 82, 0.25);"
-    styles.loc[cd, "Off-Block (Actual)"] += cell_css
-    styles.loc[ce, "ETA (FA)"] += cell_css
-    styles.loc[ca, "On-Block (Actual)"] += cell_css
-    styles.loc[ce_turn, "Turn Before Next"] += cell_css
+    styles.loc[cell_dep.reindex(x.index, fill_value=False), "Off-Block (Actual)"] += cell_css
+    styles.loc[cell_eta.reindex(x.index, fill_value=False), "ETA (FA)"] += cell_css
+    styles.loc[cell_arr.reindex(x.index, fill_value=False), "On-Block (Actual)"] += cell_css
+    styles.loc[cell_turn_red.reindex(x.index, fill_value=False), "Turn Before Next"] += cell_css
 
+    # 4) EDCT purple on Off-Block (Actual) (applied last so it wins for that cell)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
-    styles.loc[edct, "Off-Block (Actual)"] += cell_edct_css
+    styles.loc[idx_edct.reindex(x.index, fill_value=False), "Off-Block (Actual)"] += cell_edct_css
 
     return styles
+# ---------- end styling block ----------
 
+# Formatters for the time-only look (keeps datetimes underneath for sorting)
 fmt_map = {
     "Off-Block (Est)":   lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "On-Block (Est)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "On-Block (Actual)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "Turn Before Next":  lambda v: fmt_td(v) if pd.notna(v) else "—",
+    # NOTE: "Off-Block (Actual)" is already a string with optional EDCT prefix
 }
 
-# Render table
+# ----------------- Schedule render with inline Notify -----------------
+
 styler = df_display.style
 if hasattr(styler, "hide_index"):
     styler = styler.hide_index()
@@ -1025,12 +918,12 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
         st.caption("No triggered cell-level delays right now 🎉")
     else:
         st.caption("Click to post a one-click update to Telus BC. ETA shows destination **local time**.")
-        for idx, row in _delayed.iterrows():
+        for idx, row in _delayed.iterrows():  # use original index
             info_col, btn_col = st.columns([12, 4])
             with info_col:
                 etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
                 eta_local = get_local_eta_str(row) or "—"
-                reason_text, _ = _top_reason(idx)
+                reason_text, _reason_min = _top_reason(idx)
                 st.markdown(
                     f"**{row['Booking']} · {row['Aircraft']}** — {row['Route']}  "
                     f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}  \n"
@@ -1051,6 +944,8 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
                         else:
                             st.error(f"Failed: {err}")
+
+# -------- end Quick Notify panel --------
 
 # ============================
 # Manual Overrides
