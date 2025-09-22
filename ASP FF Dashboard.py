@@ -24,6 +24,9 @@ st.caption(
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
 )
 
+if "inline_edit_toast" in st.session_state:
+    st.success(st.session_state.pop("inline_edit_toast"))
+
 # ============================
 # Auto-refresh controls (no page reload fallback)
 # ============================
@@ -73,6 +76,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS email_cursor (
             mailbox TEXT PRIMARY KEY,
             last_uid INTEGER
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS tail_overrides (
+            booking TEXT PRIMARY KEY,
+            tail TEXT,
+            updated_at TEXT NOT NULL
         )
         """)
 
@@ -137,6 +147,25 @@ def set_last_uid(mailbox: str, uid: int):
         VALUES (?, ?)
         ON CONFLICT(mailbox) DO UPDATE SET last_uid=excluded.last_uid
         """, (mailbox, int(uid)))
+
+def load_tail_overrides() -> dict[str, str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT booking, tail FROM tail_overrides").fetchall()
+    return {str(booking): tail for booking, tail in rows if tail}
+
+def upsert_tail_override(booking: str, tail: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO tail_overrides (booking, tail, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(booking) DO UPDATE SET
+                tail=excluded.tail,
+                updated_at=datetime('now')
+        """, (booking, tail))
+
+def delete_tail_override(booking: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
 init_db()
 
@@ -958,6 +987,7 @@ with btn_cols[0]:
             conn.execute("DELETE FROM status_events")
             conn.execute("DELETE FROM csv_store")
             conn.execute("DELETE FROM email_cursor")
+            conn.execute("DELETE FROM tail_overrides")
         st.rerun()
 
 # Priority order: upload → session → DB
@@ -1004,6 +1034,13 @@ if missing:
     st.stop()
 
 df = df_raw.copy()
+df["Aircraft"] = df["Aircraft"].fillna("").astype(str).str.strip()
+_tail_override_map = load_tail_overrides()
+if _tail_override_map:
+    df["Aircraft"] = [
+        _tail_override_map.get(str(booking), tail) or tail
+        for booking, tail in zip(df["Booking"], df["Aircraft"])
+    ]
 df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
 df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
 
@@ -1422,6 +1459,147 @@ fmt_map = {
     # NOTE: "Off-Block (Actual)" is already a string with optional EDCT prefix
 }
 
+# Helpers for inline editing (data_editor expects naive datetimes)
+def _to_editor_datetime(ts):
+    if ts is None or pd.isna(ts):
+        return None
+    if isinstance(ts, pd.Timestamp):
+        dt = ts.to_pydatetime()
+    elif isinstance(ts, datetime):
+        dt = ts
+    else:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    dt = dt.replace(second=0, microsecond=0)
+    return dt.replace(tzinfo=None)
+
+def _from_editor_datetime(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, pd.Timestamp):
+        dt = val.to_pydatetime()
+    elif isinstance(val, datetime):
+        dt = val
+    elif isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            dt = dateparse.parse(s)
+        except Exception:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(second=0, microsecond=0)
+
+def _datetimes_equal(a, b):
+    if a is None and b is None:
+        return True
+    if (a is None) != (b is None):
+        return False
+    return pd.Timestamp(a) == pd.Timestamp(b)
+
+# Apply inline edits persisted via st.data_editor
+def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFrame, base_df: pd.DataFrame):
+    if edited_df is None or original_df is None or original_df.empty:
+        return
+
+    orig_idx = original_df.set_index("Booking")
+    edited_idx = edited_df.set_index("Booking")
+    if orig_idx.empty or edited_idx.empty:
+        return
+
+    base_lookup = base_df.drop_duplicates(subset=["Booking"]).set_index("Booking")
+
+    time_saved = 0
+    time_cleared = 0
+    tail_saved = 0
+    tail_cleared = 0
+
+    for booking, row in edited_idx.iterrows():
+        if booking not in orig_idx.index or booking not in base_lookup.index:
+            continue
+
+        base_row = base_lookup.loc[booking]
+        orig_row = orig_idx.loc[booking]
+
+        if isinstance(base_row, pd.DataFrame):
+            base_row = base_row.iloc[0]
+        if isinstance(orig_row, pd.DataFrame):
+            orig_row = orig_row.iloc[0]
+
+        # Tail overrides (expected tail registration)
+        new_tail_raw = row.get("Aircraft", "")
+        new_tail = "" if new_tail_raw is None else str(new_tail_raw).strip()
+        if new_tail.lower() == "nan":
+            new_tail = ""
+        orig_tail_raw = orig_row.get("Aircraft", "")
+        orig_tail = "" if orig_tail_raw is None else str(orig_tail_raw).strip()
+
+        if new_tail != orig_tail:
+            if new_tail:
+                cleaned_tail = new_tail.upper()
+                upsert_tail_override(str(booking), cleaned_tail)
+                tail_saved += 1
+            else:
+                delete_tail_override(str(booking))
+                tail_cleared += 1
+
+        # Time overrides for selected columns
+        for col, event_type, status_label, planned_col in [
+            ("Off-Block (Actual)", "Departure", "🟢 DEPARTED", "ETD_UTC"),
+            ("ETA (FA)", "ArrivalForecast", "🟦 ARRIVING SOON", "ETA_UTC"),
+            ("On-Block (Actual)", "Arrival", "🟣 ARRIVED", "ETA_UTC"),
+        ]:
+            orig_val = _from_editor_datetime(orig_row.get(col))
+            new_val = _from_editor_datetime(row.get(col))
+
+            if _datetimes_equal(orig_val, new_val):
+                continue
+
+            if new_val is None:
+                delete_status(str(booking), event_type)
+                if st.session_state.get("status_updates", {}).get(booking, {}).get("type") == event_type:
+                    st.session_state["status_updates"].pop(booking, None)
+                time_cleared += 1
+                continue
+
+            planned = base_row.get(planned_col)
+            delta_min = None
+            if planned is not None and pd.notna(planned):
+                delta_min = int(round((pd.Timestamp(new_val) - planned).total_seconds() / 60.0))
+
+            upsert_status(str(booking), event_type, status_label, new_val.isoformat(), delta_min)
+            st.session_state.setdefault("status_updates", {})
+            st.session_state["status_updates"][booking] = {
+                **st.session_state["status_updates"].get(booking, {}),
+                "type": event_type,
+                "actual_time_utc": new_val.isoformat(),
+                "delta_min": delta_min,
+                "status": status_label,
+            }
+            time_saved += 1
+
+    if any([time_saved, time_cleared, tail_saved, tail_cleared]):
+        parts = []
+        if time_saved:
+            parts.append(f"saved {time_saved} time value{'s' if time_saved != 1 else ''}")
+        if time_cleared:
+            parts.append(f"cleared {time_cleared} time value{'s' if time_cleared != 1 else ''}")
+        if tail_saved:
+            parts.append(f"updated tail for {tail_saved} flight{'s' if tail_saved != 1 else ''}")
+        if tail_cleared:
+            parts.append(f"cleared tail override for {tail_cleared} flight{'s' if tail_cleared != 1 else ''}")
+
+        summary = ", ".join(parts)
+        st.session_state["inline_edit_toast"] = f"Inline edits applied: {summary}."
+        st.rerun()
+
 # ----------------- Schedule render with inline Notify -----------------
 
 styler = df_display.style
@@ -1439,6 +1617,66 @@ except Exception:
     for c in ["Off-Block (Est)", "On-Block (Est)", "ETA (FA)", "On-Block (Actual)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
+
+# ----------------- Inline editor for manual overrides -----------------
+st.markdown("#### Inline manual updates (UTC)")
+st.caption(
+    "Double-click a cell to adjust actual times or expected tail registrations. "
+    "Values are stored in SQLite and override email updates until a new message arrives."
+)
+
+if view_df.empty:
+    st.info("No flights available for inline edits.")
+else:
+    inline_editor = view_df[["Booking", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
+    inline_editor = inline_editor.rename(columns={
+        "_DepActual_ts": "Off-Block (Actual)",
+        "_ETA_FA_ts": "ETA (FA)",
+        "_ArrActual_ts": "On-Block (Actual)",
+    })
+    inline_editor["Booking"] = inline_editor["Booking"].astype(str)
+    inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
+    for col in ["Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"]:
+        inline_editor[col] = inline_editor[col].apply(_to_editor_datetime)
+
+    inline_original = inline_editor.copy(deep=True)
+
+    edited_inline = st.data_editor(
+        inline_editor,
+        key="schedule_inline_editor",
+        hide_index=True,
+        num_rows="fixed",
+        use_container_width=True,
+        column_order=["Booking", "Aircraft", "Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"],
+        column_config={
+            "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
+            "Aircraft": st.column_config.TextColumn(
+                "Expected Tail",
+                help="Override the tail registration shown in the schedule.",
+                max_chars=16,
+            ),
+            "Off-Block (Actual)": st.column_config.DatetimeColumn(
+                "Off-Block (Actual)",
+                help="Actual departure (UTC).",
+                format="DD.MM.YYYY HH:mm",
+                step=60,
+            ),
+            "ETA (FA)": st.column_config.DatetimeColumn(
+                "ETA (FA)",
+                help="FlightAware ETA (UTC).",
+                format="DD.MM.YYYY HH:mm",
+                step=60,
+            ),
+            "On-Block (Actual)": st.column_config.DatetimeColumn(
+                "On-Block (Actual)",
+                help="Actual arrival (UTC).",
+                format="DD.MM.YYYY HH:mm",
+                step=60,
+            ),
+        },
+    )
+
+    _apply_inline_editor_updates(inline_original, edited_inline, view_df)
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = (df_view if delayed_view else df)  # NOTE: keep original index; do NOT reset here
