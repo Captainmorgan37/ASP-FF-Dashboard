@@ -100,6 +100,16 @@ def load_status_map() -> dict:
     return m
 
 def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
+    if delta_min is None:
+        delta_value = None
+    else:
+        try:
+            if pd.isna(delta_min):
+                delta_value = None
+            else:
+                delta_value = int(delta_min)
+        except (TypeError, ValueError):
+            delta_value = None
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT INTO status_events (booking, event_type, status, actual_time_utc, delta_min, updated_at)
@@ -109,8 +119,7 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
                 actual_time_utc=excluded.actual_time_utc,
                 delta_min=excluded.delta_min,
                 updated_at=datetime('now')
-        """, (booking, event_type, status, actual_time_iso,
-              int(delta_min) if delta_min is not None else None))
+        """, (booking, event_type, status, actual_time_iso, delta_value))
 
 def delete_status(booking: str, event_type: str):
     with sqlite3.connect(DB_PATH) as conn:
@@ -1475,8 +1484,13 @@ def _to_editor_datetime(ts):
     return dt.replace(tzinfo=None)
 
 def _from_editor_datetime(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+    if val is None:
         return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
     if isinstance(val, pd.Timestamp):
         dt = val.to_pydatetime()
     elif isinstance(val, datetime):
@@ -1491,10 +1505,20 @@ def _from_editor_datetime(val):
             return None
     else:
         return None
+    try:
+        if pd.isna(dt):
+            return None
+    except (TypeError, ValueError):
+        pass
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     else:
         dt = dt.astimezone(timezone.utc)
+    try:
+        if pd.isna(dt):
+            return None
+    except (TypeError, ValueError):
+        pass
     return dt.replace(second=0, microsecond=0)
 
 def _datetimes_equal(a, b):
