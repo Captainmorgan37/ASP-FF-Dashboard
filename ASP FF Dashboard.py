@@ -1115,23 +1115,6 @@ if not turnaround_df.empty:
         if not booking_val or pd.isna(booking_val):
             continue
 
-        arrival_basis_val = turn_row.get("ArrivalSource")
-        arrival_basis = arrival_basis_val.strip() if isinstance(arrival_basis_val, str) else ""
-
-        next_booking_val = turn_row.get("NextBooking")
-        next_booking = next_booking_val.strip() if isinstance(next_booking_val, str) else ""
-
-        next_route_val = turn_row.get("NextRoute")
-        next_route = next_route_val.strip() if isinstance(next_route_val, str) else ""
-
-        next_etd_val = turn_row.get("NextETDUTC")
-        next_etd_txt = ""
-        if next_etd_val is not None and pd.notna(next_etd_val):
-            try:
-                next_etd_txt = pd.Timestamp(next_etd_val).strftime("%H:%MZ")
-            except Exception:
-                next_etd_txt = ""
-
         minutes_val = turn_row.get("TurnMinutes")
         if minutes_val is not None and not pd.isna(minutes_val):
             try:
@@ -1141,25 +1124,11 @@ if not turnaround_df.empty:
         else:
             minutes_int = None
 
-        parts = []
-        if next_booking:
-            parts.append(next_booking)
-        if next_route:
-            parts.append(next_route)
-        if next_etd_txt:
-            parts.append(next_etd_txt)
         if minutes_int is not None:
-            parts.append(f"{minutes_int}m")
-
-        detail_text = " · ".join(parts)
-        info_text = detail_text
-        if arrival_basis:
-            info_text = f"{arrival_basis} → {detail_text}" if detail_text else arrival_basis
-
-        if minutes_int is not None and minutes_int < TURNAROUND_MIN_GAP_MINUTES:
-            info_text = f"⚠️ {info_text}" if info_text else "⚠️"
-
-        if not info_text:
+            info_text = f"{minutes_int}m"
+            if minutes_int < TURNAROUND_MIN_GAP_MINUTES:
+                info_text = f"⚠️ {info_text}"
+        else:
             info_text = "—"
 
         turn_info_map[booking_val] = {
@@ -1168,8 +1137,8 @@ if not turnaround_df.empty:
         }
 
 df["_TurnMinutes"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("minutes"))
-df["Turn Info"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("text", "—"))
-df["Turn Info"] = df["Turn Info"].fillna("—")
+df["Turn Time"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("text", "—"))
+df["Turn Time"] = df["Turn Time"].fillna("—")
 
 df.loc[has_dep_series, "Departs In"] = "—"
 df.loc[has_arr_series, "Arrives In"] = "—"
@@ -1289,7 +1258,7 @@ display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Est)", "Off-Block (Actual)", "ETA (FA)",
     "On-Block (Est)", "On-Block (Actual)",
-    "Departs In", "Arrives In", "Turn Info",
+    "Departs In", "Arrives In", "Turn Time",
     "PIC", "SIC", "Workflow", "Status"
 ]
 
@@ -1434,11 +1403,11 @@ def _style_ops(x: pd.DataFrame):
         styles.loc[mask_edct, "Off-Block (Actual)"].fillna("") + cell_edct_css
     )
 
-    if "Turn Info" in x.columns:
+    if "Turn Time" in x.columns:
         turn_css = "background-color: rgba(255, 82, 82, 0.2); font-weight: 600;"
         mask_turn = turn_warn.reindex(x.index, fill_value=False)
-        styles.loc[mask_turn, "Turn Info"] = (
-            styles.loc[mask_turn, "Turn Info"].fillna("") + turn_css
+        styles.loc[mask_turn, "Turn Time"] = (
+            styles.loc[mask_turn, "Turn Time"].fillna("") + turn_css
         )
 
     return styles
