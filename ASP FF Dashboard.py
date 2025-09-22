@@ -1267,13 +1267,26 @@ def _style_ops(x: pd.DataFrame):
 
     # 3) Cell-level red accents (apply after row colors so cells stay visible even on green rows)
     cell_css = "background-color: rgba(255, 82, 82, 0.25);"
-    styles.loc[cell_dep.reindex(x.index, fill_value=False), "Off-Block (Actual)"] += cell_css
-    styles.loc[cell_eta.reindex(x.index, fill_value=False), "ETA (FA)"] += cell_css
-    styles.loc[cell_arr.reindex(x.index, fill_value=False), "On-Block (Actual)"] += cell_css
+    mask_dep = cell_dep.reindex(x.index, fill_value=False)
+    mask_eta = cell_eta.reindex(x.index, fill_value=False)
+    mask_arr = cell_arr.reindex(x.index, fill_value=False)
+
+    styles.loc[mask_dep, "Off-Block (Actual)"] = (
+        styles.loc[mask_dep, "Off-Block (Actual)"].fillna("") + cell_css
+    )
+    styles.loc[mask_eta, "ETA (FA)"] = (
+        styles.loc[mask_eta, "ETA (FA)"].fillna("") + cell_css
+    )
+    styles.loc[mask_arr, "On-Block (Actual)"] = (
+        styles.loc[mask_arr, "On-Block (Actual)"].fillna("") + cell_css
+    )
 
     # 4) EDCT purple on Off-Block (Actual) (applied last so it wins for that cell)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
-    styles.loc[idx_edct.reindex(x.index, fill_value=False), "Off-Block (Actual)"] += cell_edct_css
+    mask_edct = idx_edct.reindex(x.index, fill_value=False)
+    styles.loc[mask_edct, "Off-Block (Actual)"] = (
+        styles.loc[mask_edct, "Off-Block (Actual)"].fillna("") + cell_edct_css
+    )
 
     return styles
 # ---------- end styling block ----------
