@@ -1107,6 +1107,38 @@ has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}
 has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
 
 turnaround_df = compute_turnaround_windows(df)
+
+turn_info_map = {}
+if not turnaround_df.empty:
+    for _, turn_row in turnaround_df.iterrows():
+        booking_val = turn_row.get("CurrentBooking")
+        if not booking_val or pd.isna(booking_val):
+            continue
+
+        minutes_val = turn_row.get("TurnMinutes")
+        if minutes_val is not None and not pd.isna(minutes_val):
+            try:
+                minutes_int = int(minutes_val)
+            except Exception:
+                minutes_int = None
+        else:
+            minutes_int = None
+
+        info_text = "—"
+        if minutes_int is not None:
+            info_text = f"{minutes_int}m"
+            if minutes_int < TURNAROUND_MIN_GAP_MINUTES:
+                info_text = f"⚠️ {info_text}"
+
+        turn_info_map[booking_val] = {
+            "text": info_text,
+            "minutes": minutes_int,
+        }
+
+df["_TurnMinutes"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("minutes"))
+df["Turn Time"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("text", "—"))
+df["Turn Time"] = df["Turn Time"].fillna("—")
+
 df.loc[has_dep_series, "Departs In"] = "—"
 df.loc[has_arr_series, "Arrives In"] = "—"
 
@@ -1225,7 +1257,7 @@ display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Est)", "Off-Block (Actual)", "ETA (FA)",
     "On-Block (Est)", "On-Block (Actual)",
-    "Departs In", "Arrives In",
+    "Departs In", "Arrives In", "Turn Time",
     "PIC", "SIC", "Workflow", "Status"
 ]
 
@@ -1328,6 +1360,11 @@ row_green = _base["_ArrActual_ts"].notna() & (_base["_ArrActual_ts"] >= recent_c
 # EDCT purple (until true departure is received)
 idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
 
+if "_TurnMinutes" in _base.columns:
+    turn_warn = _base["_TurnMinutes"].notna() & (_base["_TurnMinutes"] < TURNAROUND_MIN_GAP_MINUTES)
+else:
+    turn_warn = pd.Series(False, index=_base.index)
+
 def _style_ops(x: pd.DataFrame):
     styles = pd.DataFrame("", index=x.index, columns=x.columns)
 
@@ -1364,6 +1401,13 @@ def _style_ops(x: pd.DataFrame):
     styles.loc[mask_edct, "Off-Block (Actual)"] = (
         styles.loc[mask_edct, "Off-Block (Actual)"].fillna("") + cell_edct_css
     )
+
+    if "Turn Time" in x.columns:
+        turn_css = "background-color: rgba(255, 82, 82, 0.2); font-weight: 600;"
+        mask_turn = turn_warn.reindex(x.index, fill_value=False)
+        styles.loc[mask_turn, "Turn Time"] = (
+            styles.loc[mask_turn, "Turn Time"].fillna("") + turn_css
+        )
 
     return styles
 # ---------- end styling block ----------
@@ -1482,80 +1526,6 @@ else:
         "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
         "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
     )
-
-st.subheader("Turnaround Watch")
-if turnaround_df.empty:
-    st.caption("No aircraft with an arrival-to-next-departure pairing is available right now.")
-else:
-    st.caption(
-        "Time between the arrival baseline (Actual/ETA/Sked) and the next scheduled departure. "
-        f"Rows under **{TURNAROUND_MIN_GAP_MINUTES} minutes** are highlighted."
-    )
-
-    turn_display = turnaround_df.copy()
-    turn_display["TurnMinutes"] = turn_display["TurnMinutes"].astype(int)
-    turn_red_mask = turn_display["TurnMinutes"] < TURNAROUND_MIN_GAP_MINUTES
-
-    turn_display = turn_display.rename(
-        columns={
-            "CurrentBooking": "Current Booking",
-            "CurrentRoute": "Current Route",
-            "ArrivalSource": "Arrival Basis",
-            "ArrivalUTC": "Arrival (UTC)",
-            "NextBooking": "Next Booking",
-            "NextRoute": "Next Route",
-            "NextETDUTC": "Next ETD (UTC)",
-            "TurnDelta": "Turn Window",
-            "TurnMinutes": "Turn Minutes",
-        }
-    )
-
-    turn_cols = [
-        "Aircraft",
-        "Current Booking",
-        "Current Route",
-        "Arrival Basis",
-        "Arrival (UTC)",
-        "Next Booking",
-        "Next Route",
-        "Next ETD (UTC)",
-        "Turn Window",
-        "Turn Minutes",
-    ]
-    turn_display = turn_display[turn_cols]
-
-    def _style_turnaround_table(x: pd.DataFrame):
-        styles = pd.DataFrame("", index=x.index, columns=x.columns)
-        red_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
-        styles.loc[turn_red_mask.reindex(x.index, fill_value=False), :] = red_css
-        return styles
-
-    fmt_turn = {
-        "Arrival (UTC)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-        "Next ETD (UTC)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-        "Turn Window": lambda v: fmt_td(v),
-        "Turn Minutes": lambda v: f"{int(v):d}",
-    }
-
-    try:
-        turn_styler = turn_display.style
-        if hasattr(turn_styler, "hide_index"):
-            turn_styler = turn_styler.hide_index()
-        else:
-            turn_styler = turn_styler.hide(axis="index")
-        turn_styler = turn_styler.apply(_style_turnaround_table, axis=None).format(fmt_turn)
-        st.dataframe(turn_styler, use_container_width=True)
-    except Exception:
-        plain_turn = turn_display.copy()
-        plain_turn["Arrival (UTC)"] = plain_turn["Arrival (UTC)"].apply(
-            lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—"
-        )
-        plain_turn["Next ETD (UTC)"] = plain_turn["Next ETD (UTC)"].apply(
-            lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—"
-        )
-        plain_turn["Turn Window"] = plain_turn["Turn Window"].apply(fmt_td)
-        plain_turn["Turn Minutes"] = plain_turn["Turn Minutes"].astype(int)
-        st.dataframe(plain_turn, use_container_width=True)
 
 # ----------------- end schedule render -----------------
 
