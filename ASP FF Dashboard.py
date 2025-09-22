@@ -693,10 +693,10 @@ def display_airport(icao: str, iata: str) -> str:
     return "—"
 
 # ---- Booking chooser ----
-def choose_booking_for_event(subj_info, tails, event, event_dt_utc):
+def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: str, event_dt_utc: datetime) -> str | None:
     cand = df_clean.copy()
-    if tails:
-        cand = cand[cand["Aircraft"].isin(tails)]
+    if tails_dashed:
+        cand = cand[cand["Aircraft"].isin(tails_dashed)]  # CSV is dashed
         if cand.empty:
             return None
 
@@ -1673,7 +1673,7 @@ for uid in sorted(uids)[:max_to_process]:
 
     try: M.logout()
     except: pass
-return applied
+    return applied
 
 if enable_poll:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
