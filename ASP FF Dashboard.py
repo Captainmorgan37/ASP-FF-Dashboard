@@ -171,6 +171,8 @@ FAKE_TAIL_PATTERNS = [
     re.compile(r"\b(ocs|emb)\b", re.I),
 ]
 
+TURNAROUND_MIN_GAP_MINUTES = 45  # warn when ground time between legs drops below 45 minutes
+
 def is_real_tail(tail: str) -> bool:
     if not isinstance(tail, str) or not tail.strip():
         return False
@@ -347,7 +349,7 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
 
 def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
     """Return 'HHMM LT' at the airport's local time (fallback 'HHMM UTC')."""
-    if ts is None or pd.isna(ts): 
+    if ts is None or pd.isna(ts):
         return ""
     icao = (icao or "").upper()
     try:
@@ -357,6 +359,79 @@ def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
         return pd.Timestamp(ts).strftime("%H%M UTC")
     except Exception:
         return pd.Timestamp(ts).strftime("%H%M UTC")
+
+def _select_arrival_baseline(row: pd.Series) -> tuple[pd.Timestamp | None, str]:
+    """Return the best arrival timestamp (Actual → ETA_FA → Scheduled) and its label."""
+    actual = row.get("_ArrActual_ts")
+    if actual is not None and pd.notna(actual):
+        return pd.Timestamp(actual), "Actual"
+
+    eta_fa = row.get("_ETA_FA_ts")
+    if eta_fa is not None and pd.notna(eta_fa):
+        return pd.Timestamp(eta_fa), "ETA (FA)"
+
+    sched = row.get("ETA_UTC")
+    if sched is not None and pd.notna(sched):
+        return pd.Timestamp(sched), "Sched ETA"
+
+    return None, ""
+
+def compute_turnaround_windows(df: pd.DataFrame) -> pd.DataFrame:
+    """Build turnaround windows (arrival → next departure) for each aircraft."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if "Aircraft" not in df.columns or "ETD_UTC" not in df.columns:
+        return pd.DataFrame()
+
+    work = df[df["ETD_UTC"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    work = work.sort_values(["Aircraft", "ETD_UTC"])
+    rows = []
+
+    for tail, group in work.groupby("Aircraft"):
+        group = group.sort_values("ETD_UTC").reset_index(drop=True)
+        if len(group) < 2:
+            continue
+
+        for idx in range(len(group) - 1):
+            current = group.iloc[idx]
+            next_leg = group.iloc[idx + 1]
+
+            next_dep_actual = next_leg.get("_DepActual_ts")
+            if next_dep_actual is not None and pd.notna(next_dep_actual):
+                continue  # next leg already departed; no upcoming window to monitor
+
+            arr_ts, arrival_source = _select_arrival_baseline(current)
+            next_etd = next_leg.get("ETD_UTC")
+
+            if arr_ts is None or pd.isna(arr_ts) or next_etd is None or pd.isna(next_etd):
+                continue
+
+            next_etd = pd.Timestamp(next_etd)
+            gap = next_etd - pd.Timestamp(arr_ts)
+
+            rows.append({
+                "Aircraft": tail,
+                "CurrentBooking": current.get("Booking", ""),
+                "CurrentRoute": current.get("Route", ""),
+                "ArrivalSource": arrival_source,
+                "ArrivalUTC": pd.Timestamp(arr_ts),
+                "NextBooking": next_leg.get("Booking", ""),
+                "NextRoute": next_leg.get("Route", ""),
+                "NextETDUTC": next_etd,
+                "TurnDelta": gap,
+                "TurnMinutes": int(round(gap.total_seconds() / 60.0)),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    result = result.sort_values(["NextETDUTC", "Aircraft", "CurrentBooking"]).reset_index(drop=True)
+    return result
 
 def _late_early_label(delta_min: int) -> tuple[str, int]:
     # positive => late; negative => early
@@ -1030,6 +1105,8 @@ df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
 # Blank countdowns when appropriate
 has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
 has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
+
+turnaround_df = compute_turnaround_windows(df)
 df.loc[has_dep_series, "Departs In"] = "—"
 df.loc[has_arr_series, "Arrives In"] = "—"
 
@@ -1405,6 +1482,80 @@ else:
         "Cell accents: red = variance (Off-Block Actual>Est, ETA(FA)>On-Block Est, On-Block Actual>Est). "
         "EDCT shows in purple in Off-Block (Actual) until a Departure email is received."
     )
+
+st.subheader("Turnaround Watch")
+if turnaround_df.empty:
+    st.caption("No aircraft with an arrival-to-next-departure pairing is available right now.")
+else:
+    st.caption(
+        "Time between the arrival baseline (Actual/ETA/Sked) and the next scheduled departure. "
+        f"Rows under **{TURNAROUND_MIN_GAP_MINUTES} minutes** are highlighted."
+    )
+
+    turn_display = turnaround_df.copy()
+    turn_display["TurnMinutes"] = turn_display["TurnMinutes"].astype(int)
+    turn_red_mask = turn_display["TurnMinutes"] < TURNAROUND_MIN_GAP_MINUTES
+
+    turn_display = turn_display.rename(
+        columns={
+            "CurrentBooking": "Current Booking",
+            "CurrentRoute": "Current Route",
+            "ArrivalSource": "Arrival Basis",
+            "ArrivalUTC": "Arrival (UTC)",
+            "NextBooking": "Next Booking",
+            "NextRoute": "Next Route",
+            "NextETDUTC": "Next ETD (UTC)",
+            "TurnDelta": "Turn Window",
+            "TurnMinutes": "Turn Minutes",
+        }
+    )
+
+    turn_cols = [
+        "Aircraft",
+        "Current Booking",
+        "Current Route",
+        "Arrival Basis",
+        "Arrival (UTC)",
+        "Next Booking",
+        "Next Route",
+        "Next ETD (UTC)",
+        "Turn Window",
+        "Turn Minutes",
+    ]
+    turn_display = turn_display[turn_cols]
+
+    def _style_turnaround_table(x: pd.DataFrame):
+        styles = pd.DataFrame("", index=x.index, columns=x.columns)
+        red_css = "background-color: rgba(255, 82, 82, 0.18); border-left: 6px solid #ff5252;"
+        styles.loc[turn_red_mask.reindex(x.index, fill_value=False), :] = red_css
+        return styles
+
+    fmt_turn = {
+        "Arrival (UTC)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+        "Next ETD (UTC)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+        "Turn Window": lambda v: fmt_td(v),
+        "Turn Minutes": lambda v: f"{int(v):d}",
+    }
+
+    try:
+        turn_styler = turn_display.style
+        if hasattr(turn_styler, "hide_index"):
+            turn_styler = turn_styler.hide_index()
+        else:
+            turn_styler = turn_styler.hide(axis="index")
+        turn_styler = turn_styler.apply(_style_turnaround_table, axis=None).format(fmt_turn)
+        st.dataframe(turn_styler, use_container_width=True)
+    except Exception:
+        plain_turn = turn_display.copy()
+        plain_turn["Arrival (UTC)"] = plain_turn["Arrival (UTC)"].apply(
+            lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—"
+        )
+        plain_turn["Next ETD (UTC)"] = plain_turn["Next ETD (UTC)"].apply(
+            lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—"
+        )
+        plain_turn["Turn Window"] = plain_turn["Turn Window"].apply(fmt_td)
+        plain_turn["Turn Minutes"] = plain_turn["Turn Minutes"].astype(int)
+        st.dataframe(plain_turn, use_container_width=True)
 
 # ----------------- end schedule render -----------------
 
