@@ -1673,7 +1673,7 @@ for uid in sorted(uids)[:max_to_process]:
 
     try: M.logout()
     except: pass
-    return applied
+return applied
 
 if enable_poll:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
