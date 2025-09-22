@@ -1643,64 +1643,64 @@ except Exception:
     st.dataframe(tmp, use_container_width=True)
 
 # ----------------- Inline editor for manual overrides -----------------
-st.markdown("#### Inline manual updates (UTC)")
-st.caption(
-    "Double-click a cell to adjust actual times or expected tail registrations. "
-    "Values are stored in SQLite and override email updates until a new message arrives."
-)
-
-if view_df.empty:
-    st.info("No flights available for inline edits.")
-else:
-    inline_editor = view_df[["Booking", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
-    inline_editor = inline_editor.rename(columns={
-        "_DepActual_ts": "Off-Block (Actual)",
-        "_ETA_FA_ts": "ETA (FA)",
-        "_ArrActual_ts": "On-Block (Actual)",
-    })
-    inline_editor["Booking"] = inline_editor["Booking"].astype(str)
-    inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
-    for col in ["Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"]:
-        inline_editor[col] = inline_editor[col].apply(_to_editor_datetime)
-
-    inline_original = inline_editor.copy(deep=True)
-
-    edited_inline = st.data_editor(
-        inline_editor,
-        key="schedule_inline_editor",
-        hide_index=True,
-        num_rows="fixed",
-        use_container_width=True,
-        column_order=["Booking", "Aircraft", "Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"],
-        column_config={
-            "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
-            "Aircraft": st.column_config.TextColumn(
-                "Expected Tail",
-                help="Override the tail registration shown in the schedule.",
-                max_chars=16,
-            ),
-            "Off-Block (Actual)": st.column_config.DatetimeColumn(
-                "Off-Block (Actual)",
-                help="Actual departure (UTC).",
-                format="DD.MM.YYYY HH:mm",
-                step=60,
-            ),
-            "ETA (FA)": st.column_config.DatetimeColumn(
-                "ETA (FA)",
-                help="FlightAware ETA (UTC).",
-                format="DD.MM.YYYY HH:mm",
-                step=60,
-            ),
-            "On-Block (Actual)": st.column_config.DatetimeColumn(
-                "On-Block (Actual)",
-                help="Actual arrival (UTC).",
-                format="DD.MM.YYYY HH:mm",
-                step=60,
-            ),
-        },
+with st.expander("Inline manual updates (UTC)", expanded=True):
+    st.caption(
+        "Double-click a cell to adjust actual times or expected tail registrations. "
+        "Values are stored in SQLite and override email updates until a new message arrives."
     )
 
-    _apply_inline_editor_updates(inline_original, edited_inline, view_df)
+    if view_df.empty:
+        st.info("No flights available for inline edits.")
+    else:
+        inline_editor = view_df[["Booking", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
+        inline_editor = inline_editor.rename(columns={
+            "_DepActual_ts": "Off-Block (Actual)",
+            "_ETA_FA_ts": "ETA (FA)",
+            "_ArrActual_ts": "On-Block (Actual)",
+        })
+        inline_editor["Booking"] = inline_editor["Booking"].astype(str)
+        inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
+        for col in ["Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"]:
+            inline_editor[col] = inline_editor[col].apply(_to_editor_datetime)
+
+        inline_original = inline_editor.copy(deep=True)
+
+        edited_inline = st.data_editor(
+            inline_editor,
+            key="schedule_inline_editor",
+            hide_index=True,
+            num_rows="fixed",
+            use_container_width=True,
+            column_order=["Booking", "Aircraft", "Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"],
+            column_config={
+                "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
+                "Aircraft": st.column_config.TextColumn(
+                    "Expected Tail",
+                    help="Override the tail registration shown in the schedule.",
+                    max_chars=16,
+                ),
+                "Off-Block (Actual)": st.column_config.DatetimeColumn(
+                    "Off-Block (Actual)",
+                    help="Actual departure (UTC).",
+                    format="DD.MM.YYYY HH:mm",
+                    step=60,
+                ),
+                "ETA (FA)": st.column_config.DatetimeColumn(
+                    "ETA (FA)",
+                    help="FlightAware ETA (UTC).",
+                    format="DD.MM.YYYY HH:mm",
+                    step=60,
+                ),
+                "On-Block (Actual)": st.column_config.DatetimeColumn(
+                    "On-Block (Actual)",
+                    help="Actual arrival (UTC).",
+                    format="DD.MM.YYYY HH:mm",
+                    step=60,
+                ),
+            },
+        )
+
+        _apply_inline_editor_updates(inline_original, edited_inline, view_df)
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = (df_view if delayed_view else df)  # NOTE: keep original index; do NOT reset here
@@ -1791,95 +1791,6 @@ else:
     )
 
 # ----------------- end schedule render -----------------
-
-
-# ============================
-# Manual Overrides (Departure / Arrival)
-# ============================
-st.markdown("### Manual Overrides (Departure / Arrival)")
-with st.expander("Set or clear an actual OUT / IN time when an email is missing"):
-    if df_clean.empty:
-        st.info("No flights loaded.")
-    else:
-        col_ov1, col_ov2 = st.columns([2, 1])
-        with col_ov1:
-            sel_booking = st.selectbox("Booking", sorted(df_clean["Booking"].astype(str).unique().tolist()))
-            row = df_clean[df_clean["Booking"] == sel_booking].iloc[0]
-            planned_dep = row["ETD_UTC"]
-            planned_arr = row["ETA_UTC"]
-
-            st.caption(
-                f"Planned: Off-Block (Est) **{fmt_dt_utc(planned_dep) if pd.notna(planned_dep) else '—'}**, "
-                f"On-Block (Est) **{fmt_dt_utc(planned_arr) if pd.notna(planned_arr) else '—'}**"
-            )
-
-        with col_ov2:
-            set_dep = st.checkbox("Set Actual Departure (OUT)")
-            set_arr = st.checkbox("Set Actual Arrival (IN)")
-
-        override_dep_dt = None
-        override_arr_dt = None
-        if set_dep:
-            dep_seed = (row["ETD_UTC"].to_pydatetime() if pd.notna(row["ETD_UTC"]) else datetime.now(timezone.utc))
-            override_dep_dt = utc_datetime_picker("Actual Departure (UTC)", key="override_dep", initial_dt_utc=dep_seed)
-        
-        if set_arr:
-            arr_seed = (row["ETA_UTC"].to_pydatetime() if pd.notna(row["ETA_UTC"]) else datetime.now(timezone.utc))
-            override_arr_dt = utc_datetime_picker("Actual Arrival (UTC)", key="override_arr", initial_dt_utc=arr_seed)
-
-
-        cbtn1, cbtn2, cbtn3 = st.columns([1,1,2])
-        with cbtn1:
-            if st.button("Save override(s)"):
-                st.session_state.setdefault("status_updates", {})
-
-                if set_dep and override_dep_dt:
-                    # Compute delta vs scheduled ETD (for reference)
-                    delta_min = None
-                    if pd.notna(planned_dep):
-                        delta_min = int(round((override_dep_dt - planned_dep).total_seconds() / 60.0))
-
-                    # Persist as a normal Departure event (board will treat it like an email)
-                    upsert_status(sel_booking, "Departure", "🟢 DEPARTED", override_dep_dt.isoformat(), delta_min)
-                    st.session_state["status_updates"][sel_booking] = {
-                        **st.session_state["status_updates"].get(sel_booking, {}),
-                        "type": "Departure",
-                        "actual_time_utc": override_dep_dt.isoformat(),
-                        "delta_min": delta_min,
-                        "status": "🟢 DEPARTED",
-                    }
-
-                if set_arr and override_arr_dt:
-                    # Compute delta vs scheduled ETA (for reference)
-                    delta_min = None
-                    if pd.notna(planned_arr):
-                        delta_min = int(round((override_arr_dt - planned_arr).total_seconds() / 60.0))
-
-                    # Persist as a normal Arrival event
-                    upsert_status(sel_booking, "Arrival", "🟣 ARRIVED", override_arr_dt.isoformat(), delta_min)
-                    st.session_state["status_updates"][sel_booking] = {
-                        **st.session_state["status_updates"].get(sel_booking, {}),
-                        "type": "Arrival",
-                        "actual_time_utc": override_arr_dt.isoformat(),
-                        "delta_min": delta_min,
-                        "status": "🟣 ARRIVED",
-                    }
-
-                st.success("Override(s) saved. The table will reflect this immediately.")
-
-        with cbtn2:
-            if st.button("Clear selected"):
-                # Clear whichever boxes are checked
-                if set_dep:
-                    delete_status(sel_booking, "Departure")
-                    # Remove from session_state if present
-                    if st.session_state.get("status_updates", {}).get(sel_booking, {}).get("type") == "Departure":
-                        st.session_state["status_updates"].pop(sel_booking, None)
-                if set_arr:
-                    delete_status(sel_booking, "Arrival")
-                    if st.session_state.get("status_updates", {}).get(sel_booking, {}).get("type") == "Arrival":
-                        st.session_state["status_updates"].pop(sel_booking, None)
-                st.success("Selected override(s) cleared.")
 
 
 # ============================
