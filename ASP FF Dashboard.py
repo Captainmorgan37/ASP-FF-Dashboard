@@ -1488,49 +1488,16 @@ with st.expander("Set or clear an actual OUT / IN time when an email is missing"
 # ============================
 # Mailbox Polling (IMAP)
 # ============================
-st.markdown("### Mailbox Polling")
+
+# 1) IMAP secrets/config FIRST
 IMAP_HOST = st.secrets.get("IMAP_HOST")
 IMAP_USER = st.secrets.get("IMAP_USER")
 IMAP_PASS = st.secrets.get("IMAP_PASS")
 IMAP_FOLDER = st.secrets.get("IMAP_FOLDER", "INBOX")
 IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., alerts@flightaware.com
 
-if IMAP_SENDER:
-    st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
-else:
-    st.caption("IMAP filter: **From = ALL senders**")
 
-enable_poll = st.checkbox("Enable IMAP polling", value=False,
-                          help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.")
-
-if enable_poll:
-    if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
-        st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
-    else:
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            debug_poll = st.checkbox("Debug IMAP (verbose)", value=False)
-        with c2:
-            poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
-        with c3:
-            if st.button("Reset IMAP cursor only", key="reset_imap_cursor", help="Sets the last processed UID to 0; saved statuses remain."):
-                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
-                st.success("IMAP cursor reset to 0 (statuses preserved).")
-
-        max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
-
-        if st.button("Poll now", key="poll_now"):
-            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
-            st.success(f"Applied {applied} update(s) from mailbox.")
-
-        if poll_on_refresh:
-            try:
-                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
-                if applied:
-                    st.info(f"Auto-poll applied {applied} update(s).")
-            except Exception as e:
-                st.error(f"Auto-poll error: {e}")
-
+# 2) Define the polling function BEFORE the UI uses it
 def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
@@ -1693,8 +1660,6 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 # Always advance the cursor so we don't reprocess this email
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
 
-        # end for
-
         return applied
 
     finally:
@@ -1703,3 +1668,44 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
         except Exception:
             pass
 
+
+# 3) Now the UI that uses the function
+st.markdown("### Mailbox Polling")
+if IMAP_SENDER:
+    st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
+else:
+    st.caption("IMAP filter: **From = ALL senders**")
+
+enable_poll = st.checkbox(
+    "Enable IMAP polling",
+    value=False,
+    help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
+)
+
+if enable_poll:
+    if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
+        st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+    else:
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            debug_poll = st.checkbox("Debug IMAP (verbose)", value=False)
+        with c2:
+            poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
+        with c3:
+            if st.button("Reset IMAP cursor only", key="reset_imap_cursor", help="Sets the last processed UID to 0; saved statuses remain."):
+                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
+                st.success("IMAP cursor reset to 0 (statuses preserved).")
+
+        max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
+
+        if st.button("Poll now", key="poll_now"):
+            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
+            st.success(f"Applied {applied} update(s) from mailbox.")
+
+        if poll_on_refresh:
+            try:
+                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
+                if applied:
+                    st.info(f"Auto-poll applied {applied} update(s).")
+            except Exception as e:
+                st.error(f"Auto-poll error: {e}")
