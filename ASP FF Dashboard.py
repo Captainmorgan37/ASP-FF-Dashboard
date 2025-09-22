@@ -1506,200 +1506,172 @@ enable_poll = st.checkbox("Enable IMAP polling", value=False,
 def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
+
     M = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
-        M.login(IMAP_USER, IMAP_PASS)
-    except imaplib.IMAP4.error as e:
-        st.error(f"IMAP login failed: {e}")
-        return 0
+        # --- login + select
+        try:
+            M.login(IMAP_USER, IMAP_PASS)
+        except imaplib.IMAP4.error as e:
+            st.error(f"IMAP login failed: {e}")
+            return 0
 
-    typ, _ = M.select(IMAP_FOLDER)
-    if typ != "OK":
-        st.error(f"Could not open folder {IMAP_FOLDER}")
-        try: M.logout()
-        except: pass
-        return 0
+        typ, _ = M.select(IMAP_FOLDER)
+        if typ != "OK":
+            st.error(f"Could not open folder {IMAP_FOLDER}")
+            return 0
 
-    last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
-    if IMAP_SENDER:
-        typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
-        if typ != "OK" or not data or not data[0]:
-            if debug:
-                st.warning(f'No matches for FROM filter "{IMAP_SENDER}". Falling back to unfiltered UID search.')
+        # --- search new UIDs
+        last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
+        if IMAP_SENDER:
+            typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
+            if typ != "OK" or not data or not data[0]:
+                if debug:
+                    st.warning(f'No matches for FROM filter "{IMAP_SENDER}". Falling back to unfiltered UID search.')
+                typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
+        else:
             typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
-    else:
-        typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
 
-    if typ != "OK":
-        st.error("IMAP search failed")
-        M.logout()
-        return 0
+        if typ != "OK":
+            st.error("IMAP search failed")
+            return 0
 
-    uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
-    if not uids:
-        M.logout()
-        return 0
+        uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
+        if not uids:
+            return 0
 
-applied = 0
-for uid in sorted(uids)[:max_to_process]:
-    # Make sure these exist even if we error early
-    booking = None
-    text = ""
-    try:
-        typ, msg_data = M.uid('fetch', str(uid), '(RFC822)')
-        if typ != "OK" or not msg_data or not msg_data[0]:
-            set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
-            continue
-
-        raw = msg_data[0][1]
-        msg = email.message_from_bytes(raw)
-
-        subject = msg.get('Subject', '') or ''
-        body = ""
-        if msg.is_multipart():
-            # prefer text/plain, fall back to other text
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    body = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
-                    break
-            if not body:
-                for part in msg.walk():
-                    if part.get_content_type().startswith("text/"):
-                        body = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
-                        break
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                body = payload.decode(msg.get_content_charset() or 'utf-8', errors='ignore')
-
-        text = f"{subject}\n{body}"
-        now_utc = datetime.now(timezone.utc)
-
-        subj_info = parse_subject_line(subject, now_utc)
-        event = subj_info.get("event_type")
-
-        hdr_dt = get_email_date_utc(msg)
-        explicit_dt = parse_any_datetime_to_utc(text)
-
-        # Try to pull structured bits from body (optional helpers in your code)
-        body_info = parse_body_firstline(event, body, hdr_dt or now_utc)
-        edct_info = parse_body_edct(body)
-
-        # Normalize event if EDCT content detected
-        if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
-            event = "EDCT"
-
-        # Compute the "actual" timestamp for this event
-        if event == "Departure":
-            actual_dt_utc = body_info.get("dep_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
-        elif event == "Arrival":
-            actual_dt_utc = body_info.get("arr_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
-        elif event == "EDCT":
-            actual_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt or now_utc
-        else:
-            actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
-
-        # --- Build dashed tails (literal dashed + ASP-mapped dashed) ---
-        tails_dashed = []
-        if subj_info.get("tail"):
-            tails_dashed.append(subj_info["tail"].upper())
-        tails_dashed += re.findall(r"\bC-[A-Z0-9]{4}\b", text.upper())
-        tails_dashed += tail_from_asp(text)  # <-- your ASP map must return dashed tails like 'C-FSEF'
-        tails_dashed = sorted(set(tails_dashed))
-
-        # Try direct booking token(s) first
-        bookings, _, _evt = extract_candidates(text)
-        booking = bookings[0] if bookings else None
-
-        # Fallback: pick by tail/route/time if no booking token
-        if not booking:
-            booking = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
-
-        # If we still don’t have enough to apply an update, just advance the cursor
-        if not (booking and event and actual_dt_utc):
-            set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
-            continue
-
-        # Look up planned time from the CSV for delta calc
-        row = df_clean[df_clean["Booking"] == booking]
-        planned = None
-        if not row.empty:
-            planned = row["ETA_UTC"].iloc[0] if event in ("Arrival", "ArrivalForecast") else row["ETD_UTC"].iloc[0]
-        delta_min = None
-        if planned is not None and pd.notna(planned):
-            delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
-
-        # Build status string
-        if event == "Diversion":
-            status = f"🔷 DIVERTED to {subj_info.get('to_airport','—')}"
-        elif event == "ArrivalForecast":
-            status = "🟦 ARRIVING SOON"
-        elif event == "Arrival":
-            status = "🟣 ARRIVED"
-        elif event == "Departure":
-            status = "🟢 DEPARTED"
-        elif event == "EDCT":
-            status = "🟪 EDCT"
-        else:
-            set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
-            continue
-
-        # Persist + session mirror
-        st.session_state.setdefault("status_updates", {})
-        st.session_state["status_updates"][booking] = {
-            "type": event,
-            "actual_time_utc": actual_dt_utc.isoformat(),
-            "delta_min": delta_min,
-            "status": status,
-        }
-        upsert_status(booking, event, status, actual_dt_utc.isoformat(), delta_min)
-
-        # If EDCT email also carries an expected arrival, store that as forecast ETA
-        if edct_info.get("expected_arrival_utc"):
-            upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", edct_info["expected_arrival_utc"].isoformat(), None)
-        elif event == "Departure" and body_info.get("eta_time_utc"):
-            upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", body_info["eta_time_utc"].isoformat(), None)
-
-        applied += 1
-
-    except Exception as e:
-        # Important: do NOT reference `booking` here (it might still be None/not assigned)
-        if debug:
-            st.warning(f"IMAP parse error on UID {uid}: {e}")
-    finally:
-        # Always advance the cursor so we don't re-process this email
-        set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
-
-
-    try: M.logout()
-    except: pass
-    return applied
-
-if enable_poll:
-    if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
-        st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
-    else:
-        c_poll1, c_poll2, c_poll3 = st.columns([1,1,1])
-        with c_poll1:
-            debug_poll = st.checkbox("Debug IMAP (verbose)", value=False)
-        with c_poll2:
-            poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
-        with c_poll3:
-            if st.button("Reset IMAP cursor only"):
-                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
-                st.success("IMAP cursor reset to 0 (statuses preserved).")
-
-        # Optional: control batch size if you expect backlogs
-        max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
-
-        if st.button("Poll now"):
-            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
-            st.success(f"Applied {applied} update(s) from mailbox.")
-
-        if poll_on_refresh:
+        # --- process emails
+        applied = 0
+        for uid in sorted(uids)[:max_to_process]:
+            booking = None
+            text = ""
             try:
-                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
-                if applied:
-                    st.info(f"Auto-poll applied {applied} update(s).")
+                typ, msg_data = M.uid('fetch', str(uid), '(RFC822)')
+                if typ != "OK" or not msg_data or not msg_data[0]:
+                    set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
+                    continue
+
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+
+                subject = msg.get('Subject', '') or ''
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                            break
+                    if not body:
+                        for part in msg.walk():
+                            if part.get_content_type().startswith("text/"):
+                                body = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                                break
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode(msg.get_content_charset() or 'utf-8', errors='ignore')
+
+                text = f"{subject}\n{body}"
+                now_utc = datetime.now(timezone.utc)
+
+                subj_info = parse_subject_line(subject, now_utc)
+                event = subj_info.get("event_type")
+
+                hdr_dt = get_email_date_utc(msg)
+                explicit_dt = parse_any_datetime_to_utc(text)
+                body_info = parse_body_firstline(event, body, hdr_dt or now_utc)
+                edct_info = parse_body_edct(body)
+
+                # EDCT normalization
+                if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
+                    event = "EDCT"
+
+                # Choose actual timestamp
+                if event == "Departure":
+                    actual_dt_utc = body_info.get("dep_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                elif event == "Arrival":
+                    actual_dt_utc = body_info.get("arr_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                elif event == "EDCT":
+                    actual_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt or now_utc
+                else:
+                    actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+
+                # --- dashed tails (literal + ASP mapped)
+                tails_dashed = []
+                if subj_info.get("tail"):
+                    tails_dashed.append(subj_info["tail"].upper())
+                tails_dashed += re.findall(r"\bC-[A-Z0-9]{4}\b", text.upper())
+                tails_dashed += tail_from_asp(text)  # must return dashed like 'C-FSEF'
+                tails_dashed = sorted(set(tails_dashed))
+
+                # Try explicit booking first
+                bookings, _tails_unused, _evt_unused = extract_candidates(text)
+                booking = bookings[0] if bookings else None
+
+                # Fallback: choose by tail/route/time
+                if not booking:
+                    booking = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
+
+                if not (booking and event and actual_dt_utc):
+                    set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
+                    continue
+
+                # Planned time for delta
+                row = df_clean[df_clean["Booking"] == booking]
+                planned = None
+                if not row.empty:
+                    planned = row["ETA_UTC"].iloc[0] if event in ("Arrival", "ArrivalForecast") else row["ETD_UTC"].iloc[0]
+                delta_min = None
+                if planned is not None and pd.notna(planned):
+                    delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
+
+                # Status label
+                if event == "Diversion":
+                    status = f"🔷 DIVERTED to {subj_info.get('to_airport','—')}"
+                elif event == "ArrivalForecast":
+                    status = "🟦 ARRIVING SOON"
+                elif event == "Arrival":
+                    status = "🟣 ARRIVED"
+                elif event == "Departure":
+                    status = "🟢 DEPARTED"
+                elif event == "EDCT":
+                    status = "🟪 EDCT"
+                else:
+                    set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
+                    continue
+
+                # Persist + session mirror
+                st.session_state.setdefault("status_updates", {})
+                st.session_state["status_updates"][booking] = {
+                    "type": event,
+                    "actual_time_utc": actual_dt_utc.isoformat(),
+                    "delta_min": delta_min,
+                    "status": status,
+                }
+                upsert_status(booking, event, status, actual_dt_utc.isoformat(), delta_min)
+
+                # EDCT may include an expected arrival—save as forecast
+                if edct_info.get("expected_arrival_utc"):
+                    upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", edct_info["expected_arrival_utc"].isoformat(), None)
+                elif event == "Departure" and body_info.get("eta_time_utc"):
+                    upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", body_info["eta_time_utc"].isoformat(), None)
+
+                applied += 1
+
             except Exception as e:
-                st.error(f"Auto-poll error: {e}")
+                if debug:
+                    st.warning(f"IMAP parse error on UID {uid}: {e}")
+            finally:
+                # Always advance the cursor so we don't reprocess this email
+                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
+
+        # end for
+
+        return applied
+
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
