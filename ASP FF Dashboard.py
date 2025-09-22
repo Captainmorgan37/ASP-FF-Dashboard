@@ -555,12 +555,30 @@ def extract_event(text: str):
     return None
 
 def extract_candidates(text: str):
-    bookings_all = set(re.findall(r"\b([A-Z0-9]{5})\b", text))
+    """
+    Return (bookings, tails_dashed, event).
+    - bookings: 5-char tokens that match real bookings in the CSV (unchanged)
+    - tails_dashed: dashed tails from the text + dashed tails from ASP mapping
+    - event: coarse type from keywords
+    """
+    # bookings (unchanged)
+    bookings_all = set(re.findall(r"\b([A-Z0-9]{5})\b", text or ""))
     valid_bookings = set(df_clean["Booking"].astype(str).unique().tolist()) if 'df_clean' in globals() else set()
     bookings = sorted([b for b in bookings_all if b in valid_bookings]) if valid_bookings else sorted(bookings_all)
-    tails = sorted(set(re.findall(r"\bC-[A-Z0-9]{4}\b", text)))
-    event = extract_event(text)
-    return bookings, tails, event
+
+    # dashed tails from literal matches
+    literal_dashed = set(re.findall(r"\bC-[A-Z0-9]{4}\b", (text or "").upper()))
+
+    # dashed tails from ASP callsigns via your mapping
+    # (tail_from_asp(text) must return values like 'C-FSEF', 'C-FLAS', etc.)
+    mapped_dashed = set(tail_from_asp(text))
+
+    tails_dashed = sorted(literal_dashed | mapped_dashed)
+
+    event = extract_event(text or "")
+    return bookings, tails_dashed, event
+
+
 
 # ---- BODY parsers ----
 BODY_DEPARTURE_RE = re.compile(
@@ -675,9 +693,7 @@ def display_airport(icao: str, iata: str) -> str:
     return "—"
 
 # ---- Booking chooser ----
-def choose_booking_for_event(subj_info: dict, tails: list[str], event: str, event_dt_utc: datetime) -> str | None:
-    if event_dt_utc is None or event not in ("Arrival", "ArrivalForecast", "Departure", "Diversion", "EDCT"):
-        return None
+def choose_booking_for_event(subj_info, tails, event, event_dt_utc):
     cand = df_clean.copy()
     if tails:
         cand = cand[cand["Aircraft"].isin(tails)]
@@ -754,6 +770,101 @@ with c3:
     next_hours = st.number_input("X hours (for filter above)", min_value=1, max_value=48, value=6)
 
 delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
+
+# --- ASP Callsign ↔ Tail mapping -------------------------------------------
+# You can optionally put this in Streamlit secrets as:
+# ASP_MAP:
+#   ASP574: CFSEF
+#   ASP503: CFASW
+#   ... (etc)
+#
+# If not in secrets, we display a text area to paste/edit the list at runtime.
+
+DEFAULT_ASP_MAP_TEXT = """\
+CGASL\tASP816
+CFASV\tASP812
+CFLAS\tASP820
+CFJAS\tASP822
+CFASF\tASP827
+CGASE\tASP846
+CGASK\tASP839
+CGXAS\tASP826
+CGBAS\tASP875
+CFSNY\tASP858
+CFSYX\tASP844
+CFSBR\tASP814
+CFSRX\tASP864
+CFSJR\tASP877
+CFASQ\tASP821
+CFSDO\tASP836
+
+CFASP\tASP519
+CFASR\tASP524
+CFASW\tASP503
+CFIAS\tASP511
+CGASR\tASP510
+CGZAS\tASP508
+
+CFASY\tASP489
+CGASW\tASP554
+CGAAS\tASP567
+CFNAS\tASP473
+CGNAS\tASP642
+CGFFS\tASP595
+CFSFS\tASP654
+CGFSX\tASP609
+CFSFO\tASP668
+CFSNP\tASP675
+CFSQX\tASP556
+CFSFP\tASP686
+CFSEF\tASP574
+CFSDN\tASP548
+CGFSD\tASP655
+CFSUP\tASP653
+CFSRY\tASP565
+CGFSJ\tASP501
+"""
+
+def _parse_asp_map_text(txt: str) -> dict[str, str]:
+    callsign_to_tail = {}
+    for line in (txt or "").splitlines():
+        parts = [p for p in re.split(r"[,\t ]+", line.strip()) if p]
+        if len(parts) < 2: 
+            continue
+        tail_with_dash, asp = parts[0].upper(), parts[1].upper()
+        if asp.startswith("ASP"):
+            callsign_to_tail[asp] = tail_with_dash  # keep the dash
+    return callsign_to_tail
+
+
+# Prefer secrets if present
+_secrets_map = st.secrets.get("ASP_MAP", None)
+if isinstance(_secrets_map, dict) and _secrets_map:
+    ASP_MAP = {k.upper(): v.upper() for k, v in _secrets_map.items()}
+else:
+    with st.expander("Callsign ↔ Tail mapping (ASP → Tail)", expanded=False):
+        map_text = st.text_area(
+            "Paste mapping (Tail then ASP, separated by tab/space, one pair per line):",
+            value=DEFAULT_ASP_MAP_TEXT,
+            height=200,
+        )
+    ASP_MAP = _parse_asp_map_text(map_text)
+
+def tail_from_asp(text: str) -> list[str]:
+    """
+    Find any ASP callsigns (ASP###/ASP####) inside text, return the list of mapped tails.
+    """
+    if not text:
+        return []
+    found = re.findall(r"\bASP\d{3,4}\b", text.upper())
+    tails = []
+    for asp in found:
+        t = ASP_MAP.get(asp)
+        if t:
+            tails.append(t)
+    return sorted(set(tails))
+# ---------------------------------------------------------------------------
+
 
 # ============================
 # File upload with persistence
@@ -1488,17 +1599,24 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
             else:
                 actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
 
-            # Booking selection
-            bookings = extract_candidates(text)[0]
-            booking = bookings[0] if bookings else None
-
-            tails = []
-            if subj_info.get("tail"): tails.append(subj_info["tail"])
-            tails += re.findall(r"\bC-[A-Z0-9]{4}\b", text)
-            tails = sorted(set(tails))
+            # Build dashed tails from the whole message
+            tails_dashed = []
+            
+            # If parse_subject_line found a tail, keep it (already dashed by SUBJ_TAIL_RE)
+            if subj_info.get("tail"):
+                tails_dashed.append(subj_info["tail"].upper())
+            
+            # Add any literal dashed tails anywhere in the message
+            tails_dashed += re.findall(r"\bC-[A-Z0-9]{4}\b", text.upper())
+            
+            # Add any dashed tails resolved from ASP callsigns (via your mapping)
+            tails_dashed += tail_from_asp(text)  # must return dashed, e.g., 'C-FSEF'
+            
+            # Dedupe + sort
+            tails_dashed = sorted(set(tails_dashed))
 
             if not booking:
-                booking = choose_booking_for_event(subj_info, tails, event, actual_dt_utc)
+                booking = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
 
             if not (booking and event and actual_dt_utc):
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
