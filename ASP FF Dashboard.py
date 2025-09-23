@@ -1388,7 +1388,6 @@ cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 head_toggle_col, head_title_col = st.columns([1.6, 8.4])
 with head_toggle_col:
     delayed_view = st.checkbox("Delayed View", value=False, help="Show RED (≥30m) first, then YELLOW (15–29m).")
-    hide_non_delayed = st.checkbox("Hide non-delayed", value=True, help="Only show red/yellow rows.") if delayed_view else False
     show_account_column = st.checkbox(
         "Show Account column",
         value=False,
@@ -1414,8 +1413,7 @@ df["_DelayPriority"] = delay_priority
 # If Delayed View is on: optionally filter, then sort by priority
 df_view = df.copy()
 if delayed_view:
-    if hide_non_delayed:
-        df_view = df_view[df_view["_DelayPriority"] > 0].copy()
+    df_view = df_view[df_view["_DelayPriority"] > 0].copy()
     # Keep chronological order within each priority by using the earlier sort's order
     df_view = df_view.sort_values(
         by=["_DelayPriority", "_orig_order"],
@@ -1935,10 +1933,8 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
 
 
 
-if delayed_view and hide_non_delayed:
+if delayed_view:
     st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
-elif delayed_view:
-    st.caption("Delayed View: **RED** (≥30m) first, then **YELLOW** (15–29m); others follow in schedule order.")
 else:
     st.caption(
         "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
