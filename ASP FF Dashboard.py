@@ -210,6 +210,128 @@ FAKE_TAIL_PATTERNS = [
 ]
 
 TURNAROUND_MIN_GAP_MINUTES = 45  # warn when ground time between legs drops below 45 minutes
+NO_ACTIVITY_GAP_THRESHOLD = pd.Timedelta(hours=3)
+
+
+def _max_valid_timestamp(*values):
+    valid = [pd.Timestamp(v) for v in values if pd.notna(v)]
+    if not valid:
+        return pd.NaT
+    return max(valid)
+
+
+def _min_valid_timestamp(*values):
+    valid = [pd.Timestamp(v) for v in values if pd.notna(v)]
+    if not valid:
+        return pd.NaT
+    return min(valid)
+
+
+def _format_gap_duration(td: pd.Timedelta) -> str:
+    if td is None or pd.isna(td):
+        return ""
+    total_minutes = int(td.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _build_gap_notice_row(template: pd.DataFrame, gap_start, gap_end, gap_td):
+    base = {}
+    for col in template.columns:
+        if pd.api.types.is_datetime64_any_dtype(template[col].dtype):
+            base[col] = pd.NaT
+        else:
+            base[col] = None
+
+    for col in ["ETD_UTC", "ETA_UTC", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts", "_EDCT_ts"]:
+        if col in base:
+            base[col] = pd.NaT
+
+    if "_DelayPriority" in base:
+        base["_DelayPriority"] = 0
+    if "_TurnMinutes" in base:
+        base["_TurnMinutes"] = pd.NA
+    if "_LegKey" in base:
+        base["_LegKey"] = ""
+    if "is_real_leg" in base:
+        base["is_real_leg"] = False
+
+    gap_window = (
+        f"{gap_start.strftime('%d.%m %H:%MZ')} → {gap_end.strftime('%d.%m %H:%MZ')}"
+        if pd.notna(gap_start) and pd.notna(gap_end)
+        else ""
+    )
+    duration_txt = _format_gap_duration(gap_td)
+    message = "No flight activity planned"
+    if gap_window:
+        message = f"{message} · {gap_window}"
+    if duration_txt:
+        message = f"{message} ({duration_txt})"
+
+    text_fill_cols = [
+        "Booking", "Aircraft", "Aircraft Type", "Departs In", "Arrives In",
+        "Turn Time", "PIC", "Status", "Type",
+    ]
+    for col in text_fill_cols:
+        if col in base:
+            base[col] = "—" if col != "Status" else "No flight activity planned"
+
+    if "Status" in base:
+        base["Status"] = "No flight activity planned"
+    if "Type" in base:
+        base["Type"] = "Notice"
+    if "SIC" in base:
+        base["SIC"] = "—"
+    if "Workflow" in base:
+        base["Workflow"] = "—"
+    if "Account" in base:
+        base["Account"] = "—"
+
+    base["Route"] = f"— {message} —"
+    base["TypeBadge"] = "⏸️"
+    base["_GapRow"] = True
+
+    return pd.DataFrame([base], columns=template.columns)
+
+
+def insert_gap_notice_rows(frame: pd.DataFrame, threshold: pd.Timedelta = NO_ACTIVITY_GAP_THRESHOLD) -> pd.DataFrame:
+    if frame.empty or len(frame) < 2:
+        frame = frame.copy()
+        if "_GapRow" not in frame.columns:
+            frame["_GapRow"] = False
+        return frame
+
+    frame = frame.copy()
+    if "_GapRow" not in frame.columns:
+        frame["_GapRow"] = False
+
+    pieces = []
+    idxs = list(frame.index)
+    for pos, idx in enumerate(idxs):
+        pieces.append(frame.loc[[idx]])
+        if pos == len(idxs) - 1:
+            continue
+
+        next_idx = idxs[pos + 1]
+        cur_end = _max_valid_timestamp(frame.at[idx, "ETD_UTC"], frame.at[idx, "ETA_UTC"])
+        next_start = _min_valid_timestamp(frame.at[next_idx, "ETD_UTC"], frame.at[next_idx, "ETA_UTC"])
+
+        if pd.isna(cur_end) or pd.isna(next_start):
+            continue
+
+        gap_td = next_start - cur_end
+        if pd.isna(gap_td) or gap_td < threshold:
+            continue
+
+        pieces.append(_build_gap_notice_row(frame, cur_end, next_start, gap_td))
+
+    combined = pd.concat(pieces, ignore_index=True)
+    combined["_GapRow"] = combined["_GapRow"].fillna(False)
+    return combined
 
 def is_real_tail(tail: str) -> bool:
     if not isinstance(tail, str) or not tail.strip():
@@ -1444,6 +1566,16 @@ view_df = (df_view if delayed_view else df).copy()
 if show_account_column and "Account" in view_df.columns:
     view_df["Account"] = view_df["Account"].map(format_account_value)
 
+view_df["_GapRow"] = False
+if not delayed_view:
+    view_df = insert_gap_notice_rows(view_df)
+else:
+    view_df = view_df.reset_index(drop=True)
+
+# Ensure gap flag remains boolean after any transforms
+if "_GapRow" in view_df.columns:
+    view_df["_GapRow"] = view_df["_GapRow"].fillna(False).astype(bool)
+
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Est)"]  = view_df["ETD_UTC"]          # datetime
 view_df["On-Block (Est)"]   = view_df["ETA_UTC"]          # datetime
@@ -1559,7 +1691,13 @@ def _style_ops(x: pd.DataFrame):
         row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
         styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
 
-    # 3) Cell-level red accents (apply after row colors so cells stay visible even on green rows)
+    # 3) Pink overlay for planned inactivity gaps
+    if "_GapRow" in _base.columns:
+        gap_css = "background-color: rgba(255, 128, 171, 0.28); border-left: 6px solid #ff80ab; font-weight: 600;"
+        gap_mask = _base["_GapRow"].reindex(x.index, fill_value=False)
+        styles.loc[gap_mask, :] = gap_css
+
+    # 4) Cell-level red accents (apply after row colors so cells stay visible even on green rows)
     cell_css = "background-color: rgba(255, 82, 82, 0.25);"
     mask_dep = cell_dep.reindex(x.index, fill_value=False)
     mask_eta = cell_eta.reindex(x.index, fill_value=False)
@@ -1575,7 +1713,7 @@ def _style_ops(x: pd.DataFrame):
         styles.loc[mask_arr, "On-Block (Actual)"].fillna("") + cell_css
     )
 
-    # 4) EDCT purple on Off-Block (Actual) (applied last so it wins for that cell)
+    # 5) EDCT purple on Off-Block (Actual) (applied last so it wins for that cell)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
     mask_edct = idx_edct.reindex(x.index, fill_value=False)
     styles.loc[mask_edct, "Off-Block (Actual)"] = (
@@ -1793,10 +1931,13 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
         "Values are stored in SQLite and override email updates until a new message arrives."
     )
 
-    if view_df.empty:
+    gap_mask = view_df["_GapRow"] if "_GapRow" in view_df.columns else pd.Series(False, index=view_df.index)
+    editable_source = view_df[~gap_mask].copy()
+
+    if editable_source.empty:
         st.info("No flights available for inline edits.")
     else:
-        inline_editor = view_df[["Booking", "_LegKey", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
+        inline_editor = editable_source[["Booking", "_LegKey", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
         inline_editor = inline_editor.rename(columns={
             "_DepActual_ts": "Off-Block (Actual)",
             "_ETA_FA_ts": "ETA (FA)",
@@ -1850,7 +1991,7 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
             },
         )
 
-        _apply_inline_editor_updates(inline_original, edited_inline, view_df)
+        _apply_inline_editor_updates(inline_original, edited_inline, editable_source)
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = (df_view if delayed_view else df)  # NOTE: keep original index; do NOT reset here
