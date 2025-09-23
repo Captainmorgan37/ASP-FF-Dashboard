@@ -1394,6 +1394,16 @@ with head_toggle_col:
         value=False,
         help="Display the Account value from the uploaded CSV in the schedule table.",
     )
+    show_sic_column = st.checkbox(
+        "Show SIC column",
+        value=True,
+        help="Display the SIC value from the uploaded CSV in the schedule table.",
+    )
+    show_workflow_column = st.checkbox(
+        "Show Workflow column",
+        value=True,
+        help="Display the Workflow value from the uploaded CSV in the schedule table.",
+    )
 with head_title_col:
     st.subheader("Schedule")
 
@@ -1427,6 +1437,12 @@ if show_account_column:
     except ValueError:
         insert_at = len(display_cols)
     display_cols.insert(insert_at, "Account")
+
+if not show_sic_column:
+    display_cols = [c for c in display_cols if c != "SIC"]
+
+if not show_workflow_column:
+    display_cols = [c for c in display_cols if c != "Workflow"]
 
 view_df = (df_view if delayed_view else df).copy()
 
