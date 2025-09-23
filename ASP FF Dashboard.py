@@ -1317,12 +1317,10 @@ if workflows_sel:
 # ============================
 # Post-arrival visibility controls
 # ============================
-v1, v2, v3 = st.columns([1, 1, 1])
+v1, v2 = st.columns([1, 1])
 with v1:
-    highlight_recent_arrivals = st.checkbox("Highlight recently landed", value=True)
+    highlight_landed_legs = st.checkbox("Highlight landed legs", value=True)
 with v2:
-    highlight_minutes = st.number_input("Highlight window (min)", min_value=10, max_value=240, value=60, step=5)
-with v3:
     auto_hide_landed = st.checkbox("Auto-hide landed", value=True)
 hide_hours = st.number_input("Hide landed after (hours)", min_value=1, max_value=24, value=2, step=1)
 
@@ -1375,9 +1373,8 @@ row_red    = row_dep_red    | row_arr_red
 dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # Off-Block (Actual true) - Off-Block (Est)
 eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Est)
 arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # On-Block (Actual) - On-Block (Est)
-# Recent arrivals green mask (keep this near your other masks)
-recent_cut = datetime.now(timezone.utc) - pd.Timedelta(minutes=int(highlight_minutes))
-row_green = df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] >= recent_cut)
+# Landed legs green mask (keep this near your other masks)
+row_green = df["_ArrActual_ts"].notna()
 
 
 cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
@@ -1537,9 +1534,8 @@ cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
 cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
-# Recent-arrival green overlay
-recent_cut = now_utc - pd.Timedelta(minutes=int(highlight_minutes))
-row_green = _base["_ArrActual_ts"].notna() & (_base["_ArrActual_ts"] >= recent_cut)
+# Landed-leg green overlay
+row_green = _base["_ArrActual_ts"].notna()
 
 # EDCT purple (until true departure is received)
 idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
@@ -1558,8 +1554,8 @@ def _style_ops(x: pd.DataFrame):
     styles.loc[row_yellow.reindex(x.index, fill_value=False), :] = row_y_css
     styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css
 
-    # 2) GREEN overlay for recent arrivals (applied after Y/R so it wins at row level)
-    if 'highlight_recent_arrivals' in globals() and highlight_recent_arrivals:
+    # 2) GREEN overlay for landed legs (applied after Y/R so it wins at row level)
+    if 'highlight_landed_legs' in globals() and highlight_landed_legs:
         row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
         styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
 
