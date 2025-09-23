@@ -739,10 +739,19 @@ SUBJ_PATTERNS = {
         re.I,
     ),
     "Diversion": re.compile(
-        r"\bdiverted to\s+(?P<to>[A-Z]{3,4})\b",
+        r"\bdiverted\s+to\b.*?(?:\(|\b)(?P<to>[A-Z]{3,4})\b",
         re.I,
     ),
 }
+
+SUBJ_DIVERSION_FROM_PAREN_RE = re.compile(
+    r"\bfrom\b[^()]*\(\s*(?P<code>[A-Z]{3,4})\s*\)",
+    re.I,
+)
+SUBJ_DIVERSION_FROM_TOKEN_RE = re.compile(
+    r"\bfrom\s+(?P<code>[A-Z]{3,4})\b",
+    re.I,
+)
 
 def parse_subject_line(subject: str, now_utc: datetime):
     if not subject:
@@ -781,7 +790,19 @@ def parse_subject_line(subject: str, now_utc: datetime):
     m = SUBJ_PATTERNS["Diversion"].search(subject)
     if m:
         result["event_type"] = "Diversion"
-        result["to_airport"] = m.group("to")
+        to_token = m.groupdict().get("to")
+        if to_token:
+            result["to_airport"] = to_token.strip().upper()
+
+        from_token = m.groupdict().get("from")
+        if not from_token:
+            m_from = SUBJ_DIVERSION_FROM_PAREN_RE.search(subject)
+            if not m_from:
+                m_from = SUBJ_DIVERSION_FROM_TOKEN_RE.search(subject)
+            if m_from:
+                from_token = m_from.group("code")
+        if from_token:
+            result["from_airport"] = from_token.strip().upper()
         return result
 
     return result
@@ -888,6 +909,11 @@ BODY_ARRIVAL_RE = re.compile(
     r".*?from\s+.*?\((?P<from>[A-Z]{3,4})\)",
     re.I
 )
+BODY_DIVERSION_RE = re.compile(
+    r"en\s*route\s+from\s+.*?\(\s*(?P<from>[A-Z]{3,4})\s*\)"
+    r".*?diverted\s+to\s+.*?\(\s*(?P<divert_to>[A-Z]{3,4})\s*\)",
+    re.I | re.S,
+)
 ETA_ANY_RE = re.compile(
     r"(?:estimated\s+(?:time\s+of\s+)?arrival|ETA)\s*(?:at|of)?\s+"
     r"(\d{1,2}:\d{2}(?:\s*[AP]M)?(?:\s*[A-Z]{2,4})?)",
@@ -938,6 +964,11 @@ def parse_body_firstline(event: str, body: str, email_date_utc: datetime) -> dic
         info["from"] = m.group("from")
         info["arr_time_utc"] = _parse_time_token_to_utc(m.group("arr_time"), email_date_utc)
         return info
+    if event == "Diversion":
+        m_div = BODY_DIVERSION_RE.search(body)
+        if m_div:
+            info["from"] = m_div.group("from")
+            info["divert_to"] = m_div.group("divert_to")
     # If the event wasn't detected as "Departure", try to capture an ETA anywhere.
     m_eta = ETA_ANY_RE.search(body)
     if m_eta:
@@ -2199,6 +2230,12 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 explicit_dt = parse_any_datetime_to_utc(text)
                 body_info = parse_body_firstline(event, body, hdr_dt or now_utc)
                 edct_info = parse_body_edct(body)
+
+                if event == "Diversion":
+                    if body_info.get("from"):
+                        subj_info.setdefault("from_airport", body_info["from"])
+                    if body_info.get("divert_to"):
+                        subj_info.setdefault("to_airport", body_info["divert_to"])
 
                 # EDCT normalization
                 if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
