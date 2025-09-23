@@ -405,12 +405,19 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
 
 import re, requests, streamlit as st
 
+
+def _normalize_delay_reason(delay_reason: str | None) -> str:
+    reason = (delay_reason or "").strip()
+    return reason if reason else "Unknown"
+
+
 def _build_delay_msg(
     tail: str,
     booking: str,
     minutes_delta: int,
     new_eta_hhmm: str,
     account: str | None = None,
+    delay_reason: str | None = None,
 ) -> str:
     # Tail like "C-FASW" or "CFASW" → "CFASW"
     tail_disp = (tail or "").replace("-", "").upper()
@@ -435,12 +442,14 @@ def _build_delay_msg(
             else:
                 eta_disp = f"{s} LT"
 
-    return (
-        f"TAIL#/BOOKING#: {tail_disp}//{booking}\n"
-        f"Account: {account_disp}\n"
-        f"{label}: {mins} minutes\n"
-        f"UPDATED ETA: {eta_disp}"
-    )
+    lines = [
+        f"TAIL#/BOOKING#: {tail_disp}//{booking}",
+        f"Account: {account_disp}",
+        f"{label}: {mins} minutes",
+        f"UPDATED ETA: {eta_disp}",
+        f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
+    ]
+    return "\n".join(lines)
 
 def post_to_telus_team(team: str, text: str) -> tuple[bool, str]:
     url = st.secrets.get("TELUS_WEBHOOKS", {}).get(team)
@@ -460,8 +469,16 @@ def notify_delay_chat(
     minutes_delta: int,
     new_eta_hhmm: str,
     account: str | None = None,
+    delay_reason: str | None = None,
 ):
-    msg = _build_delay_msg(tail, booking, minutes_delta, new_eta_hhmm, account=account)
+    msg = _build_delay_msg(
+        tail,
+        booking,
+        minutes_delta,
+        new_eta_hhmm,
+        account=account,
+        delay_reason=delay_reason,
+    )
     ok, err = post_to_telus_team(team, msg)
     if ok:
         st.success("Posted to TELUS BC team.")
@@ -630,7 +647,7 @@ def _late_early_label(delta_min: int) -> tuple[str, int]:
     label = "LATE" if delta_min >= 0 else "EARLY"
     return label, abs(int(delta_min))
 
-def build_stateful_notify_message(row: pd.Series) -> str:
+def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = None) -> str:
     """
     Build a Telus BC message whose contents depend on flight state.
     Priority for reason if multiple cells are red:
@@ -658,37 +675,40 @@ def build_stateful_notify_message(row: pd.Series) -> str:
         delta_min = int(round(arr_var.total_seconds()/60.0))
         label, mins = _late_early_label(delta_min)
         arr_local = local_hhmm(arr_ts, to_icao)
-        body = (
-            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
-            f"{account_line}\n"
-            f"{label}: {mins} minutes\n"
-            f"ARRIVAL: {arr_local}"
-        )
-        return body
+        lines = [
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}",
+            account_line,
+            f"{label}: {mins} minutes",
+            f"ARRIVAL: {arr_local}",
+            f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
+        ]
+        return "\n".join(lines)
 
     if pd.notna(eta_var):  # ENROUTE with FA ETA variance
         delta_min = int(round(eta_var.total_seconds()/60.0))
         label, mins = _late_early_label(delta_min)
         eta_local = local_hhmm(eta_fa, to_icao)
-        body = (
-            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
-            f"{account_line}\n"
-            f"{label}: {mins} minutes\n"
-            f"UPDATED ETA: {eta_local}"
-        )
-        return body
+        lines = [
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}",
+            account_line,
+            f"{label}: {mins} minutes",
+            f"UPDATED ETA: {eta_local}",
+            f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
+        ]
+        return "\n".join(lines)
 
     if pd.notna(dep_var):  # OFF-BLOCK variance (usually already enroute)
         delta_min = int(round(dep_var.total_seconds()/60.0))
         label, mins = _late_early_label(delta_min)
         dep_local = local_hhmm(dep_ts, from_icao)
-        body = (
-            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
-            f"{account_line}\n"
-            f"{label}: {mins} minutes\n"
-            f"OFF-BLOCK (ACTUAL): {dep_local}"
-        )
-        return body
+        lines = [
+            f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}",
+            account_line,
+            f"{label}: {mins} minutes",
+            f"OFF-BLOCK (ACTUAL): {dep_local}",
+            f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
+        ]
+        return "\n".join(lines)
 
     # Fallback: keep current generic builder (should rarely hit with our panel filters)
     return _build_delay_msg(
@@ -697,6 +717,7 @@ def build_stateful_notify_message(row: pd.Series) -> str:
         minutes_delta=int(_default_minutes_delta(row)),
         new_eta_hhmm=get_local_eta_str(row),  # ETA LT or UTC
         account=account_val,
+        delay_reason=delay_reason,
     )
 
 
@@ -2040,7 +2061,8 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
     else:
         st.caption("Click to post a one-click update to Telus BC. ETA shows destination **local time**.")
         for idx, row in _delayed.iterrows():  # use original index
-            info_col, btn_col = st.columns([12, 4])
+            booking_str = str(row["Booking"])
+            info_col, reason_col, btn_col = st.columns([12, 6, 3])
             with info_col:
                 etd_txt = row["ETD_UTC"].strftime("%H:%MZ") if pd.notna(row["ETD_UTC"]) else "—"
                 eta_local = get_local_eta_str(row) or "—"
@@ -2050,16 +2072,20 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                     f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}  \n"
                     f"{reason_text}"
                 )
+            with reason_col:
+                reason_key = f"delay_reason_{booking_str}_{idx}"
+                st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
             with btn_col:
-                btn_key = f"notify_{row['Booking']}_{idx}"
+                btn_key = f"notify_{booking_str}_{idx}"
                 if st.button("📣 Notify", key=btn_key):
                     teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
                     if not teams:
                         st.error("No TELUS teams configured in secrets.")
                     else:
+                        reason_val = st.session_state.get(reason_key, "")
                         ok, err = post_to_telus_team(
                             team=teams[0],
-                            text=build_stateful_notify_message(row),
+                            text=build_stateful_notify_message(row, delay_reason=reason_val),
                         )
                         if ok:
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
