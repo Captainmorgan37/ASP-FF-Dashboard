@@ -249,6 +249,22 @@ def classify_account(account_val: str) -> str:
 def type_badge(flight_type: str) -> str:
     return {"OCS": "🟢 OCS", "Owner": "🔵 Owner"}.get(flight_type, "⚪︎")
 
+def format_account_value(account_val) -> str:
+    """Return a display-friendly account string."""
+    if account_val is None:
+        return "—"
+    try:
+        if pd.isna(account_val):
+            return "—"
+    except Exception:
+        pass
+    account_str = str(account_val).strip()
+    if not account_str:
+        return "—"
+    if account_str.lower() == "nan":
+        return "—"
+    return account_str
+
 def fmt_dt_utc(dt: datetime | None) -> str:
     if not dt or (isinstance(dt, float) and pd.isna(dt)):
         return "—"
@@ -267,11 +283,19 @@ def parse_iso_to_utc(dt_str: str | None) -> datetime | None:
 
 import re, requests, streamlit as st
 
-def _build_delay_msg(tail: str, booking: str, minutes_delta: int, new_eta_hhmm: str) -> str:
+def _build_delay_msg(
+    tail: str,
+    booking: str,
+    minutes_delta: int,
+    new_eta_hhmm: str,
+    account: str | None = None,
+) -> str:
     # Tail like "C-FASW" or "CFASW" → "CFASW"
     tail_disp = (tail or "").replace("-", "").upper()
     label = "LATE" if int(minutes_delta) >= 0 else "EARLY"
     mins = abs(int(minutes_delta))
+
+    account_disp = format_account_value(account)
 
     # If caller already passed "HHMM LT"/"HHMM UTC", keep it; else normalize HHMM → "HHMM LT"
     s = (new_eta_hhmm or "").strip()
@@ -291,6 +315,7 @@ def _build_delay_msg(tail: str, booking: str, minutes_delta: int, new_eta_hhmm: 
 
     return (
         f"TAIL#/BOOKING#: {tail_disp}//{booking}\n"
+        f"Account: {account_disp}\n"
         f"{label}: {mins} minutes\n"
         f"UPDATED ETA: {eta_disp}"
     )
@@ -306,8 +331,15 @@ def post_to_telus_team(team: str, text: str) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def notify_delay_chat(team: str, tail: str, booking: str, minutes_delta: int, new_eta_hhmm: str):
-    msg = _build_delay_msg(tail, booking, minutes_delta, new_eta_hhmm)
+def notify_delay_chat(
+    team: str,
+    tail: str,
+    booking: str,
+    minutes_delta: int,
+    new_eta_hhmm: str,
+    account: str | None = None,
+):
+    msg = _build_delay_msg(tail, booking, minutes_delta, new_eta_hhmm, account=account)
     ok, err = post_to_telus_team(team, msg)
     if ok:
         st.success("Posted to TELUS BC team.")
@@ -491,6 +523,8 @@ def build_stateful_notify_message(row: pd.Series) -> str:
     eta_est  = row.get("ETA_UTC")
     from_icao= row.get("From_ICAO", "")
     to_icao  = row.get("To_ICAO", "")
+    account_val = row.get("Account")
+    account_line = f"Account: {format_account_value(account_val)}"
 
     # Compute cell variances (same definitions as styling)
     dep_var = (dep_ts - etd_est) if (pd.notna(dep_ts) and pd.notna(etd_est)) else None
@@ -504,6 +538,7 @@ def build_stateful_notify_message(row: pd.Series) -> str:
         arr_local = local_hhmm(arr_ts, to_icao)
         body = (
             f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{account_line}\n"
             f"{label}: {mins} minutes\n"
             f"ARRIVAL: {arr_local}"
         )
@@ -515,6 +550,7 @@ def build_stateful_notify_message(row: pd.Series) -> str:
         eta_local = local_hhmm(eta_fa, to_icao)
         body = (
             f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{account_line}\n"
             f"{label}: {mins} minutes\n"
             f"UPDATED ETA: {eta_local}"
         )
@@ -526,6 +562,7 @@ def build_stateful_notify_message(row: pd.Series) -> str:
         dep_local = local_hhmm(dep_ts, from_icao)
         body = (
             f"TAIL#/BOOKING#: {(tail or '').replace('-', '').upper()}//{booking}\n"
+            f"{account_line}\n"
             f"{label}: {mins} minutes\n"
             f"OFF-BLOCK (ACTUAL): {dep_local}"
         )
@@ -536,7 +573,8 @@ def build_stateful_notify_message(row: pd.Series) -> str:
         tail=tail,
         booking=booking,
         minutes_delta=int(_default_minutes_delta(row)),
-        new_eta_hhmm=get_local_eta_str(row)  # ETA LT or UTC
+        new_eta_hhmm=get_local_eta_str(row),  # ETA LT or UTC
+        account=account_val,
     )
 
 
@@ -1351,6 +1389,11 @@ head_toggle_col, head_title_col = st.columns([1.6, 8.4])
 with head_toggle_col:
     delayed_view = st.checkbox("Delayed View", value=False, help="Show RED (≥30m) first, then YELLOW (15–29m).")
     hide_non_delayed = st.checkbox("Hide non-delayed", value=True, help="Only show red/yellow rows.") if delayed_view else False
+    show_account_column = st.checkbox(
+        "Show Account column",
+        value=False,
+        help="Display the Account value from the uploaded CSV in the schedule table.",
+    )
 with head_title_col:
     st.subheader("Schedule")
 
@@ -1378,7 +1421,17 @@ display_cols = [
     "PIC", "SIC", "Workflow", "Status"
 ]
 
+if show_account_column:
+    try:
+        insert_at = display_cols.index("Aircraft")
+    except ValueError:
+        insert_at = len(display_cols)
+    display_cols.insert(insert_at, "Account")
+
 view_df = (df_view if delayed_view else df).copy()
+
+if show_account_column and "Account" in view_df.columns:
+    view_df["Account"] = view_df["Account"].map(format_account_value)
 
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Est)"]  = view_df["ETD_UTC"]          # datetime
