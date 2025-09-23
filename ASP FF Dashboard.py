@@ -806,7 +806,7 @@ def display_airport(icao: str, iata: str) -> str:
     return "—"
 
 # ---- Booking chooser ----
-def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: str, event_dt_utc: datetime) -> str | None:
+def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: str, event_dt_utc: datetime) -> pd.Series | None:
     cand = df_clean.copy()
     if tails_dashed:
         cand = cand[cand["Aircraft"].isin(tails_dashed)]  # CSV is dashed
@@ -869,7 +869,32 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
 
     MAX_WINDOW = pd.Timedelta(hours=12) if event == "Diversion" else pd.Timedelta(hours=3)
     best = cand.iloc[0]
-    return best["Booking"] if best["Δ"] <= MAX_WINDOW else None
+    if best["Δ"] <= MAX_WINDOW:
+        return best.drop(labels=["Δ"]) if "Δ" in best else best
+    return None
+
+def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: datetime | None) -> pd.Series | None:
+    if not booking:
+        return None
+    subset = df_clean[df_clean["Booking"].astype(str) == str(booking)].copy()
+    if subset.empty:
+        return None
+    if len(subset) == 1:
+        return subset.iloc[0]
+
+    if event in ("Arrival", "ArrivalForecast", "Diversion"):
+        sched_col = "ETA_UTC"
+    else:
+        sched_col = "ETD_UTC"
+
+    if event_dt_utc is None:
+        subset = subset.sort_values(sched_col)
+        return subset.iloc[0]
+
+    subset["Δ"] = (subset[sched_col] - event_dt_utc).abs()
+    subset = subset.sort_values("Δ")
+    best = subset.iloc[0]
+    return best.drop(labels=["Δ"]) if "Δ" in best else best
 
 # ============================
 # Controls
@@ -1043,6 +1068,7 @@ if missing:
     st.stop()
 
 df = df_raw.copy()
+df["Booking"] = df["Booking"].fillna("").astype(str).str.strip()
 df["Aircraft"] = df["Aircraft"].fillna("").astype(str).str.strip()
 _tail_override_map = load_tail_overrides()
 if _tail_override_map:
@@ -1069,6 +1095,33 @@ else:
 df["is_real_leg"] = df["Aircraft"].apply(is_real_tail)
 df = df[df["is_real_leg"]].copy()
 
+if not df.empty:
+    booking_sizes = df.groupby("Booking", dropna=False)["Booking"].transform("size")
+    booking_order = df.groupby("Booking", dropna=False).cumcount() + 1
+
+    def _compose_leg_key(row_booking: str, seq: int, total: int, idx: int) -> str:
+        base = (row_booking or "").strip()
+        if not base:
+            base = f"LEG-{idx+1}"
+        if total <= 1:
+            return base
+        return f"{base}#L{seq}"
+
+    df["_LegKey"] = [
+        _compose_leg_key(b, seq, total, idx)
+        for b, seq, total, idx in zip(
+            df["Booking"], booking_order, booking_sizes, df.index
+        )
+    ]
+else:
+    df["_LegKey"] = pd.Series(dtype=str, index=df.index)
+
+if _tail_override_map and not df.empty:
+    df["Aircraft"] = [
+        _tail_override_map.get(leg_key, _tail_override_map.get(str(booking), tail)) or tail
+        for leg_key, booking, tail in zip(df["_LegKey"], df["Booking"], df["Aircraft"])
+    ]
+
 df["Type"] = df["Account"].apply(classify_account)
 df["TypeBadge"] = df["Type"].apply(type_badge)
 
@@ -1087,12 +1140,18 @@ df_clean = df.copy()
 # ============================
 events_map = load_status_map()
 if st.session_state.get("status_updates"):
-    for b, upd in st.session_state["status_updates"].items():
+    for key, upd in st.session_state["status_updates"].items():
         et = upd.get("type") or "Unknown"
-        events_map.setdefault(b, {})[et] = upd
+        events_map.setdefault(key, {})[et] = upd
 
-def compute_status_row(booking, dep_utc, eta_utc) -> str:
-    rec = events_map.get(booking, {})
+def _events_for_leg(leg_key: str, booking: str) -> dict:
+    rec = events_map.get(leg_key)
+    if rec:
+        return rec
+    return events_map.get(booking, {})
+
+def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
+    rec = _events_for_leg(leg_key, booking)
     now = datetime.now(timezone.utc)
     thr = timedelta(minutes=int(delay_threshold_min))
 
@@ -1116,12 +1175,15 @@ def compute_status_row(booking, dep_utc, eta_utc) -> str:
         return "🟡 SCHEDULED" if now <= dep_utc + thr else "🔴 DELAY"
     return "🟡 SCHEDULED"
 
-df["Status"] = [compute_status_row(b, dep, eta) for b, dep, eta in zip(df["Booking"], df["ETD_UTC"], df["ETA_UTC"])]
+df["Status"] = [
+    compute_status_row(leg_key, booking, dep, eta)
+    for leg_key, booking, dep, eta in zip(df["_LegKey"], df["Booking"], df["ETD_UTC"], df["ETA_UTC"])
+]
 
 # Pull persisted times
 dep_actual_list, eta_fore_list, arr_actual_list, edct_list = [], [], [], []
-for b in df["Booking"]:
-    rec = events_map.get(b, {})
+for leg_key, booking in zip(df["_LegKey"], df["Booking"]):
+    rec = _events_for_leg(leg_key, booking)
     dep_actual_list.append(parse_iso_to_utc(rec.get("Departure", {}).get("actual_time_utc")))
     eta_fore_list.append(parse_iso_to_utc(rec.get("ArrivalForecast", {}).get("actual_time_utc")))
     arr_actual_list.append(parse_iso_to_utc(rec.get("Arrival", {}).get("actual_time_utc")))
@@ -1149,8 +1211,10 @@ df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
 df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
 
 # Blank countdowns when appropriate
-has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
-has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
+has_dep_series = ["Departure" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])]
+has_arr_series = ["Arrival" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])]
+has_dep_series = pd.Series(has_dep_series, index=df.index)
+has_arr_series = pd.Series(has_arr_series, index=df.index)
 
 turnaround_df = compute_turnaround_windows(df)
 
@@ -1231,8 +1295,14 @@ if auto_hide_landed:
     df = df[~(df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] < cutoff_hide))].copy()
 
 # (Re)compute these after filtering so masks align cleanly
-has_dep_series = df["Booking"].map(lambda b: "Departure" in events_map.get(b, {}))
-has_arr_series = df["Booking"].map(lambda b: "Arrival" in events_map.get(b, {}))
+has_dep_series = pd.Series(
+    ["Departure" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])],
+    index=df.index,
+)
+has_arr_series = pd.Series(
+    ["Arrival" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])],
+    index=df.index,
+)
 
 
 # ============================
@@ -1533,29 +1603,39 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
     if edited_df is None or original_df is None or original_df.empty:
         return
 
-    orig_idx = original_df.set_index("Booking")
-    edited_idx = edited_df.set_index("Booking")
+    key_col = "_LegKey" if all(
+        col in frame.columns for frame, col in (
+            (original_df, "_LegKey"),
+            (edited_df, "_LegKey"),
+            (base_df, "_LegKey"),
+        )
+    ) else "Booking"
+
+    orig_idx = original_df.set_index(key_col)
+    edited_idx = edited_df.set_index(key_col)
     if orig_idx.empty or edited_idx.empty:
         return
 
-    base_lookup = base_df.drop_duplicates(subset=["Booking"]).set_index("Booking")
+    base_lookup = base_df.drop_duplicates(subset=[key_col]).set_index(key_col)
 
     time_saved = 0
     time_cleared = 0
     tail_saved = 0
     tail_cleared = 0
 
-    for booking, row in edited_idx.iterrows():
-        if booking not in orig_idx.index or booking not in base_lookup.index:
+    for key, row in edited_idx.iterrows():
+        if key not in orig_idx.index or key not in base_lookup.index:
             continue
 
-        base_row = base_lookup.loc[booking]
-        orig_row = orig_idx.loc[booking]
+        base_row = base_lookup.loc[key]
+        orig_row = orig_idx.loc[key]
 
         if isinstance(base_row, pd.DataFrame):
             base_row = base_row.iloc[0]
         if isinstance(orig_row, pd.DataFrame):
             orig_row = orig_row.iloc[0]
+
+        booking_val = str(base_row.get("Booking", "")) if isinstance(base_row, pd.Series) else ""
 
         # Tail overrides (expected tail registration)
         new_tail_raw = row.get("Aircraft", "")
@@ -1568,10 +1648,10 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         if new_tail != orig_tail:
             if new_tail:
                 cleaned_tail = new_tail.upper()
-                upsert_tail_override(str(booking), cleaned_tail)
+                upsert_tail_override(str(key), cleaned_tail)
                 tail_saved += 1
             else:
-                delete_tail_override(str(booking))
+                delete_tail_override(str(key))
                 tail_cleared += 1
 
         # Time overrides for selected columns
@@ -1587,9 +1667,9 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
                 continue
 
             if new_val is None:
-                delete_status(str(booking), event_type)
-                if st.session_state.get("status_updates", {}).get(booking, {}).get("type") == event_type:
-                    st.session_state["status_updates"].pop(booking, None)
+                delete_status(str(key), event_type)
+                if st.session_state.get("status_updates", {}).get(key, {}).get("type") == event_type:
+                    st.session_state["status_updates"].pop(key, None)
                 time_cleared += 1
                 continue
 
@@ -1598,14 +1678,15 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
             if planned is not None and pd.notna(planned):
                 delta_min = int(round((pd.Timestamp(new_val) - planned).total_seconds() / 60.0))
 
-            upsert_status(str(booking), event_type, status_label, new_val.isoformat(), delta_min)
+            upsert_status(str(key), event_type, status_label, new_val.isoformat(), delta_min)
             st.session_state.setdefault("status_updates", {})
-            st.session_state["status_updates"][booking] = {
-                **st.session_state["status_updates"].get(booking, {}),
+            st.session_state["status_updates"][key] = {
+                **st.session_state["status_updates"].get(key, {}),
                 "type": event_type,
                 "actual_time_utc": new_val.isoformat(),
                 "delta_min": delta_min,
                 "status": status_label,
+                "booking": booking_val,
             }
             time_saved += 1
 
@@ -1652,13 +1733,14 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
     if view_df.empty:
         st.info("No flights available for inline edits.")
     else:
-        inline_editor = view_df[["Booking", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
+        inline_editor = view_df[["Booking", "_LegKey", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
         inline_editor = inline_editor.rename(columns={
             "_DepActual_ts": "Off-Block (Actual)",
             "_ETA_FA_ts": "ETA (FA)",
             "_ArrActual_ts": "On-Block (Actual)",
         })
         inline_editor["Booking"] = inline_editor["Booking"].astype(str)
+        inline_editor["_LegKey"] = inline_editor["_LegKey"].astype(str)
         inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
         for col in ["Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"]:
             inline_editor[col] = inline_editor[col].apply(_to_editor_datetime)
@@ -1671,9 +1753,14 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
             hide_index=True,
             num_rows="fixed",
             use_container_width=True,
-            column_order=["Booking", "Aircraft", "Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"],
+            column_order=["Booking", "_LegKey", "Aircraft", "Off-Block (Actual)", "ETA (FA)", "On-Block (Actual)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
+                "_LegKey": st.column_config.Column(
+                    "Leg Identifier",
+                    disabled=True,
+                    help="Unique key for this specific leg (updates apply per leg).",
+                ),
                 "Aircraft": st.column_config.TextColumn(
                     "Expected Tail",
                     help="Override the tail registration shown in the schedule.",
@@ -1909,21 +1996,33 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
 
                 # Try explicit booking first
                 bookings, _tails_unused, _evt_unused = extract_candidates(text)
-                booking = bookings[0] if bookings else None
+                booking_token = bookings[0] if bookings else None
 
-                # Fallback: choose by tail/route/time
-                if not booking:
-                    booking = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
+                selected_row = select_leg_row_for_booking(booking_token, event, actual_dt_utc)
+                if selected_row is None:
+                    match_row = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
+                    if match_row is not None:
+                        selected_row = match_row
 
-                if not (booking and event and actual_dt_utc):
+                if selected_row is not None:
+                    booking = str(selected_row.get("Booking", booking_token or ""))
+                    leg_key = str(selected_row.get("_LegKey") or booking)
+                else:
+                    booking = booking_token
+                    leg_key = str(booking) if booking else None
+
+                if not (leg_key and event and actual_dt_utc):
                     set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                     continue
 
                 # Planned time for delta
-                row = df_clean[df_clean["Booking"] == booking]
                 planned = None
-                if not row.empty:
-                    planned = row["ETA_UTC"].iloc[0] if event in ("Arrival", "ArrivalForecast") else row["ETD_UTC"].iloc[0]
+                if selected_row is not None:
+                    planned = (
+                        selected_row.get("ETA_UTC")
+                        if event in ("Arrival", "ArrivalForecast")
+                        else selected_row.get("ETD_UTC")
+                    )
                 delta_min = None
                 if planned is not None and pd.notna(planned):
                     delta_min = int(round((actual_dt_utc - planned).total_seconds() / 60.0))
@@ -1945,19 +2044,20 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
 
                 # Persist + session mirror
                 st.session_state.setdefault("status_updates", {})
-                st.session_state["status_updates"][booking] = {
+                st.session_state["status_updates"][leg_key] = {
                     "type": event,
                     "actual_time_utc": actual_dt_utc.isoformat(),
                     "delta_min": delta_min,
                     "status": status,
+                    "booking": booking,
                 }
-                upsert_status(booking, event, status, actual_dt_utc.isoformat(), delta_min)
+                upsert_status(leg_key, event, status, actual_dt_utc.isoformat(), delta_min)
 
                 # EDCT may include an expected arrival—save as forecast
                 if edct_info.get("expected_arrival_utc"):
-                    upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", edct_info["expected_arrival_utc"].isoformat(), None)
+                    upsert_status(leg_key, "ArrivalForecast", "🟦 ARRIVING SOON", edct_info["expected_arrival_utc"].isoformat(), None)
                 elif event == "Departure" and body_info.get("eta_time_utc"):
-                    upsert_status(booking, "ArrivalForecast", "🟦 ARRIVING SOON", body_info["eta_time_utc"].isoformat(), None)
+                    upsert_status(leg_key, "ArrivalForecast", "🟦 ARRIVING SOON", body_info["eta_time_utc"].isoformat(), None)
 
                 applied += 1
 
