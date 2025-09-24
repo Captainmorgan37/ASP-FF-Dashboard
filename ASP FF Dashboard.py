@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 from dateutil import parser as dateparse
 from dateutil.tz import tzoffset
+from pathlib import Path
 import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 
@@ -1655,7 +1656,7 @@ def _default_minutes_delta(row) -> int:
     return 0
 
 # NEW: airport-local ETA string for notifications (HHMM LT) with fallback to UTC
-ICAO_TZ_MAP = {
+DEFAULT_ICAO_TZ_MAP = {
     "CYYZ": "America/Toronto",
     "CYUL": "America/Toronto",
     "CYOW": "America/Toronto",
@@ -1669,6 +1670,42 @@ ICAO_TZ_MAP = {
     "CYQR": "America/Regina",
     # add more as needed
 }
+
+
+def load_icao_timezone_map() -> dict[str, str]:
+    """Return a mapping of ICAO -> Olson timezone string."""
+
+    mapping: dict[str, str] = DEFAULT_ICAO_TZ_MAP.copy()
+    csv_path = Path(__file__).with_name("Airport TZ")
+    if not csv_path.exists():
+        return mapping
+
+    try:
+        df = pd.read_csv(csv_path, usecols=["icao", "tz"])
+    except Exception as exc:  # pragma: no cover - informative fallback only
+        print(f"Unable to load airport timezone data from {csv_path}: {exc}")
+        return mapping
+
+    if df.empty:
+        return mapping
+
+    valid_timezones = set(pytz.all_timezones)
+    df = df.dropna(subset=["icao", "tz"])
+    df["icao"] = df["icao"].astype(str).str.strip().str.upper()
+    df["tz"] = df["tz"].astype(str).str.strip()
+    df = df[df["icao"].str.len() == 4]
+    df = df[df["tz"].isin(valid_timezones)]
+
+    if df.empty:
+        return mapping
+
+    mapping.update(df.drop_duplicates(subset="icao", keep="first").set_index("icao")["tz"].to_dict())
+    return mapping
+
+
+ICAO_TZ_MAP = load_icao_timezone_map()
+
+
 def get_local_eta_str(row) -> str:
     base = row["_ETA_FA_ts"] if pd.notna(row["_ETA_FA_ts"]) else row["ETA_UTC"]
     if pd.isna(base):
