@@ -1,6 +1,7 @@
 # daily_ops_dashboard.py  — FF Dashboard with inline Notify + local ETA conversion
 
 import re
+import json
 import sqlite3
 import imaplib, email
 from email.utils import parsedate_to_datetime
@@ -1018,6 +1019,60 @@ def display_airport(icao: str, iata: str) -> str:
         return a
     return "—"
 
+
+def _airport_token_variants(code: str) -> set[str]:
+    """Return possible comparison tokens (ICAO + derived IATA) for a code."""
+
+    tokens: set[str] = set()
+    c = (code or "").strip().upper()
+    if not c:
+        return tokens
+    if len(c) == 4:
+        tokens.add(c)
+        derived = derive_iata_from_icao(c)
+        if derived:
+            tokens.add(derived)
+    elif len(c) == 3:
+        tokens.add(c)
+    return tokens
+
+
+def _parse_route_mismatch_status(status_text: str):
+    """Parse stored RouteMismatch status JSON → dict with normalized fields."""
+
+    if not status_text:
+        return None
+    try:
+        data = json.loads(status_text)
+        if isinstance(data, dict):
+            email_raw = str(data.get("email_to_raw") or "").strip().upper()
+            tokens = data.get("email_tokens")
+            if isinstance(tokens, list):
+                token_set = {
+                    str(tok).strip().upper()
+                    for tok in tokens
+                    if isinstance(tok, str) and str(tok).strip()
+                }
+            else:
+                token_set = set()
+            if not token_set and email_raw:
+                token_set = _airport_token_variants(email_raw)
+            return {
+                "email_to_raw": email_raw,
+                "email_tokens": sorted(token_set),
+            }
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    fallback = status_text.strip().upper()
+    if not fallback:
+        return None
+    tokens = _airport_token_variants(fallback)
+    return {
+        "email_to_raw": fallback,
+        "email_tokens": sorted(tokens),
+    }
+
 # ---- Booking chooser ----
 def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: str, event_dt_utc: datetime) -> pd.Series | None:
     cand = df_clean.copy()
@@ -1395,12 +1450,36 @@ df["Status"] = [
 
 # Pull persisted times
 dep_actual_list, eta_fore_list, arr_actual_list, edct_list = [], [], [], []
-for leg_key, booking in zip(df["_LegKey"], df["Booking"]):
+route_mismatch_flags: list[bool] = []
+route_mismatch_msgs: list[str] = []
+for idx, (leg_key, booking) in enumerate(zip(df["_LegKey"], df["Booking"])):
     rec = _events_for_leg(leg_key, booking)
     dep_actual_list.append(parse_iso_to_utc(rec.get("Departure", {}).get("actual_time_utc")))
     eta_fore_list.append(parse_iso_to_utc(rec.get("ArrivalForecast", {}).get("actual_time_utc")))
     arr_actual_list.append(parse_iso_to_utc(rec.get("Arrival", {}).get("actual_time_utc")))
     edct_list.append(parse_iso_to_utc(rec.get("EDCT", {}).get("actual_time_utc")))
+
+    mismatch_flag = False
+    mismatch_msg = ""
+    mismatch_event = rec.get("RouteMismatch")
+    if mismatch_event is not None:
+        payload = _parse_route_mismatch_status(mismatch_event.get("status"))
+        if payload:
+            sched_tokens = set()
+            row = df.iloc[idx]
+            sched_tokens.update(_airport_token_variants(row.get("To_ICAO")))
+            sched_tokens.update(_airport_token_variants(row.get("To_IATA")))
+
+            email_tokens = set(payload.get("email_tokens") or [])
+            if not email_tokens and payload.get("email_to_raw"):
+                email_tokens = _airport_token_variants(payload.get("email_to_raw"))
+
+            if sched_tokens and email_tokens and email_tokens.isdisjoint(sched_tokens):
+                mismatch_flag = True
+                mismatch_msg = payload.get("email_to_raw") or (next(iter(email_tokens)) if email_tokens else "")
+
+    route_mismatch_flags.append(mismatch_flag)
+    route_mismatch_msgs.append(mismatch_msg)
 
 # Display columns
 # Off-Block (Actual): show EDCT (purple) until a true Departure arrives, then overwrite with actual time
@@ -1422,6 +1501,13 @@ df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)     # True actua
 df["_ETA_FA_ts"]    = pd.to_datetime(eta_fore_list,   utc=True)
 df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
 df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
+
+df["_RouteMismatch"] = route_mismatch_flags
+df["_RouteMismatchMsg"] = route_mismatch_msgs
+for idx in df.index[df["_RouteMismatch"]]:
+    msg = df.at[idx, "_RouteMismatchMsg"]
+    if isinstance(msg, str) and msg:
+        df.at[idx, "Route"] = f"{df.at[idx, 'Route']} · ⚠️ FA email to {msg}"
 
 # Blank countdowns when appropriate
 has_dep_series = ["Departure" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])]
@@ -1629,6 +1715,12 @@ else:
 if "_GapRow" in view_df.columns:
     view_df["_GapRow"] = view_df["_GapRow"].fillna(False).astype(bool)
 
+if "_RouteMismatch" in view_df.columns:
+    view_df["_RouteMismatch"] = view_df["_RouteMismatch"].fillna(False).astype(bool)
+
+if "_RouteMismatchMsg" in view_df.columns:
+    view_df["_RouteMismatchMsg"] = view_df["_RouteMismatchMsg"].fillna("")
+
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Est)"]  = view_df["ETD_UTC"]          # datetime
 view_df["On-Block (Est)"]   = view_df["ETA_UTC"]          # datetime
@@ -1814,6 +1906,13 @@ def _style_ops(x: pd.DataFrame):
         mask_turn = turn_warn.reindex(x.index, fill_value=False)
         styles.loc[mask_turn, "Turn Time"] = (
             styles.loc[mask_turn, "Turn Time"].fillna("") + turn_css
+        )
+
+    if "_RouteMismatch" in _base.columns and "Route" in x.columns:
+        route_css = "background-color: rgba(244, 67, 54, 0.35); color: #b71c1c; font-weight: 700;"
+        route_mask = _base["_RouteMismatch"].reindex(x.index, fill_value=False)
+        styles.loc[route_mask, "Route"] = (
+            styles.loc[route_mask, "Route"].fillna("") + route_css
         )
 
     return styles
@@ -2312,6 +2411,40 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 else:
                     booking = booking_token
                     leg_key = str(booking) if booking else None
+
+                if leg_key and event == "Departure" and selected_row is not None:
+                    sched_tokens = set()
+                    sched_tokens.update(_airport_token_variants(selected_row.get("To_ICAO")))
+                    sched_tokens.update(_airport_token_variants(selected_row.get("To_IATA")))
+
+                    email_tokens = set()
+                    email_to_raw = ""
+                    for candidate in [body_info.get("to"), subj_info.get("to_airport")]:
+                        token = (candidate or "").strip().upper()
+                        if not token:
+                            continue
+                        if not email_to_raw:
+                            email_to_raw = token
+                        email_tokens.update(_airport_token_variants(token))
+
+                    if sched_tokens and email_tokens:
+                        mismatch_ts = actual_dt_utc or hdr_dt or now_utc
+                        if email_tokens.isdisjoint(sched_tokens):
+                            payload = {
+                                "email_to_raw": email_to_raw,
+                                "email_tokens": sorted(email_tokens),
+                            }
+                            if mismatch_ts:
+                                payload["detected_at"] = mismatch_ts.isoformat()
+                            upsert_status(
+                                leg_key,
+                                "RouteMismatch",
+                                json.dumps(payload),
+                                mismatch_ts.isoformat() if mismatch_ts else None,
+                                None,
+                            )
+                        else:
+                            delete_status(leg_key, "RouteMismatch")
 
                 if not (leg_key and event and actual_dt_utc):
                     set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
