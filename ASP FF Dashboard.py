@@ -1325,7 +1325,7 @@ else:
 # Parse & normalize
 # ============================
 expected_cols = [
-    "Booking", "Off-Block (Est)", "On-Block (Est)",
+    "Booking", "Off-Block (Sched)", "On-Block (Sched)",
     "From (ICAO)", "To (ICAO)",
     "Flight time (Est)", "PIC", "SIC",
     "Account", "Aircraft", "Aircraft Type", "Workflow"
@@ -1344,8 +1344,8 @@ if _tail_override_map:
         _tail_override_map.get(str(booking), tail) or tail
         for booking, tail in zip(df["Booking"], df["Aircraft"])
     ]
-df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Est)"])
-df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Est)"])
+df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Sched)"])
+df["ETA_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["On-Block (Sched)"])
 
 df["From_ICAO"] = df["From (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
 df["To_ICAO"]   = df["To (ICAO)"].astype(str).str.strip().str.upper().replace({"NAN": ""})
@@ -1632,8 +1632,8 @@ row_red    = row_dep_red    | row_arr_red
 
 # Cell-level red accents (do not count EDCT as actual departure)
 dep_delay        = df["_DepActual_ts"] - df["ETD_UTC"]   # True takeoff - Off-Block (Sched)
-eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Est)
-arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # Landing (FA) - On-Block (Est)
+eta_fa_vs_sched  = df["_ETA_FA_ts"]    - df["ETA_UTC"]   # ETA (FA) - On-Block (Sched)
+arr_vs_sched     = df["_ArrActual_ts"] - df["ETA_UTC"]   # Landing (FA) - On-Block (Sched)
 # Landed legs green mask (keep this near your other masks)
 row_green = df["_ArrActual_ts"].notna()
 
@@ -1682,7 +1682,7 @@ if delayed_view:
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off-Block (Sched)", "Takeoff (FA)", "ETA (FA)",
-    "On-Block (Est)", "Landing (FA)",
+    "On-Block (Sched)", "Landing (FA)",
     "Departs In", "Arrives In", "Turn Time",
     "PIC", "SIC", "Workflow", "Status"
 ]
@@ -1723,7 +1723,7 @@ if "_RouteMismatchMsg" in view_df.columns:
 
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Sched)"] = view_df["ETD_UTC"]          # datetime
-view_df["On-Block (Est)"]    = view_df["ETA_UTC"]          # datetime
+view_df["On-Block (Sched)"]  = view_df["ETA_UTC"]          # datetime
 view_df["ETA (FA)"]          = view_df["_ETA_FA_ts"]       # datetime or NaT
 view_df["Landing (FA)"]      = view_df["_ArrActual_ts"]   # datetime or NaT
 
@@ -1841,8 +1841,8 @@ row_red    = (row_dep_red    | row_arr_red)
 
 # Cell-level variance checks
 dep_delay        = _base["_DepActual_ts"] - _base["ETD_UTC"]   # Takeoff (FA) − Off-Block (Sched)
-eta_fa_vs_sched  = _base["_ETA_FA_ts"]    - _base["ETA_UTC"]   # ETA(FA) − On-Block (Est)
-arr_vs_sched     = _base["_ArrActual_ts"] - _base["ETA_UTC"]   # Landing (FA) − On-Block (Est)
+eta_fa_vs_sched  = _base["_ETA_FA_ts"]    - _base["ETA_UTC"]   # ETA(FA) − On-Block (Sched)
+arr_vs_sched     = _base["_ArrActual_ts"] - _base["ETA_UTC"]   # Landing (FA) − On-Block (Sched)
 
 cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
@@ -1922,7 +1922,7 @@ def _style_ops(x: pd.DataFrame):
 # Time-only display, but keep sorting by underlying datetimes
 fmt_map = {
     "Off-Block (Sched)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-    "On-Block (Est)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "On-Block (Sched)":  lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "Landing (FA)":      lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
@@ -2109,7 +2109,7 @@ try:
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
-    for c in ["Off-Block (Sched)", "On-Block (Est)", "ETA (FA)", "Landing (FA)"]:
+    for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
 
@@ -2189,8 +2189,8 @@ thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as stylin
 
 # Variances vs schedule (same as styling)
 dep_var = _show["_DepActual_ts"] - _show["ETD_UTC"]   # Takeoff (FA) − Off-Block (Sched)
-eta_var = _show["_ETA_FA_ts"]    - _show["ETA_UTC"]   # ETA(FA) − On-Block (Est)
-arr_var = _show["_ArrActual_ts"] - _show["ETA_UTC"]   # Landing (FA) − On-Block (Est)
+eta_var = _show["_ETA_FA_ts"]    - _show["ETA_UTC"]   # ETA(FA) − On-Block (Sched)
+arr_var = _show["_ArrActual_ts"] - _show["ETA_UTC"]   # Landing (FA) − On-Block (Sched)
 
 cell_dep = dep_var.notna() & (dep_var > thr)
 cell_eta = eta_var.notna() & (eta_var > thr)
@@ -2269,7 +2269,7 @@ if delayed_view:
 else:
     st.caption(
         "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
-        "Cell accents: red = variance (Takeoff (FA)>Off-Block Sched, ETA(FA)>On-Block Est, Landing (FA)>On-Block Est). "
+        "Cell accents: red = variance (Takeoff (FA)>Off-Block Sched, ETA(FA)>On-Block Sched, Landing (FA)>On-Block Sched). "
         "EDCT shows in purple in Takeoff (FA) until a Departure email is received."
     )
 
