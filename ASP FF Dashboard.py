@@ -2450,13 +2450,13 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
         # --- search new UIDs
         last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
         if IMAP_SENDER:
-            typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
+            typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', 'UID', f'{last_uid + 1}:*')
             if typ != "OK" or not data or not data[0]:
                 if debug:
                     st.warning(f'No matches for FROM filter "{IMAP_SENDER}". Falling back to unfiltered UID search.')
-                typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
+                typ, data = M.uid('search', None, 'UID', f'{last_uid + 1}:*')
         else:
-            typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
+            typ, data = M.uid('search', None, 'UID', f'{last_uid + 1}:*')
 
         if typ != "OK":
             st.error("IMAP search failed")
@@ -2642,6 +2642,10 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                     st.warning(f"IMAP parse error on UID {uid}: {e}")
             finally:
                 # Always advance the cursor so we don't reprocess this email
+                try:
+                    M.uid('store', str(uid), '+FLAGS', '(\\Seen)')
+                except Exception:
+                    pass
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
 
         return applied
