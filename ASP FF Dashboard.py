@@ -344,6 +344,33 @@ def is_real_tail(tail: str) -> bool:
             return False
     return True
 
+
+def render_flightaware_link(tail) -> str:
+    """Return a FlightAware URL for real tails, otherwise the raw tail text."""
+
+    if tail is None:
+        return ""
+
+    try:
+        if pd.isna(tail):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    tail_text = str(tail).strip()
+    if not tail_text or tail_text.lower() == "nan":
+        return ""
+
+    if not is_real_tail(tail_text):
+        return tail_text
+
+    tail_text = tail_text.upper()
+
+    normalized = tail_text.replace("-", "")
+    tail_fragment = quote(tail_text)
+    return f"https://www.flightaware.com/live/flight/{normalized}#tail={tail_fragment}"
+
+
 def parse_utc_ddmmyyyy_hhmmz(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip().str.replace("Z", "z", regex=False).str.replace("z", "", regex=False)
     return pd.to_datetime(s, format="%d.%m.%Y %H:%M", errors="coerce", utc=True)
@@ -2003,31 +2030,6 @@ fmt_map = {
     "Landing (FA)":      lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
-
-def render_flightaware_link(tail) -> str:
-    """Return a FlightAware URL for real tails, otherwise the raw tail text."""
-
-    if tail is None:
-        return ""
-
-    try:
-        if pd.isna(tail):
-            return ""
-    except (TypeError, ValueError):
-        pass
-
-    tail_text = str(tail).strip()
-    if not tail_text or tail_text.lower() == "nan":
-        return ""
-
-    if not is_real_tail(tail_text):
-        return tail_text
-
-    tail_text = tail_text.upper()
-
-    normalized = tail_text.replace("-", "")
-    tail_fragment = quote(tail_text)
-    return f"https://www.flightaware.com/live/flight/{normalized}#tail={tail_fragment}"
 
 # Helpers for inline editing (data_editor expects naive datetimes)
 def _format_editor_datetime(ts):
