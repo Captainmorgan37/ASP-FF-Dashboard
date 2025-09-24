@@ -7,6 +7,7 @@ import imaplib, email
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -1812,6 +1813,9 @@ view_df["Takeoff (FA)"] = view_df.apply(_takeoff_display, axis=1)
 
 df_display = view_df[display_cols].copy()
 
+if "Aircraft" in df_display.columns:
+    df_display["Aircraft"] = df_display["Aircraft"].map(render_flightaware_link)
+
 # ----------------- Notify helpers used by buttons -----------------
 local_tz = tzlocal.get_localzone()
 
@@ -2001,7 +2005,7 @@ fmt_map = {
 }
 
 def render_flightaware_link(tail) -> str:
-    """Return a FlightAware link for real tails, otherwise the raw tail text."""
+    """Return a FlightAware URL for real tails, otherwise the raw tail text."""
 
     if tail is None:
         return ""
@@ -2019,11 +2023,11 @@ def render_flightaware_link(tail) -> str:
     if not is_real_tail(tail_text):
         return tail_text
 
-    normalized = tail_text.replace("-", "").upper()
-    href = f"https://www.flightaware.com/live/flight/{normalized}"
-    return (
-        f'<a href="{href}" target="_blank" rel="noopener noreferrer">{normalized}</a>'
-    )
+    tail_text = tail_text.upper()
+
+    normalized = tail_text.replace("-", "")
+    tail_fragment = quote(tail_text)
+    return f"https://www.flightaware.com/live/flight/{normalized}#tail={tail_fragment}"
 
 # Helpers for inline editing (data_editor expects naive datetimes)
 def _format_editor_datetime(ts):
@@ -2261,19 +2265,33 @@ if hasattr(styler, "hide_index"):
 else:
     styler = styler.hide(axis="index")
 
+aircraft_link_column = st.column_config.LinkColumn(
+    "Aircraft",
+    help="Open the FlightAware page for this tail in a new tab.",
+    display_text=r"tail=(.*)$",
+    validate=r"^https://www\\.flightaware\\.com/live/flight/[^#]+#tail=.*$",
+)
+aircraft_column_config = {}
+if "Aircraft" in df_display.columns:
+    aircraft_column_config["Aircraft"] = aircraft_link_column
+
 try:
-    styler = (
-        styler.apply(_style_ops, axis=None)
-        .format(fmt_map)
-        .format({"Aircraft": render_flightaware_link}, escape=None)
+    styler = styler.apply(_style_ops, axis=None).format(fmt_map)
+    st.dataframe(
+        styler,
+        use_container_width=True,
+        column_config=aircraft_column_config or None,
     )
-    st.dataframe(styler, use_container_width=True)
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
     for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-    st.dataframe(tmp, use_container_width=True)
+    st.dataframe(
+        tmp,
+        use_container_width=True,
+        column_config=aircraft_column_config or None,
+    )
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=True):
