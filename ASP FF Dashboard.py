@@ -1086,19 +1086,47 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
     raw_to   = (subj_info.get("to_airport") or "").strip().upper()
 
     def match_token(cdf, col_iata, col_icao, token):
-        if not token:
+        token_norm = (token or "").strip().upper()
+        if not token_norm:
             return cdf
-        tok_iata = normalize_iata(token)
-        tok_icao = token if len(token) == 4 else None
-        if tok_iata and tok_icao:
-            mask = (cdf[col_iata] == tok_iata) | (cdf[col_icao] == tok_icao)
-        elif tok_iata:
-            mask = (cdf[col_iata] == tok_iata)
-        elif tok_icao:
-            mask = (cdf[col_icao] == tok_icao)
-        else:
-            return cdf
-        return cdf[mask]
+
+        tok_iata = normalize_iata(token_norm)
+        tok_icao = token_norm if len(token_norm) == 4 else ""
+
+        icao_series = (
+            cdf[col_icao]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+        iata_series = (
+            cdf[col_iata]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+
+        if tok_iata:
+            derived_mask = (
+                (icao_series.str.len() == 4)
+                & icao_series.str[0].isin(["C", "K"])
+                & (icao_series.str[1:] == tok_iata)
+            )
+            if derived_mask.any():
+                return cdf[derived_mask]
+
+            iata_mask = iata_series == tok_iata
+            if iata_mask.any():
+                return cdf[iata_mask]
+
+        if tok_icao:
+            icao_mask = icao_series == tok_icao
+            if icao_mask.any():
+                return cdf[icao_mask]
+
+        return cdf.iloc[0:0]
     
     if event in ("Arrival", "ArrivalForecast"):
         if raw_at:
