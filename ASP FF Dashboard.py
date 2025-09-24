@@ -1427,6 +1427,21 @@ def _events_for_leg(leg_key: str, booking: str) -> dict:
         return rec
     return events_map.get(booking, {})
 
+def _compute_event_presence(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Return boolean Series indicating which legs have departure/arrival events."""
+    has_dep_flags = [
+        "Departure" in _events_for_leg(leg_key, booking)
+        for leg_key, booking in zip(frame["_LegKey"], frame["Booking"])
+    ]
+    has_arr_flags = [
+        "Arrival" in _events_for_leg(leg_key, booking)
+        for leg_key, booking in zip(frame["_LegKey"], frame["Booking"])
+    ]
+    return (
+        pd.Series(has_dep_flags, index=frame.index, dtype=bool),
+        pd.Series(has_arr_flags, index=frame.index, dtype=bool),
+    )
+
 def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
     rec = _events_for_leg(leg_key, booking)
     now = datetime.now(timezone.utc)
@@ -1519,10 +1534,7 @@ for idx in df.index[df["_RouteMismatch"]]:
         df.at[idx, "Route"] = f"{df.at[idx, 'Route']} · ⚠️ FA email to {msg}"
 
 # Blank countdowns when appropriate
-has_dep_series = ["Departure" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])]
-has_arr_series = ["Arrival" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])]
-has_dep_series = pd.Series(has_dep_series, index=df.index)
-has_arr_series = pd.Series(has_arr_series, index=df.index)
+has_dep_series, has_arr_series = _compute_event_presence(df)
 
 turnaround_df = compute_turnaround_windows(df)
 
@@ -1584,6 +1596,28 @@ if airports_sel:
 if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
+# Limit to upcoming legs / next-hour window if requested
+if show_only_upcoming or limit_next_hours:
+    etd_series = pd.to_datetime(df["ETD_UTC"], errors="coerce", utc=True)
+    df["ETD_UTC"] = etd_series
+
+    visibility_mask = pd.Series(True, index=df.index)
+
+    if show_only_upcoming:
+        has_dep_for_filter = has_dep_series.reindex(df.index).fillna(False)
+        visibility_mask &= ~has_dep_for_filter
+
+    if limit_next_hours:
+        window_start = datetime.now(timezone.utc)
+        window_end = window_start + timedelta(hours=int(next_hours))
+        window_mask = etd_series.notna() & etd_series.between(window_start, window_end)
+        if not show_only_upcoming:
+            # Keep legs without an ETD only when we're not forcing "upcoming" only
+            window_mask = window_mask | etd_series.isna()
+        visibility_mask &= window_mask
+
+    df = df[visibility_mask].copy()
+
 # ============================
 # Post-arrival visibility controls
 # ============================
@@ -1601,14 +1635,9 @@ if auto_hide_landed:
     df = df[~(df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] < cutoff_hide))].copy()
 
 # (Re)compute these after filtering so masks align cleanly
-has_dep_series = pd.Series(
-    ["Departure" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])],
-    index=df.index,
-)
-has_arr_series = pd.Series(
-    ["Arrival" in _events_for_leg(k, b) for k, b in zip(df["_LegKey"], df["Booking"])],
-    index=df.index,
-)
+has_dep_series, has_arr_series = _compute_event_presence(df)
+df.loc[has_dep_series, "Departs In"] = "—"
+df.loc[has_arr_series, "Arrives In"] = "—"
 
 
 # ============================
