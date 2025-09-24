@@ -331,7 +331,11 @@ def insert_gap_notice_rows(frame: pd.DataFrame, threshold: pd.Timedelta = NO_ACT
 
         pieces.append(_build_gap_notice_row(frame, cur_end, next_start, gap_td))
 
-    combined = pd.concat(pieces, ignore_index=True)
+    non_empty_pieces = [piece for piece in pieces if not piece.empty]
+    if not non_empty_pieces:
+        return frame
+
+    combined = pd.concat(non_empty_pieces, ignore_index=True)
     combined["_GapRow"] = combined["_GapRow"].fillna(False)
     return combined
 
@@ -1785,10 +1789,14 @@ else:
 
 # Ensure gap flag remains boolean after any transforms
 if "_GapRow" in view_df.columns:
-    view_df["_GapRow"] = view_df["_GapRow"].fillna(False).astype(bool)
+    view_df["_GapRow"] = (
+        view_df["_GapRow"].fillna(False).infer_objects(copy=False).astype(bool)
+    )
 
 if "_RouteMismatch" in view_df.columns:
-    view_df["_RouteMismatch"] = view_df["_RouteMismatch"].fillna(False).astype(bool)
+    view_df["_RouteMismatch"] = (
+        view_df["_RouteMismatch"].fillna(False).infer_objects(copy=False).astype(bool)
+    )
 
 if "_RouteMismatchMsg" in view_df.columns:
     view_df["_RouteMismatchMsg"] = view_df["_RouteMismatchMsg"].fillna("")
@@ -2238,13 +2246,13 @@ else:
 
 try:
     styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(styler, use_container_width=True)
+    st.dataframe(styler, width="stretch")
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
     for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-    st.dataframe(tmp, use_container_width=True)
+    st.dataframe(tmp, width="stretch")
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=True):
@@ -2279,7 +2287,7 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
             key="schedule_inline_editor",
             hide_index=True,
             num_rows="fixed",
-            use_container_width=True,
+            width="stretch",
             column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "ETA (FA)", "Landing (FA)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
