@@ -1106,12 +1106,18 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         sched_col = "ETA_UTC"
-    
+
     elif event in ("Departure", "EDCT"):
         if raw_from:
             cand = match_token(cand, "From_IATA", "From_ICAO", raw_from)
         if raw_to:
-            cand = match_token(cand, "To_IATA", "To_ICAO", raw_to)
+            # Only constrain on the destination if it actually matches something.
+            # This allows us to still match the scheduled leg when FlightAware emails
+            # mention a different arrival airport (which we flag separately as a
+            # route mismatch alert).
+            cand_to = match_token(cand, "To_IATA", "To_ICAO", raw_to)
+            if not cand_to.empty:
+                cand = cand_to
         sched_col = "ETD_UTC"
     
     elif event == "Diversion":
