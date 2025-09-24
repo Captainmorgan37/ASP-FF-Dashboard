@@ -2266,7 +2266,6 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
                         "'4pm'. The scheduled day is used unless you specify a date."
                     ),
                     max_chars=32,
-                    placeholder="HHMM",
                 ),
                 "ETA (FA)": st.column_config.TextColumn(
                     "ETA (FA)",
@@ -2275,7 +2274,6 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
                         "Use words like 'tomorrow' if the arrival slips a day."
                     ),
                     max_chars=32,
-                    placeholder="HHMM",
                 ),
                 "Landing (FA)": st.column_config.TextColumn(
                     "Landing (FA)",
@@ -2284,7 +2282,6 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
                         "Leave blank to clear an override."
                     ),
                     max_chars=32,
-                    placeholder="HHMM",
                 ),
             },
         )
