@@ -1321,6 +1321,15 @@ else:
         st.info("Upload today’s FL3XX flights CSV to begin.")
         st.stop()
 
+# Harmonize legacy column names before validation so older CSV exports remain compatible
+column_renames = {}
+if "Off-Block (Sched)" not in df_raw.columns and "Off-Block (Est)" in df_raw.columns:
+    column_renames["Off-Block (Est)"] = "Off-Block (Sched)"
+if "On-Block (Sched)" not in df_raw.columns and "On-Block (Est)" in df_raw.columns:
+    column_renames["On-Block (Est)"] = "On-Block (Sched)"
+if column_renames:
+    df_raw = df_raw.rename(columns=column_renames)
+
 # ============================
 # Parse & normalize
 # ============================
