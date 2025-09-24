@@ -2429,11 +2429,67 @@ IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., alerts@flightaware.com
 
 
 # 2) Define the polling function BEFORE the UI uses it
+def _uid_list_from_search(data) -> list[int]:
+    if not data:
+        return []
+    payload = data[0]
+    if not payload:
+        return []
+    if isinstance(payload, bytes):
+        parts = payload.split()
+    elif isinstance(payload, str):
+        parts = payload.encode().split()
+    else:
+        return []
+    return [int(p) for p in parts if p]
+
+
+def _search_new_uids(M, last_uid: int, debug: bool = False) -> tuple[list[int], str]:
+    """Return the list of UIDs greater than ``last_uid`` and a short note of the strategy used."""
+
+    search_attempts: list[tuple[tuple[str, ...], str]] = []
+
+    uid_range = f"{last_uid + 1}:*"
+
+    if IMAP_SENDER:
+        # Primary attempt: standard FROM + UID search
+        search_attempts.append((('FROM', f'"{IMAP_SENDER}"', 'UID', uid_range), 'FROM+UID'))
+
+        # Gmail specific optimisation – X-GM-RAW understands gmail style query syntax
+        search_attempts.append((("X-GM-RAW", f'from:{IMAP_SENDER} uid:{last_uid + 1}:*'), 'X-GM-RAW'))
+
+    # Fallback to any sender
+    search_attempts.append((('UID', uid_range), 'UID'))
+
+    for args, label in search_attempts:
+        try:
+            typ, data = M.uid('search', None, *args)
+        except Exception as exc:
+            if debug:
+                st.warning(f"IMAP search using {label} failed: {exc}")
+            continue
+
+        if typ != 'OK':
+            if debug:
+                st.warning(f"IMAP search using {label} returned {typ}")
+            continue
+
+        uids = _uid_list_from_search(data)
+        if uids:
+            return uids, label
+
+    return [], search_attempts[-1][1] if search_attempts else 'NONE'
+
+
 def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
 
-    M = imaplib.IMAP4_SSL(IMAP_HOST)
+    try:
+        M = imaplib.IMAP4_SSL(IMAP_HOST)
+    except Exception as exc:
+        st.error(f"Unable to open IMAP connection: {exc}")
+        return 0
     try:
         # --- login + select
         try:
@@ -2449,21 +2505,17 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
 
         # --- search new UIDs
         last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
-        if IMAP_SENDER:
-            typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', 'UID', f'{last_uid + 1}:*')
-            if typ != "OK" or not data or not data[0]:
-                if debug:
-                    st.warning(f'No matches for FROM filter "{IMAP_SENDER}". Falling back to unfiltered UID search.')
-                typ, data = M.uid('search', None, 'UID', f'{last_uid + 1}:*')
-        else:
-            typ, data = M.uid('search', None, 'UID', f'{last_uid + 1}:*')
+        uids, strategy = _search_new_uids(M, last_uid, debug=debug)
+        st.session_state["imap_last_search"] = {
+            "strategy": strategy,
+            "last_uid": last_uid,
+            "fetched": len(uids),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
-        if typ != "OK":
-            st.error("IMAP search failed")
-            return 0
-
-        uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
         if not uids:
+            if debug:
+                st.info("No new messages matched the IMAP search criteria.")
             return 0
 
         # --- process emails
@@ -2697,3 +2749,11 @@ if enable_poll:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
                 st.error(f"Auto-poll error: {e}")
+
+        last_search = st.session_state.get("imap_last_search")
+        if last_search:
+            st.caption(
+                "Last IMAP search: "
+                f"{last_search.get('fetched', 0)} message(s) via {last_search.get('strategy')} "
+                f"(cursor {last_search.get('last_uid')} at {last_search.get('timestamp')})."
+            )
