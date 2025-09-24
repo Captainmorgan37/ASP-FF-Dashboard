@@ -1981,7 +1981,7 @@ def _to_editor_datetime(ts):
     dt = dt.replace(second=0, microsecond=0)
     return dt.replace(tzinfo=None)
 
-def _from_editor_datetime(val):
+def _coerce_reference_datetime(val):
     if val is None:
         return None
     try:
@@ -2001,6 +2001,44 @@ def _from_editor_datetime(val):
             dt = dateparse.parse(s)
         except Exception:
             return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _from_editor_datetime(val, reference=None):
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    ref_dt = _coerce_reference_datetime(reference)
+    if isinstance(val, pd.Timestamp):
+        dt = val.to_pydatetime()
+    elif isinstance(val, datetime):
+        dt = val
+    elif isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        time_digits = re.fullmatch(r"(\d{1,2})(\d{2})", s)
+        if time_digits:
+            hour = int(time_digits.group(1))
+            minute = int(time_digits.group(2))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return None
+            base = ref_dt or datetime.now(timezone.utc)
+            dt = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        else:
+            default_base = ref_dt or datetime.now(timezone.utc)
+            try:
+                dt = dateparse.parse(s, default=default_base.replace(microsecond=0))
+            except Exception:
+                return None
     else:
         return None
     try:
@@ -2088,8 +2126,12 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
             ("ETA (FA)", "ArrivalForecast", "🟦 ARRIVING SOON", "ETA_UTC"),
             ("Landing (FA)", "Arrival", "🟣 ARRIVED", "ETA_UTC"),
         ]:
-            orig_val = _from_editor_datetime(orig_row.get(col))
-            new_val = _from_editor_datetime(row.get(col))
+            planned_raw = base_row.get(planned_col)
+            orig_val = _from_editor_datetime(orig_row.get(col), reference=planned_raw)
+            ref_candidate = _coerce_reference_datetime(orig_row.get(col))
+            if ref_candidate is None:
+                ref_candidate = _coerce_reference_datetime(planned_raw)
+            new_val = _from_editor_datetime(row.get(col), reference=ref_candidate)
 
             if _datetimes_equal(orig_val, new_val):
                 continue
@@ -2101,7 +2143,7 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
                 time_cleared += 1
                 continue
 
-            planned = base_row.get(planned_col)
+            planned = planned_raw
             delta_min = None
             if planned is not None and pd.notna(planned):
                 delta_min = int(round((pd.Timestamp(new_val) - planned).total_seconds() / 60.0))
