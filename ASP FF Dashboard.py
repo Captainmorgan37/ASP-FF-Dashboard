@@ -7,7 +7,6 @@ import imaplib, email
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -163,14 +162,9 @@ def set_last_uid(mailbox: str, uid: int):
 def load_tail_overrides() -> dict[str, str]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("SELECT booking, tail FROM tail_overrides").fetchall()
-    return {
-        str(booking): normalize_tail_registration(tail)
-        for booking, tail in rows
-        if tail
-    }
+    return {str(booking): tail for booking, tail in rows if tail}
 
 def upsert_tail_override(booking: str, tail: str):
-    cleaned_tail = normalize_tail_registration(tail)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT INTO tail_overrides (booking, tail, updated_at)
@@ -178,7 +172,7 @@ def upsert_tail_override(booking: str, tail: str):
             ON CONFLICT(booking) DO UPDATE SET
                 tail=excluded.tail,
                 updated_at=datetime('now')
-        """, (booking, cleaned_tail))
+        """, (booking, tail))
 
 def delete_tail_override(booking: str):
     with sqlite3.connect(DB_PATH) as conn:
@@ -341,29 +335,6 @@ def insert_gap_notice_rows(frame: pd.DataFrame, threshold: pd.Timedelta = NO_ACT
     combined["_GapRow"] = combined["_GapRow"].fillna(False)
     return combined
 
-TAIL_CANADIAN_RE = re.compile(r"^C-[A-Z0-9]{4}$")
-TAIL_CANADIAN_NODASH_RE = re.compile(r"^C[A-Z0-9]{4}$")
-
-
-def normalize_tail_registration(tail: str | None) -> str:
-    """Return a consistently formatted tail (upper-case, insert dash when needed)."""
-
-    if tail is None:
-        return ""
-
-    text = str(tail).strip().upper()
-    if not text or text == "NAN":
-        return ""
-
-    if TAIL_CANADIAN_RE.match(text):
-        return text
-
-    if TAIL_CANADIAN_NODASH_RE.match(text):
-        return f"C-{text[1:]}"
-
-    return text
-
-
 def is_real_tail(tail: str) -> bool:
     if not isinstance(tail, str) or not tail.strip():
         return False
@@ -371,29 +342,6 @@ def is_real_tail(tail: str) -> bool:
         if pat.search(tail):
             return False
     return True
-
-
-def render_flightaware_link(tail) -> str:
-    """Return a FlightAware URL for real tails, otherwise the raw tail text."""
-
-    try:
-        if tail is None or pd.isna(tail):
-            return ""
-    except (TypeError, ValueError):
-        if tail is None:
-            return ""
-
-    tail_text = normalize_tail_registration(tail)
-    if not tail_text:
-        return ""
-
-    if not is_real_tail(tail_text):
-        return tail_text
-
-    normalized = tail_text.replace("-", "")
-    tail_fragment = quote(tail_text)
-    return f"https://www.flightaware.com/live/flight/{normalized}#tail={tail_fragment}"
-
 
 def parse_utc_ddmmyyyy_hhmmz(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip().str.replace("Z", "z", regex=False).str.replace("z", "", regex=False)
@@ -1323,9 +1271,8 @@ def _parse_asp_map_text(txt: str) -> dict[str, str]:
         parts = [p for p in re.split(r"[,\t ]+", line.strip()) if p]
         if len(parts) < 2: 
             continue
-        tail_with_dash = normalize_tail_registration(parts[0])
-        asp = parts[1].upper()
-        if asp.startswith("ASP") and tail_with_dash:
+        tail_with_dash, asp = parts[0].upper(), parts[1].upper()
+        if asp.startswith("ASP"):
             callsign_to_tail[asp] = tail_with_dash  # keep the dash
     return callsign_to_tail
 
@@ -1333,12 +1280,7 @@ def _parse_asp_map_text(txt: str) -> dict[str, str]:
 # Prefer secrets if present
 _secrets_map = st.secrets.get("ASP_MAP", None)
 if isinstance(_secrets_map, dict) and _secrets_map:
-    ASP_MAP = {
-        str(k).upper(): normalize_tail_registration(v)
-        for k, v in _secrets_map.items()
-        if v is not None
-    }
-    ASP_MAP = {k: v for k, v in ASP_MAP.items() if v}
+    ASP_MAP = {k.upper(): v.upper() for k, v in _secrets_map.items()}
 else:
     with st.expander("Callsign ↔ Tail mapping (ASP → Tail)", expanded=False):
         map_text = st.text_area(
@@ -1359,7 +1301,7 @@ def tail_from_asp(text: str) -> list[str]:
     for asp in found:
         t = ASP_MAP.get(asp)
         if t:
-            tails.append(normalize_tail_registration(t))
+            tails.append(t)
     return sorted(set(tails))
 # ---------------------------------------------------------------------------
 
@@ -1438,11 +1380,11 @@ if missing:
 
 df = df_raw.copy()
 df["Booking"] = df["Booking"].fillna("").astype(str).str.strip()
-df["Aircraft"] = df["Aircraft"].fillna("").map(normalize_tail_registration)
+df["Aircraft"] = df["Aircraft"].fillna("").astype(str).str.strip()
 _tail_override_map = load_tail_overrides()
 if _tail_override_map:
     df["Aircraft"] = [
-        normalize_tail_registration(_tail_override_map.get(str(booking), tail) or tail)
+        _tail_override_map.get(str(booking), tail) or tail
         for booking, tail in zip(df["Booking"], df["Aircraft"])
     ]
 df["ETD_UTC"] = parse_utc_ddmmyyyy_hhmmz(df["Off-Block (Sched)"])
@@ -1487,7 +1429,7 @@ else:
 
 if _tail_override_map and not df.empty:
     df["Aircraft"] = [
-        normalize_tail_registration(_tail_override_map.get(leg_key, _tail_override_map.get(str(booking), tail)) or tail)
+        _tail_override_map.get(leg_key, _tail_override_map.get(str(booking), tail)) or tail
         for leg_key, booking, tail in zip(df["_LegKey"], df["Booking"], df["Aircraft"])
     ]
 
@@ -1870,9 +1812,6 @@ view_df["Takeoff (FA)"] = view_df.apply(_takeoff_display, axis=1)
 
 df_display = view_df[display_cols].copy()
 
-if "Aircraft" in df_display.columns:
-    df_display["Aircraft"] = df_display["Aircraft"].map(render_flightaware_link)
-
 # ----------------- Notify helpers used by buttons -----------------
 local_tz = tzlocal.get_localzone()
 
@@ -2225,12 +2164,10 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         orig_tail_raw = orig_row.get("Aircraft", "")
         orig_tail = "" if orig_tail_raw is None else str(orig_tail_raw).strip()
 
-        new_tail_norm = normalize_tail_registration(new_tail) if new_tail else ""
-        orig_tail_norm = normalize_tail_registration(orig_tail) if orig_tail else ""
-
-        if new_tail_norm != orig_tail_norm:
-            if new_tail_norm:
-                upsert_tail_override(str(key), new_tail_norm)
+        if new_tail != orig_tail:
+            if new_tail:
+                cleaned_tail = new_tail.upper()
+                upsert_tail_override(str(key), cleaned_tail)
                 tail_saved += 1
             else:
                 delete_tail_override(str(key))
@@ -2299,33 +2236,15 @@ if hasattr(styler, "hide_index"):
 else:
     styler = styler.hide(axis="index")
 
-aircraft_link_column = st.column_config.LinkColumn(
-    "Aircraft",
-    help="Open the FlightAware page for this tail in a new tab.",
-    display_text=r"tail=(.*)$",
-    validate=r"^https://www\\.flightaware\\.com/live/flight/[^#]+#tail=.*$",
-)
-aircraft_column_config = {}
-if "Aircraft" in df_display.columns:
-    aircraft_column_config["Aircraft"] = aircraft_link_column
-
 try:
     styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(
-        styler,
-        use_container_width=True,
-        column_config=aircraft_column_config or None,
-    )
+    st.dataframe(styler, use_container_width=True)
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
     for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-    st.dataframe(
-        tmp,
-        use_container_width=True,
-        column_config=aircraft_column_config or None,
-    )
+    st.dataframe(tmp, use_container_width=True)
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=True):
