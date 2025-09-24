@@ -1967,19 +1967,25 @@ fmt_map = {
 }
 
 # Helpers for inline editing (data_editor expects naive datetimes)
-def _to_editor_datetime(ts):
-    if ts is None or pd.isna(ts):
-        return None
+def _format_editor_datetime(ts):
+    """Return a pre-filled string for the inline editor (UTC, minute precision)."""
+    if ts is None:
+        return ""
+    try:
+        if pd.isna(ts):
+            return ""
+    except (TypeError, ValueError):
+        pass
     if isinstance(ts, pd.Timestamp):
         dt = ts.to_pydatetime()
     elif isinstance(ts, datetime):
         dt = ts
     else:
-        return None
+        return ""
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc)
     dt = dt.replace(second=0, microsecond=0)
-    return dt.replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 def _coerce_reference_datetime(val):
     if val is None:
@@ -2025,10 +2031,23 @@ def _from_editor_datetime(val, reference=None):
         s = val.strip()
         if not s:
             return None
-        time_digits = re.fullmatch(r"(\d{1,2})(\d{2})", s)
-        if time_digits:
-            hour = int(time_digits.group(1))
-            minute = int(time_digits.group(2))
+        hhmm_digits = None
+        if re.fullmatch(r"\d{1,4}", s):
+            digits = s
+            if len(digits) <= 2:
+                hour = int(digits)
+                minute = 0
+            else:
+                padded = digits.zfill(4)
+                hour = int(padded[:2])
+                minute = int(padded[2:])
+            hhmm_digits = (hour, minute)
+        else:
+            colon_time = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+            if colon_time:
+                hhmm_digits = (int(colon_time.group(1)), int(colon_time.group(2)))
+        if hhmm_digits is not None:
+            hour, minute = hhmm_digits
             if not (0 <= hour <= 23 and 0 <= minute <= 59):
                 return None
             base = ref_dt or datetime.now(timezone.utc)
@@ -2197,7 +2216,8 @@ except Exception:
 with st.expander("Inline manual updates (UTC)", expanded=True):
     st.caption(
         "Double-click a cell to adjust actual times or expected tail registrations. "
-        "Values are stored in SQLite and override email updates until a new message arrives."
+        "Values are stored in SQLite and override email updates until a new message arrives. "
+        "Enter times as HHMM (e.g., 2004), HH:MM, or 4pm — the scheduled day is used automatically."
     )
 
     gap_mask = view_df["_GapRow"] if "_GapRow" in view_df.columns else pd.Series(False, index=view_df.index)
@@ -2216,7 +2236,7 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
         inline_editor["_LegKey"] = inline_editor["_LegKey"].astype(str)
         inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
         for col in ["Takeoff (FA)", "ETA (FA)", "Landing (FA)"]:
-            inline_editor[col] = inline_editor[col].apply(_to_editor_datetime)
+            inline_editor[col] = inline_editor[col].apply(_format_editor_datetime)
 
         inline_original = inline_editor.copy(deep=True)
 
@@ -2239,23 +2259,32 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
                     help="Override the tail registration shown in the schedule.",
                     max_chars=16,
                 ),
-                "Takeoff (FA)": st.column_config.DatetimeColumn(
+                "Takeoff (FA)": st.column_config.TextColumn(
                     "Takeoff (FA)",
-                    help="FlightAware departure (UTC).",
-                    format="DD.MM.YYYY HH:mm",
-                    step=60,
+                    help=(
+                        "FlightAware departure (UTC). Enter HHMM (24h), HH:MM, or phrases like "
+                        "'4pm'. The scheduled day is used unless you specify a date."
+                    ),
+                    max_chars=32,
+                    placeholder="HHMM",
                 ),
-                "ETA (FA)": st.column_config.DatetimeColumn(
+                "ETA (FA)": st.column_config.TextColumn(
                     "ETA (FA)",
-                    help="FlightAware ETA (UTC).",
-                    format="DD.MM.YYYY HH:mm",
-                    step=60,
+                    help=(
+                        "FlightAware ETA (UTC). Enter HHMM (24h), HH:MM, or natural language times. "
+                        "Use words like 'tomorrow' if the arrival slips a day."
+                    ),
+                    max_chars=32,
+                    placeholder="HHMM",
                 ),
-                "Landing (FA)": st.column_config.DatetimeColumn(
+                "Landing (FA)": st.column_config.TextColumn(
                     "Landing (FA)",
-                    help="FlightAware arrival (UTC).",
-                    format="DD.MM.YYYY HH:mm",
-                    step=60,
+                    help=(
+                        "FlightAware arrival (UTC). Enter HHMM (24h), HH:MM, or phrases such as '830pm'. "
+                        "Leave blank to clear an override."
+                    ),
+                    max_chars=32,
+                    placeholder="HHMM",
                 ),
             },
         )
