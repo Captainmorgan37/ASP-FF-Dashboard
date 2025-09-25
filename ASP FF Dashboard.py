@@ -1843,6 +1843,34 @@ def _flightaware_anchor(tail_val) -> Markup | str:
         f'<a href="{url}" target="_blank" rel="noopener noreferrer">{tail_upper}</a>'
     )
 
+
+def _flightaware_plaintext(val) -> str:
+    """Fallback text for FlightAware anchors when HTML can't be rendered."""
+    if isinstance(val, Markup):
+        # strip tags but keep any escaped text (Markup.striptags returns str)
+        text = val.striptags()
+        return text if text else "—"
+
+    if val is None:
+        return "—"
+
+    try:
+        if pd.isna(val):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+
+    text = str(val).strip()
+    if not text:
+        return "—"
+
+    if "<" in text and ">" in text:
+        # last resort: drop any tags that made it this far
+        text = re.sub(r"<[^>]+>", "", text)
+
+    return text
+
+
 aircraft_series = view_df.get("Aircraft")
 if aircraft_series is None:
     aircraft_series = pd.Series(index=df_display.index, dtype=object)
@@ -2283,6 +2311,8 @@ try:
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
+    if "Aircraft" in tmp.columns:
+        tmp["Aircraft"] = tmp["Aircraft"].apply(_flightaware_plaintext)
     for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
     st.dataframe(tmp, use_container_width=True)
