@@ -1485,20 +1485,65 @@ def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
     has_arr  = "Arrival" in rec
     has_div  = "Diversion" in rec
 
+    def _clean_datetime(value):
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return None
+            return value.to_pydatetime()
+        if isinstance(value, datetime):
+            return value
+        return None
+
+    dep_sched = _clean_datetime(dep_utc)
+    eta_sched = _clean_datetime(eta_utc)
+
+    dep_actual_raw = rec.get("Departure", {}).get("actual_time_utc")
+    dep_actual = _clean_datetime(parse_iso_to_utc(dep_actual_raw)) if dep_actual_raw else None
+
+    eta_forecast_raw = rec.get("ArrivalForecast", {}).get("actual_time_utc")
+    eta_forecast = _clean_datetime(parse_iso_to_utc(eta_forecast_raw)) if eta_forecast_raw else None
+
+    arr_actual_raw = rec.get("Arrival", {}).get("actual_time_utc")
+    arr_actual = _clean_datetime(parse_iso_to_utc(arr_actual_raw)) if arr_actual_raw else None
+
+    def _within_threshold(actual, scheduled):
+        if actual is None or scheduled is None:
+            return False
+        return abs(actual - scheduled) <= thr
+
+    def _is_late(actual, scheduled):
+        if actual is None or scheduled is None:
+            return False
+        return (actual - scheduled) > thr
+
     if has_div:
         return rec["Diversion"].get("status", "🔷 DIVERTED")
+
     if has_arr:
-        return "🟣 ARRIVED"
+        if eta_sched and arr_actual:
+            if _is_late(arr_actual, eta_sched):
+                return "🔴 Arrived (Delay)"
+            if _within_threshold(arr_actual, eta_sched):
+                return "🟣 Arrived (On Sched)"
+        return "🟣 Arrived"
+
     if has_dep and not has_arr:
-        fore_eta = None
-        if "ArrivalForecast" in rec:
-            fore_eta = parse_iso_to_utc(rec["ArrivalForecast"].get("actual_time_utc"))
-        eta_for_status = fore_eta or eta_utc
-        if pd.notna(eta_for_status) and now > eta_for_status + thr:
-            return "🟠 LATE ARRIVAL"
-        return "🟢 DEPARTED"
-    if pd.notna(dep_utc):
-        return "🟡 SCHEDULED" if now <= dep_utc + thr else "🔴 DELAY"
+        if eta_sched and eta_forecast and _is_late(eta_forecast, eta_sched):
+            return "🟠 Delayed Arrival"
+        if eta_sched and eta_forecast and _within_threshold(eta_forecast, eta_sched):
+            if dep_sched and dep_actual:
+                if _is_late(dep_actual, dep_sched):
+                    return "🔴 Departed (Delay)"
+                if _within_threshold(dep_actual, dep_sched):
+                    return "🟢 Departed (On Sched)"
+        if dep_sched and dep_actual and _is_late(dep_actual, dep_sched):
+            return "🔴 Departed (Delay)"
+        return "🟢 Departed"
+
+    if dep_sched:
+        return "🟡 SCHEDULED" if now <= dep_sched + thr else "🔴 DELAY"
     return "🟡 SCHEDULED"
 
 df["Status"] = [
