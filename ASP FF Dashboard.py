@@ -2024,6 +2024,18 @@ def _style_ops(x: pd.DataFrame):
         styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
     )
 
+    if "Status" in x.columns:
+        delay_statuses = {
+            "🔴 Arrived (Delay)",
+            "🔴 Departed (Delay)",
+            "🟠 Delayed Arrival",
+            "🔴 DELAY",
+        }
+        mask_status = _base["Status"].isin(delay_statuses).reindex(x.index, fill_value=False)
+        styles.loc[mask_status, "Status"] = (
+            styles.loc[mask_status, "Status"].fillna("") + cell_css
+        )
+
     # 5) EDCT purple on Takeoff (FA) (applied last so it wins for that cell)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
     mask_edct = idx_edct.reindex(x.index, fill_value=False)
