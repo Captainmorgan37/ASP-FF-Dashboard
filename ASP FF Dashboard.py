@@ -13,6 +13,7 @@ import streamlit as st
 from dateutil import parser as dateparse
 from dateutil.tz import tzoffset
 from pathlib import Path
+from markupsafe import Markup
 import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 
@@ -1811,6 +1812,44 @@ def _takeoff_display(row):
 view_df["Takeoff (FA)"] = view_df.apply(_takeoff_display, axis=1)
 
 df_display = view_df[display_cols].copy()
+
+def _flightaware_anchor(tail_val) -> Markup | str:
+    """Return an HTML anchor for FlightAware when the tail looks real."""
+    if tail_val is None:
+        return "—"
+    try:
+        if pd.isna(tail_val):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+
+    tail_str = str(tail_val).strip()
+    if not tail_str:
+        return "—"
+
+    if tail_str.lower() in {"nan", "none", "null"}:
+        return "—"
+
+    tail_upper = tail_str.upper()
+    if not is_real_tail(tail_upper):
+        return tail_upper
+
+    tail_for_url = re.sub(r"[^A-Z0-9]", "", tail_upper)
+    if not tail_for_url:
+        return tail_upper
+
+    url = f"https://flightaware.com/live/flight/{tail_for_url}"
+    return Markup(
+        f'<a href="{url}" target="_blank" rel="noopener noreferrer">{tail_upper}</a>'
+    )
+
+aircraft_series = view_df.get("Aircraft")
+if aircraft_series is None:
+    aircraft_series = pd.Series(index=df_display.index, dtype=object)
+else:
+    aircraft_series = aircraft_series.reindex(df_display.index)
+
+df_display["Aircraft"] = [_flightaware_anchor(val) for val in aircraft_series]
 
 # ----------------- Notify helpers used by buttons -----------------
 local_tz = tzlocal.get_localzone()
