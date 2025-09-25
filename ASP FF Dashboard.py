@@ -36,7 +36,7 @@ ar1, ar2 = st.columns([1, 1])
 with ar1:
     auto_refresh = st.checkbox("Auto-refresh", value=True, help="Re-run the app so countdowns update.")
 with ar2:
-    refresh_sec = st.number_input("Refresh every (sec)", min_value=5, max_value=120, value=30, step=5)
+    refresh_sec = st.number_input("Refresh every (sec)", min_value=5, max_value=120, value=60, step=5)
 
 if auto_refresh:
     try:
@@ -1660,7 +1660,7 @@ with v1:
     highlight_landed_legs = st.checkbox("Highlight landed legs", value=True)
 with v2:
     auto_hide_landed = st.checkbox("Auto-hide landed", value=True)
-hide_hours = st.number_input("Hide landed after (hours)", min_value=1, max_value=24, value=2, step=1)
+hide_hours = st.number_input("Hide landed after (hours)", min_value=1, max_value=24, value=1, step=1)
 
 # Hide legs that landed more than N hours ago (if enabled)
 now_utc = datetime.now(timezone.utc)
@@ -1725,12 +1725,12 @@ with head_toggle_col:
     )
     show_sic_column = st.checkbox(
         "Show SIC column",
-        value=True,
+        value=False,
         help="Display the SIC value from the uploaded CSV in the schedule table.",
     )
     show_workflow_column = st.checkbox(
         "Show Workflow column",
-        value=True,
+        value=False,
         help="Display the Workflow value from the uploaded CSV in the schedule table.",
     )
 with head_title_col:
@@ -2247,7 +2247,7 @@ except Exception:
     st.dataframe(tmp, use_container_width=True)
 
 # ----------------- Inline editor for manual overrides -----------------
-with st.expander("Inline manual updates (UTC)", expanded=True):
+with st.expander("Inline manual updates (UTC)", expanded=False):
     st.caption(
         "Double-click a cell to adjust actual times or expected tail registrations. "
         "Values are stored in SQLite and override email updates until a new message arrives. "
