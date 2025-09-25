@@ -331,11 +331,7 @@ def insert_gap_notice_rows(frame: pd.DataFrame, threshold: pd.Timedelta = NO_ACT
 
         pieces.append(_build_gap_notice_row(frame, cur_end, next_start, gap_td))
 
-    non_empty_pieces = [piece for piece in pieces if not piece.empty]
-    if not non_empty_pieces:
-        return frame
-
-    combined = pd.concat(non_empty_pieces, ignore_index=True)
+    combined = pd.concat(pieces, ignore_index=True)
     combined["_GapRow"] = combined["_GapRow"].fillna(False)
     return combined
 
@@ -1789,14 +1785,10 @@ else:
 
 # Ensure gap flag remains boolean after any transforms
 if "_GapRow" in view_df.columns:
-    view_df["_GapRow"] = (
-        view_df["_GapRow"].fillna(False).infer_objects(copy=False).astype(bool)
-    )
+    view_df["_GapRow"] = view_df["_GapRow"].fillna(False).astype(bool)
 
 if "_RouteMismatch" in view_df.columns:
-    view_df["_RouteMismatch"] = (
-        view_df["_RouteMismatch"].fillna(False).infer_objects(copy=False).astype(bool)
-    )
+    view_df["_RouteMismatch"] = view_df["_RouteMismatch"].fillna(False).astype(bool)
 
 if "_RouteMismatchMsg" in view_df.columns:
     view_df["_RouteMismatchMsg"] = view_df["_RouteMismatchMsg"].fillna("")
@@ -2246,13 +2238,13 @@ else:
 
 try:
     styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(styler, width="stretch")
+    st.dataframe(styler, use_container_width=True)
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
     for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
         tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-    st.dataframe(tmp, width="stretch")
+    st.dataframe(tmp, use_container_width=True)
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=True):
@@ -2287,7 +2279,7 @@ with st.expander("Inline manual updates (UTC)", expanded=True):
             key="schedule_inline_editor",
             hide_index=True,
             num_rows="fixed",
-            width="stretch",
+            use_container_width=True,
             column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "ETA (FA)", "Landing (FA)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
@@ -2437,67 +2429,11 @@ IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., alerts@flightaware.com
 
 
 # 2) Define the polling function BEFORE the UI uses it
-def _uid_list_from_search(data) -> list[int]:
-    if not data:
-        return []
-    payload = data[0]
-    if not payload:
-        return []
-    if isinstance(payload, bytes):
-        parts = payload.split()
-    elif isinstance(payload, str):
-        parts = payload.encode().split()
-    else:
-        return []
-    return [int(p) for p in parts if p]
-
-
-def _search_new_uids(M, last_uid: int, debug: bool = False) -> tuple[list[int], str]:
-    """Return the list of UIDs greater than ``last_uid`` and a short note of the strategy used."""
-
-    search_attempts: list[tuple[tuple[str, ...], str]] = []
-
-    uid_range = f"{last_uid + 1}:*"
-
-    if IMAP_SENDER:
-        # Primary attempt: standard FROM + UID search
-        search_attempts.append((('FROM', f'"{IMAP_SENDER}"', 'UID', uid_range), 'FROM+UID'))
-
-        # Gmail specific optimisation – X-GM-RAW understands gmail style query syntax
-        search_attempts.append((("X-GM-RAW", f'from:{IMAP_SENDER} uid:{last_uid + 1}:*'), 'X-GM-RAW'))
-
-    # Fallback to any sender
-    search_attempts.append((('UID', uid_range), 'UID'))
-
-    for args, label in search_attempts:
-        try:
-            typ, data = M.uid('search', None, *args)
-        except Exception as exc:
-            if debug:
-                st.warning(f"IMAP search using {label} failed: {exc}")
-            continue
-
-        if typ != 'OK':
-            if debug:
-                st.warning(f"IMAP search using {label} returned {typ}")
-            continue
-
-        uids = _uid_list_from_search(data)
-        if uids:
-            return uids, label
-
-    return [], search_attempts[-1][1] if search_attempts else 'NONE'
-
-
 def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
 
-    try:
-        M = imaplib.IMAP4_SSL(IMAP_HOST)
-    except Exception as exc:
-        st.error(f"Unable to open IMAP connection: {exc}")
-        return 0
+    M = imaplib.IMAP4_SSL(IMAP_HOST)
     try:
         # --- login + select
         try:
@@ -2513,17 +2449,21 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
 
         # --- search new UIDs
         last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
-        uids, strategy = _search_new_uids(M, last_uid, debug=debug)
-        st.session_state["imap_last_search"] = {
-            "strategy": strategy,
-            "last_uid": last_uid,
-            "fetched": len(uids),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        if IMAP_SENDER:
+            typ, data = M.uid('search', None, 'FROM', f'"{IMAP_SENDER}"', f'UID {last_uid+1}:*')
+            if typ != "OK" or not data or not data[0]:
+                if debug:
+                    st.warning(f'No matches for FROM filter "{IMAP_SENDER}". Falling back to unfiltered UID search.')
+                typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
+        else:
+            typ, data = M.uid('search', None, f'UID {last_uid+1}:*')
 
+        if typ != "OK":
+            st.error("IMAP search failed")
+            return 0
+
+        uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
         if not uids:
-            if debug:
-                st.info("No new messages matched the IMAP search criteria.")
             return 0
 
         # --- process emails
@@ -2702,10 +2642,6 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                     st.warning(f"IMAP parse error on UID {uid}: {e}")
             finally:
                 # Always advance the cursor so we don't reprocess this email
-                try:
-                    M.uid('store', str(uid), '+FLAGS', '(\\Seen)')
-                except Exception:
-                    pass
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
 
         return applied
@@ -2757,11 +2693,3 @@ if enable_poll:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
                 st.error(f"Auto-poll error: {e}")
-
-        last_search = st.session_state.get("imap_last_search")
-        if last_search:
-            st.caption(
-                "Last IMAP search: "
-                f"{last_search.get('fetched', 0)} message(s) via {last_search.get('strategy')} "
-                f"(cursor {last_search.get('last_uid')} at {last_search.get('timestamp')})."
-            )
