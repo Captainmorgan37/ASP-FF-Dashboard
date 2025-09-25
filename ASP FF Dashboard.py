@@ -2277,7 +2277,9 @@ else:
 
 try:
     styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.markdown(styler.to_html(), unsafe_allow_html=True)
+    if "Aircraft" in df_display.columns:
+        styler = styler.format(escape=False, subset=["Aircraft"])
+    st.dataframe(styler, use_container_width=True)
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
