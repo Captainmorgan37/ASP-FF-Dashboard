@@ -2277,7 +2277,7 @@ else:
 
 try:
     styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(styler, use_container_width=True)
+    st.markdown(styler.to_html(), unsafe_allow_html=True)
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
