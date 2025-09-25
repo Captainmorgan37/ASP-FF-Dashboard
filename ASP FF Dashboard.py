@@ -1518,6 +1518,11 @@ def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
             return False
         return (actual - scheduled) > thr
 
+    def _is_early(actual, scheduled):
+        if actual is None or scheduled is None:
+            return False
+        return (scheduled - actual) > thr
+
     if has_div:
         return rec["Diversion"].get("status", "🔷 DIVERTED")
 
@@ -1525,6 +1530,8 @@ def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
         if eta_sched and arr_actual:
             if _is_late(arr_actual, eta_sched):
                 return "🔴 Arrived (Delay)"
+            if _is_early(arr_actual, eta_sched):
+                return "🟢 Arrived (Early)"
             if _within_threshold(arr_actual, eta_sched):
                 return "🟣 Arrived (On Sched)"
         return "🟣 Arrived"
@@ -1536,10 +1543,15 @@ def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
             if dep_sched and dep_actual:
                 if _is_late(dep_actual, dep_sched):
                     return "🔴 Departed (Delay)"
+                if _is_early(dep_actual, dep_sched):
+                    return "🟢 Departed (Early)"
                 if _within_threshold(dep_actual, dep_sched):
                     return "🟢 Departed (On Sched)"
-        if dep_sched and dep_actual and _is_late(dep_actual, dep_sched):
-            return "🔴 Departed (Delay)"
+        if dep_sched and dep_actual:
+            if _is_late(dep_actual, dep_sched):
+                return "🔴 Departed (Delay)"
+            if _is_early(dep_actual, dep_sched):
+                return "🟢 Departed (Early)"
         return "🟢 Departed"
 
     if dep_sched:
