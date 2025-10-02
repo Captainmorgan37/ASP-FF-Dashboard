@@ -73,6 +73,15 @@ def test_fetch_flights_builds_expected_request_parameters():
     assert call["verify"] == config.verify_ssl
 
 
+def test_build_headers_supports_custom_auth_header_name():
+    config = Fl3xxApiConfig(auth_header="Token abc123", auth_header_name="X-Auth-Token")
+
+    headers = config.build_headers()
+
+    assert headers["X-Auth-Token"] == "Token abc123"
+    assert "Authorization" not in headers or headers["Authorization"] != "Token abc123"
+
+
 def test_fetch_flights_accepts_payload_wrapped_in_items_list():
     payload = {"items": [{"bookingIdentifier": "ABC"}]}
     response = FakeResponse(payload)
