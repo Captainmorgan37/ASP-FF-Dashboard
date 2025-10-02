@@ -71,3 +71,41 @@ def test_build_config_accepts_mapping(monkeypatch):
 
     assert config.api_token == "token-123"
     assert config.auth_header == "Bearer abc"
+
+
+def test_build_config_allows_custom_auth_header_name(monkeypatch):
+    secrets_mapping = {
+        "fl3xx_api": {
+            "auth_header": "Token abc123",
+            "auth_header_name": "X-Auth-Token",
+        }
+    }
+
+    monkeypatch.setattr(st, "secrets", secrets_mapping, raising=False)
+
+    config = _build_fl3xx_config_from_secrets()
+
+    assert config.auth_header == "Token abc123"
+    assert config.auth_header_name == "X-Auth-Token"
+    headers = config.build_headers()
+    assert headers["X-Auth-Token"] == "Token abc123"
+    assert "Authorization" not in headers or headers["Authorization"] != "Token abc123"
+
+
+def test_build_config_uses_api_token_with_custom_header_name(monkeypatch):
+    secrets_mapping = {
+        "fl3xx_api": {
+            "api_token": "token-xyz",
+            "auth_header_name": "X-Auth-Token",
+        }
+    }
+
+    monkeypatch.setattr(st, "secrets", secrets_mapping, raising=False)
+
+    config = _build_fl3xx_config_from_secrets()
+
+    assert config.api_token == "token-xyz"
+    assert config.auth_header_name == "X-Auth-Token"
+    headers = config.build_headers()
+    assert headers["X-Auth-Token"] == "token-xyz"
+    assert "Authorization" not in headers or headers["Authorization"] != "Bearer token-xyz"
