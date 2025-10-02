@@ -142,6 +142,47 @@ def _build_flight_endpoint(base_url: str, flight_id: Any) -> str:
     return f"{base}/{flight_id}/crew"
 
 
+def _normalise_crew_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Return a list of crew member dictionaries from various payload layouts."""
+
+    if payload is None:
+        return []
+
+    def _coerce_members(obj: Any) -> Optional[List[Dict[str, Any]]]:
+        if obj is None:
+            return []
+        if isinstance(obj, MutableMapping):
+            return [value for value in obj.values() if isinstance(value, MutableMapping)]
+        if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes, bytearray)):
+            return [item for item in obj if isinstance(item, MutableMapping)]
+        return None
+
+    if isinstance(payload, MutableMapping):
+        for key in ("crewMembers", "items", "crew", "data", "results"):
+            if key in payload:
+                members = _coerce_members(payload[key])
+                if members is not None:
+                    return members
+
+        # Some endpoints may return a single crew member as a mapping.
+        if any(
+            key in payload
+            for key in ("role", "firstName", "lastName", "logName", "email", "trigram", "personnelNumber")
+        ):
+            return [payload]
+
+        if not payload:
+            return []
+
+        raise ValueError("Unsupported FL3XX crew payload structure")
+
+    members = _coerce_members(payload)
+    if members is not None:
+        return members
+
+    raise ValueError("Unsupported FL3XX crew payload structure")
+
+
 def fetch_flight_crew(
     config: Fl3xxApiConfig,
     flight_id: Any,
@@ -161,13 +202,7 @@ def fetch_flight_crew(
         )
         response.raise_for_status()
         payload = response.json()
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, MutableMapping) and "items" in payload:
-            items = payload["items"]
-            if isinstance(items, Iterable):
-                return [item for item in items if isinstance(item, MutableMapping)]
-        raise ValueError("Unsupported FL3XX crew payload structure")
+        return _normalise_crew_payload(payload)
     finally:
         if close_session:
             try:
