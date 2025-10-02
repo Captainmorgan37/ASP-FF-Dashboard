@@ -293,6 +293,18 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
     else:
         auth_header_name = "Authorization"
 
+    token_scheme_value = (
+        merged.get("api_token_scheme")
+        or merged.get("token_scheme")
+        or merged.get("token_type")
+        or st.secrets.get("FL3XX_API_TOKEN_SCHEME")
+        or os.getenv("FL3XX_API_TOKEN_SCHEME")
+    )
+    if token_scheme_value is None:
+        api_token_scheme = "Bearer"
+    else:
+        api_token_scheme = str(token_scheme_value)
+
     headers = merged.get("headers")
     extra_headers = dict(headers) if isinstance(headers, Mapping) else {}
 
@@ -318,6 +330,7 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         api_token=api_token,
         auth_header=auth_header,
         auth_header_name=auth_header_name,
+        api_token_scheme=api_token_scheme,
         extra_headers=extra_headers,
         verify_ssl=verify_ssl,
         timeout=timeout,
