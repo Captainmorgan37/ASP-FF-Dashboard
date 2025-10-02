@@ -5,6 +5,7 @@ import re
 import json
 import sqlite3
 import imaplib, email
+from collections.abc import Mapping
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -268,8 +269,8 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
     merged: dict[str, Any] = {}
     for key in ("fl3xx_api", "FL3XX_API", "FL3XX"):
         value = st.secrets.get(key)
-        if isinstance(value, dict):
-            merged.update(value)
+        if isinstance(value, Mapping):
+            merged.update(dict(value))
 
     base_url = str(merged.get("base_url") or DEFAULT_FL3XX_BASE_URL)
 
@@ -282,10 +283,12 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         auth_header = str(auth_header)
 
     headers = merged.get("headers")
-    extra_headers = dict(headers) if isinstance(headers, dict) else {}
+    extra_headers = dict(headers) if isinstance(headers, Mapping) else {}
 
     params = merged.get("params")
-    extra_params = {str(k): str(v) for k, v in params.items()} if isinstance(params, dict) else {}
+    extra_params = (
+        {str(k): str(v) for k, v in params.items()} if isinstance(params, Mapping) else {}
+    )
 
     verify_ssl_value = merged.get("verify_ssl", True)
     if isinstance(verify_ssl_value, str):
