@@ -4,3 +4,5 @@ streamlit-autorefresh
 python-dateutil
 tzlocal
 timezonefinder
+requests
+pytest
