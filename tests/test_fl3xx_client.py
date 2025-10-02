@@ -2,7 +2,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from fl3xx_client import Fl3xxApiConfig, compute_fetch_dates, fetch_flights
+from fl3xx_client import (
+    Fl3xxApiConfig,
+    compute_fetch_dates,
+    enrich_flights_with_crew,
+    fetch_flight_crew,
+    fetch_flights,
+)
 
 
 class FakeResponse:
@@ -19,8 +25,9 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, response):
+    def __init__(self, response=None, response_map=None):
         self.response = response
+        self.response_map = response_map or {}
         self.calls = []
 
     def get(self, url, params=None, headers=None, timeout=None, verify=None):
@@ -33,7 +40,16 @@ class FakeSession:
                 "verify": verify,
             }
         )
+        if self.response_map:
+            if url not in self.response_map:
+                raise AssertionError(f"Unexpected URL requested: {url}")
+            return self.response_map[url]
+        if self.response is None:
+            raise AssertionError("No response configured for FakeSession")
         return self.response
+
+    def close(self):  # pragma: no cover - compatibility shim
+        pass
 
 
 def test_compute_fetch_dates_uses_today_and_two_days_later():
@@ -125,3 +141,51 @@ def test_fetch_flights_raises_for_unexpected_payload_structure():
     config = Fl3xxApiConfig(api_token="token123")
     with pytest.raises(ValueError):
         fetch_flights(config, session=session)
+
+
+def test_fetch_flight_crew_uses_expected_endpoint():
+    crew_payload = [
+        {"role": "CMD", "firstName": "Stuart", "lastName": "Weaver"},
+    ]
+    expected_url = "https://app.fl3xx.us/api/external/flight/123/crew"
+    session = FakeSession(response_map={expected_url: FakeResponse(crew_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    crew = fetch_flight_crew(config, 123, session=session)
+
+    assert crew == crew_payload
+    assert len(session.calls) == 1
+    call = session.calls[0]
+    assert call["url"] == expected_url
+    assert call["headers"]["Authorization"] == "Bearer token123"
+
+
+def test_enrich_flights_with_crew_populates_names():
+    flights = [{"flightId": 123}]
+    crew_payload = [
+        {"role": "CMD", "firstName": "Stuart", "lastName": "Weaver"},
+        {"role": "FO", "firstName": "Jason", "lastName": "MacNeil"},
+    ]
+    expected_url = "https://app.fl3xx.us/api/external/flight/123/crew"
+    session = FakeSession(response_map={expected_url: FakeResponse(crew_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    summary = enrich_flights_with_crew(config, flights, force=True, session=session)
+
+    assert summary["fetched"] == 1
+    assert summary["updated"] is True
+    assert flights[0]["picName"] == "Stuart Weaver"
+    assert flights[0]["sicName"] == "Jason MacNeil"
+    assert flights[0]["crewMembers"] == crew_payload
+
+
+def test_enrich_flights_with_crew_skips_when_names_present_and_not_forced():
+    flights = [{"flightId": 123, "picName": "Existing PIC", "sicName": "Existing SIC"}]
+    session = FakeSession()
+    config = Fl3xxApiConfig(api_token="token123")
+
+    summary = enrich_flights_with_crew(config, flights, force=False, session=session)
+
+    assert summary["fetched"] == 0
+    assert summary["updated"] is False
+    assert len(session.calls) == 0

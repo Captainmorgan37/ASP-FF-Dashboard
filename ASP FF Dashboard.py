@@ -19,7 +19,13 @@ import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 
 from data_sources import ScheduleSource, load_schedule
-from fl3xx_client import DEFAULT_FL3XX_BASE_URL, Fl3xxApiConfig, fetch_flights
+from fl3xx_client import (
+    DEFAULT_FL3XX_BASE_URL,
+    Fl3xxApiConfig,
+    compute_flights_digest,
+    enrich_flights_with_crew,
+    fetch_flights,
+)
 
 # ============================
 # Page config
@@ -230,8 +236,8 @@ def save_fl3xx_cache(
             INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date)
             VALUES (1, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                payload=CASE WHEN fl3xx_cache.hash=excluded.hash THEN fl3xx_cache.payload ELSE excluded.payload END,
-                hash=CASE WHEN fl3xx_cache.hash=excluded.hash THEN fl3xx_cache.hash ELSE excluded.hash END,
+                payload=excluded.payload,
+                hash=excluded.hash,
                 fetched_at=excluded.fetched_at,
                 from_date=excluded.from_date,
                 to_date=excluded.to_date
@@ -363,10 +369,12 @@ def _get_fl3xx_schedule(
 
     if refresh_due:
         flights, metadata = fetch_flights(config, now=current_time)
-        changed = cache_entry is None or cache_entry.get("hash") != metadata["hash"]
+        crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        digest = compute_flights_digest(flights)
+        changed = cache_entry is None or cache_entry.get("hash") != digest
         save_fl3xx_cache(
             flights,
-            digest=metadata["hash"],
+            digest=digest,
             from_date=metadata["from_date"],
             to_date=metadata["to_date"],
             fetched_at=metadata["fetched_at"],
@@ -375,10 +383,14 @@ def _get_fl3xx_schedule(
         next_refresh = None if fetched_dt is None else fetched_dt + timedelta(minutes=FL3XX_REFRESH_MINUTES)
         metadata.update(
             {
+                "hash": digest,
                 "changed": changed,
                 "used_cache": False,
                 "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
                 "next_refresh_after": _to_iso8601_z(next_refresh),
+                "crew_fetch_count": crew_summary["fetched"],
+                "crew_fetch_errors": crew_summary["errors"],
+                "crew_updated": crew_summary["updated"],
             }
         )
         return flights, metadata
@@ -386,15 +398,18 @@ def _get_fl3xx_schedule(
     if not cache_entry:
         # Should not happen because refresh_due would be True, but keep defensive fallback.
         flights, metadata = fetch_flights(config, now=current_time)
+        crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        digest = compute_flights_digest(flights)
         save_fl3xx_cache(
             flights,
-            digest=metadata["hash"],
+            digest=digest,
             from_date=metadata["from_date"],
             to_date=metadata["to_date"],
             fetched_at=metadata["fetched_at"],
         )
         metadata.update(
             {
+                "hash": digest,
                 "changed": True,
                 "used_cache": False,
                 "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
@@ -403,9 +418,26 @@ def _get_fl3xx_schedule(
                     if metadata.get("fetched_at")
                     else None
                 ),
+                "crew_fetch_count": crew_summary["fetched"],
+                "crew_fetch_errors": crew_summary["errors"],
+                "crew_updated": crew_summary["updated"],
             }
         )
         return flights, metadata
+
+    flights = cache_entry.get("flights", [])
+    crew_summary = enrich_flights_with_crew(config, flights, force=False)
+    digest = compute_flights_digest(flights) if flights else cache_entry.get("hash") or ""
+
+    if crew_summary["updated"] and flights:
+        fetched_at = cache_entry.get("fetched_at") or _to_iso8601_z(last_fetch) or _to_iso8601_z(current_time)
+        save_fl3xx_cache(
+            flights,
+            digest=digest,
+            from_date=str(cache_entry.get("from_date") or ""),
+            to_date=str(cache_entry.get("to_date") or ""),
+            fetched_at=fetched_at or _to_iso8601_z(current_time),
+        )
 
     next_refresh = None
     if last_fetch is not None:
@@ -425,16 +457,19 @@ def _get_fl3xx_schedule(
         "time_zone": "UTC",
         "value": "ALL",
         "fetched_at": cache_entry.get("fetched_at"),
-        "hash": cache_entry.get("hash"),
+        "hash": digest,
         "changed": False,
         "used_cache": True,
         "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
         "next_refresh_after": _to_iso8601_z(next_refresh),
         "request_url": config.base_url,
         "request_params": cached_params,
+        "crew_fetch_count": crew_summary["fetched"],
+        "crew_fetch_errors": crew_summary["errors"],
+        "crew_updated": crew_summary["updated"],
     }
 
-    return cache_entry.get("flights", []), metadata
+    return flights, metadata
 
 
 TZINFOS = {
@@ -1713,6 +1748,9 @@ elif selected_source == "fl3xx_api":
                     "value": "ALL",
                     **config.extra_params,
                 },
+                "crew_fetch_count": 0,
+                "crew_fetch_errors": [],
+                "crew_updated": False,
             }
             flights = cache_entry.get("flights", [])
             schedule_metadata = fallback_metadata

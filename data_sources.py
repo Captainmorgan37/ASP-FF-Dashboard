@@ -111,6 +111,22 @@ def _normalize_flights_for_schedule(flights: Iterable[Dict[str, Any]]) -> pd.Dat
         off_block = _format_utc_timestamp(flight.get("blockOffEstUTC"))
         on_block = _format_utc_timestamp(flight.get("blockOnEstUTC"))
 
+        pic_value = flight.get("picName") or flight.get("PIC") or flight.get("pic") or ""
+        if isinstance(pic_value, str):
+            pic = pic_value.strip()
+        elif pic_value:
+            pic = str(pic_value).strip()
+        else:
+            pic = ""
+
+        sic_value = flight.get("sicName") or flight.get("SIC") or flight.get("sic") or ""
+        if isinstance(sic_value, str):
+            sic = sic_value.strip()
+        elif sic_value:
+            sic = str(sic_value).strip()
+        else:
+            sic = ""
+
         rows.append(
             {
                 "Booking": str(booking or "").strip(),
@@ -119,8 +135,8 @@ def _normalize_flights_for_schedule(flights: Iterable[Dict[str, Any]]) -> pd.Dat
                 "From (ICAO)": (flight.get("airportFrom") or "").strip() if isinstance(flight.get("airportFrom"), str) else str(flight.get("airportFrom") or ""),
                 "To (ICAO)": (flight.get("airportTo") or "").strip() if isinstance(flight.get("airportTo"), str) else str(flight.get("airportTo") or ""),
                 "Flight time (Est)": _compute_flight_time(flight.get("blockOffEstUTC"), flight.get("blockOnEstUTC")),
-                "PIC": "",
-                "SIC": "",
+                "PIC": pic,
+                "SIC": sic,
                 "Account": str(account or "").strip(),
                 "Aircraft": str(aircraft or "").strip(),
                 "Aircraft Type": str(aircraft_type or "").strip(),
