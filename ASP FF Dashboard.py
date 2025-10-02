@@ -1702,27 +1702,55 @@ elif selected_source == "fl3xx_api":
         st.stop()
 
     cache_entry = load_fl3xx_cache()
+
+    def _render_fl3xx_status(metadata: dict) -> None:
+        status_bits = [
+            "FL3XX flights fetched at",
+            (metadata.get("fetched_at") or "unknown time"),
+            "UTC.",
+        ]
+        if metadata.get("used_cache"):
+            status_bits.append("Using cached schedule data.")
+        else:
+            status_bits.append("Latest API response loaded.")
+        if metadata.get("changed"):
+            status_bits.append("Changes detected since previous fetch.")
+        else:
+            status_bits.append("No schedule changes detected.")
+        next_refresh = metadata.get("next_refresh_after")
+        if next_refresh:
+            status_bits.append(f"Next refresh after {next_refresh}.")
+
+        crew_fetch_count = metadata.get("crew_fetch_count")
+        if crew_fetch_count is not None:
+            status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
+
+        crew_updated = metadata.get("crew_updated")
+        if crew_updated is True:
+            status_bits.append("Crew roster updated.")
+        elif crew_updated is False:
+            status_bits.append("Crew roster unchanged.")
+
+        crew_errors = metadata.get("crew_fetch_errors")
+        if crew_errors:
+            status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
+        elif crew_errors is not None:
+            status_bits.append("No crew fetch errors.")
+
+        st.caption(" ".join(status_bits))
+
+        if crew_errors:
+            st.warning(
+                "One or more crew fetch errors occurred while refreshing crew data."
+            )
+            with st.expander("Crew fetch error details", expanded=False):
+                for error in crew_errors:
+                    st.write(error)
     try:
         flights, api_metadata = _get_fl3xx_schedule(config=config)
         schedule_metadata = api_metadata
         schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
-        status_bits = [
-            "FL3XX flights fetched at",
-            (api_metadata.get("fetched_at") or "unknown time"),
-            "UTC.",
-        ]
-        if api_metadata.get("used_cache"):
-            status_bits.append("Using cached schedule data.")
-        else:
-            status_bits.append("Latest API response loaded.")
-        if api_metadata.get("changed"):
-            status_bits.append("Changes detected since previous fetch.")
-        else:
-            status_bits.append("No schedule changes detected.")
-        next_refresh = api_metadata.get("next_refresh_after")
-        if next_refresh:
-            status_bits.append(f"Next refresh after {next_refresh}.")
-        st.caption(" ".join(status_bits))
+        _render_fl3xx_status(api_metadata)
     except Exception as exc:
         if cache_entry:
             st.warning(
@@ -1755,6 +1783,7 @@ elif selected_source == "fl3xx_api":
             flights = cache_entry.get("flights", [])
             schedule_metadata = fallback_metadata
             schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
+            _render_fl3xx_status(fallback_metadata)
         else:
             st.error(f"Unable to load FL3XX flights: {exc}")
             st.stop()
