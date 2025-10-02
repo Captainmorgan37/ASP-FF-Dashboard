@@ -1295,7 +1295,12 @@ def normalize_iata(code: str) -> str:
 
 def derive_iata_from_icao(icao: str) -> str:
     c = (icao or "").strip().upper()
-    if len(c) == 4 and c[0] in ("C", "K"):
+    if len(c) != 4:
+        return ""
+    mapped = ICAO_TO_IATA_MAP.get(c)
+    if mapped:
+        return mapped
+    if c[0] in ("C", "K"):
         return c[1:]
     return ""
 
@@ -1323,6 +1328,9 @@ def _airport_token_variants(code: str) -> set[str]:
             tokens.add(derived)
     elif len(c) == 3:
         tokens.add(c)
+        mapped_icao = IATA_TO_ICAO_MAP.get(c)
+        if mapped_icao:
+            tokens.add(mapped_icao)
     return tokens
 
 
@@ -1406,6 +1414,12 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
             if derived_mask.any():
                 return cdf[derived_mask]
 
+            mapped_icao = IATA_TO_ICAO_MAP.get(tok_iata)
+            if mapped_icao:
+                mapped_mask = icao_series == mapped_icao
+                if mapped_mask.any():
+                    return cdf[mapped_mask]
+
             iata_mask = iata_series == tok_iata
             if iata_mask.any():
                 return cdf[iata_mask]
@@ -1414,6 +1428,12 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
             icao_mask = icao_series == tok_icao
             if icao_mask.any():
                 return cdf[icao_mask]
+
+            mapped_iata = ICAO_TO_IATA_MAP.get(tok_icao)
+            if mapped_iata:
+                mapped_mask = iata_series == mapped_iata
+                if mapped_mask.any():
+                    return cdf[mapped_mask]
 
         return cdf.iloc[0:0]
     
@@ -2337,38 +2357,72 @@ DEFAULT_ICAO_TZ_MAP = {
 }
 
 
-def load_icao_timezone_map() -> dict[str, str]:
-    """Return a mapping of ICAO -> Olson timezone string."""
+ICAO_TO_IATA_MAP: dict[str, str] = {}
+IATA_TO_ICAO_MAP: dict[str, str] = {}
 
-    mapping: dict[str, str] = DEFAULT_ICAO_TZ_MAP.copy()
+
+def load_airport_metadata() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Return timezone and ICAO/IATA lookup dictionaries from the airport CSV."""
+
+    timezone_map: dict[str, str] = DEFAULT_ICAO_TZ_MAP.copy()
+    icao_to_iata: dict[str, str] = {}
+    iata_to_icao: dict[str, str] = {}
+
     csv_path = Path(__file__).with_name("Airport TZ")
     if not csv_path.exists():
-        return mapping
+        return timezone_map, icao_to_iata, iata_to_icao
 
     try:
-        df = pd.read_csv(csv_path, usecols=["icao", "tz"])
+        df = pd.read_csv(csv_path)
     except Exception as exc:  # pragma: no cover - informative fallback only
-        print(f"Unable to load airport timezone data from {csv_path}: {exc}")
-        return mapping
+        print(f"Unable to load airport metadata from {csv_path}: {exc}")
+        return timezone_map, icao_to_iata, iata_to_icao
 
     if df.empty:
-        return mapping
+        return timezone_map, icao_to_iata, iata_to_icao
 
-    valid_timezones = set(pytz.all_timezones)
-    df = df.dropna(subset=["icao", "tz"])
-    df["icao"] = df["icao"].astype(str).str.strip().str.upper()
-    df["tz"] = df["tz"].astype(str).str.strip()
-    df = df[df["icao"].str.len() == 4]
-    df = df[df["tz"].isin(valid_timezones)]
+    col_map = {col.lower(): col for col in df.columns}
+    icao_col = col_map.get("icao")
+    tz_col = col_map.get("tz")
+    iata_col = col_map.get("iata")
 
+    if not icao_col:
+        return timezone_map, icao_to_iata, iata_to_icao
+
+    df = df.dropna(subset=[icao_col])
     if df.empty:
-        return mapping
+        return timezone_map, icao_to_iata, iata_to_icao
 
-    mapping.update(df.drop_duplicates(subset="icao", keep="first").set_index("icao")["tz"].to_dict())
-    return mapping
+    df[icao_col] = df[icao_col].astype(str).str.strip().str.upper()
+    df = df[df[icao_col].str.len() == 4]
+
+    if tz_col:
+        valid_timezones = set(pytz.all_timezones)
+        tz_series = df[tz_col].astype(str).str.strip()
+        df[tz_col] = tz_series
+        tz_mask = tz_series.isin(valid_timezones)
+        if tz_mask.any():
+            timezone_map.update(
+                df.loc[tz_mask, [icao_col, tz_col]]
+                .drop_duplicates(subset=icao_col, keep="first")
+                .set_index(icao_col)[tz_col]
+                .to_dict()
+            )
+
+    if iata_col:
+        df[iata_col] = df[iata_col].astype(str).str.strip().str.upper()
+        valid_iata = df[iata_col].str.len() == 3
+        if valid_iata.any():
+            dedup = df.loc[valid_iata, [icao_col, iata_col]].drop_duplicates(subset=icao_col, keep="first")
+            for icao, iata in dedup[[icao_col, iata_col]].itertuples(index=False, name=None):
+                if icao and iata:
+                    icao_to_iata.setdefault(icao, iata)
+                    iata_to_icao.setdefault(iata, icao)
+
+    return timezone_map, icao_to_iata, iata_to_icao
 
 
-ICAO_TZ_MAP = load_icao_timezone_map()
+ICAO_TZ_MAP, ICAO_TO_IATA_MAP, IATA_TO_ICAO_MAP = load_airport_metadata()
 
 
 def get_local_eta_str(row) -> str:
