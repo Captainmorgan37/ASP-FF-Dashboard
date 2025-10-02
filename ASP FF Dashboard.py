@@ -1,11 +1,13 @@
 # daily_ops_dashboard.py  — FF Dashboard with inline Notify + local ETA conversion
 
+import os
 import re
 import json
 import sqlite3
 import imaplib, email
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -16,6 +18,7 @@ import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 
 from data_sources import ScheduleSource, load_schedule
+from fl3xx_client import DEFAULT_FL3XX_BASE_URL, Fl3xxApiConfig, fetch_flights
 
 # ============================
 # Page config
@@ -86,6 +89,16 @@ def init_db():
             booking TEXT PRIMARY KEY,
             tail TEXT,
             updated_at TEXT NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS fl3xx_cache (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            payload TEXT,
+            hash TEXT,
+            fetched_at TEXT,
+            from_date TEXT,
+            to_date TEXT
         )
         """)
 
@@ -179,11 +192,219 @@ def delete_tail_override(booking: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
+
+def load_fl3xx_cache():
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT payload, hash, fetched_at, from_date, to_date FROM fl3xx_cache WHERE id=1"
+        ).fetchone()
+    if not row:
+        return None
+    payload_json, digest, fetched_at, from_date, to_date = row
+    try:
+        flights = json.loads(payload_json) if payload_json else []
+    except json.JSONDecodeError:
+        flights = []
+    return {
+        "flights": flights,
+        "hash": digest or "",
+        "fetched_at": fetched_at,
+        "from_date": from_date,
+        "to_date": to_date,
+    }
+
+
+def save_fl3xx_cache(
+    flights: list[dict[str, object]],
+    *,
+    digest: str,
+    from_date: str,
+    to_date: str,
+    fetched_at: str,
+):
+    payload_json = json.dumps(flights, ensure_ascii=False)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date)
+            VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                payload=CASE WHEN fl3xx_cache.hash=excluded.hash THEN fl3xx_cache.payload ELSE excluded.payload END,
+                hash=CASE WHEN fl3xx_cache.hash=excluded.hash THEN fl3xx_cache.hash ELSE excluded.hash END,
+                fetched_at=excluded.fetched_at,
+                from_date=excluded.from_date,
+                to_date=excluded.to_date
+            """,
+            (payload_json, digest, fetched_at, from_date, to_date),
+        )
+
+
 init_db()
 
 # ============================
 # Helpers
 # ============================
+FL3XX_REFRESH_MINUTES = 10
+
+
+def _parse_iso8601(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _to_iso8601_z(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
+    merged: dict[str, Any] = {}
+    for key in ("fl3xx_api", "FL3XX_API", "FL3XX"):
+        value = st.secrets.get(key)
+        if isinstance(value, dict):
+            merged.update(value)
+
+    base_url = str(merged.get("base_url") or DEFAULT_FL3XX_BASE_URL)
+
+    api_token = merged.get("api_token") or st.secrets.get("FL3XX_API_TOKEN") or os.getenv("FL3XX_API_TOKEN")
+    if api_token is not None:
+        api_token = str(api_token)
+
+    auth_header = merged.get("auth_header") or merged.get("authorization")
+    if auth_header is not None:
+        auth_header = str(auth_header)
+
+    headers = merged.get("headers")
+    extra_headers = dict(headers) if isinstance(headers, dict) else {}
+
+    params = merged.get("params")
+    extra_params = {str(k): str(v) for k, v in params.items()} if isinstance(params, dict) else {}
+
+    verify_ssl_value = merged.get("verify_ssl", True)
+    if isinstance(verify_ssl_value, str):
+        verify_ssl = verify_ssl_value.strip().lower() not in {"0", "false", "no"}
+    else:
+        verify_ssl = bool(verify_ssl_value)
+
+    timeout_value = merged.get("timeout", 30)
+    try:
+        timeout = int(timeout_value)
+    except (TypeError, ValueError):
+        timeout = 30
+
+    return Fl3xxApiConfig(
+        base_url=base_url,
+        api_token=api_token,
+        auth_header=auth_header,
+        extra_headers=extra_headers,
+        verify_ssl=verify_ssl,
+        timeout=timeout,
+        extra_params=extra_params,
+    )
+
+
+def _get_fl3xx_schedule(
+    config: Fl3xxApiConfig | None = None,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if config is None:
+        config = _build_fl3xx_config_from_secrets()
+    if not config.auth_header and not config.api_token:
+        raise RuntimeError(
+            "FL3XX API credentials are not configured. Set 'api_token' or 'authorization' "
+            "in Streamlit secrets (fl3xx_api) or the FL3XX_API_TOKEN environment variable."
+        )
+
+    current_time = now or datetime.now(timezone.utc)
+    cache_entry = load_fl3xx_cache()
+    last_fetch = _parse_iso8601(cache_entry.get("fetched_at")) if cache_entry else None
+    refresh_due = cache_entry is None or last_fetch is None or (
+        current_time - last_fetch >= timedelta(minutes=FL3XX_REFRESH_MINUTES)
+    )
+
+    if refresh_due:
+        flights, metadata = fetch_flights(config, now=current_time)
+        changed = cache_entry is None or cache_entry.get("hash") != metadata["hash"]
+        save_fl3xx_cache(
+            flights,
+            digest=metadata["hash"],
+            from_date=metadata["from_date"],
+            to_date=metadata["to_date"],
+            fetched_at=metadata["fetched_at"],
+        )
+        fetched_dt = _parse_iso8601(metadata.get("fetched_at"))
+        next_refresh = None if fetched_dt is None else fetched_dt + timedelta(minutes=FL3XX_REFRESH_MINUTES)
+        metadata.update(
+            {
+                "changed": changed,
+                "used_cache": False,
+                "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "next_refresh_after": _to_iso8601_z(next_refresh),
+            }
+        )
+        return flights, metadata
+
+    if not cache_entry:
+        # Should not happen because refresh_due would be True, but keep defensive fallback.
+        flights, metadata = fetch_flights(config, now=current_time)
+        save_fl3xx_cache(
+            flights,
+            digest=metadata["hash"],
+            from_date=metadata["from_date"],
+            to_date=metadata["to_date"],
+            fetched_at=metadata["fetched_at"],
+        )
+        metadata.update(
+            {
+                "changed": True,
+                "used_cache": False,
+                "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "next_refresh_after": _to_iso8601_z(
+                    _parse_iso8601(metadata.get("fetched_at")) + timedelta(minutes=FL3XX_REFRESH_MINUTES)
+                    if metadata.get("fetched_at")
+                    else None
+                ),
+            }
+        )
+        return flights, metadata
+
+    next_refresh = None
+    if last_fetch is not None:
+        next_refresh = last_fetch + timedelta(minutes=FL3XX_REFRESH_MINUTES)
+
+    cached_params = {
+        "from": cache_entry.get("from_date"),
+        "to": cache_entry.get("to_date"),
+        "timeZone": "UTC",
+        "value": "ALL",
+    }
+    cached_params.update(config.extra_params)
+
+    metadata = {
+        "from_date": cache_entry.get("from_date"),
+        "to_date": cache_entry.get("to_date"),
+        "time_zone": "UTC",
+        "value": "ALL",
+        "fetched_at": cache_entry.get("fetched_at"),
+        "hash": cache_entry.get("hash"),
+        "changed": False,
+        "used_cache": True,
+        "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+        "next_refresh_after": _to_iso8601_z(next_refresh),
+        "request_url": config.base_url,
+        "request_params": cached_params,
+    }
+
+    return cache_entry.get("flights", []), metadata
+
+
 TZINFOS = {
     "UTC":  tzoffset("UTC", 0),
     "GMT":  tzoffset("GMT", 0),
@@ -1311,8 +1532,8 @@ def tail_from_asp(text: str) -> list[str]:
 # Schedule data source selection
 # ============================
 DATA_SOURCE_OPTIONS = {
-    "csv_upload": "Upload CSV (current)",
-    "fl3xx_api": "FL3XX API (preview)",
+    "csv_upload": "Upload CSV",
+    "fl3xx_api": "FL3XX API (automatic)",
 }
 
 with st.sidebar:
@@ -1330,14 +1551,6 @@ with st.sidebar:
         key="schedule_source_choice",
     )
 
-uploaded = None
-if selected_source == "csv_upload":
-    uploaded = st.file_uploader(
-        "Upload your daily flights CSV (FL3XX export)",
-        type=["csv"],
-        key="flights_csv",
-    )
-
 btn_cols = st.columns([1, 3, 1])
 with btn_cols[0]:
     if st.button("Reset data & clear cache"):
@@ -1348,62 +1561,140 @@ with btn_cols[0]:
             conn.execute("DELETE FROM csv_store")
             conn.execute("DELETE FROM email_cursor")
             conn.execute("DELETE FROM tail_overrides")
+            conn.execute("DELETE FROM fl3xx_cache")
         st.rerun()
 
-if selected_source == "fl3xx_api":
-    st.info(
-        "FL3XX API loading is being scaffolded. "
-        "Once credentials are configured, the dashboard will fetch the schedule directly."
-    )
-    st.stop()
+schedule_payload = None
+schedule_metadata: dict[str, Any] = {}
 
-# Priority order: upload → session → DB
-csv_bytes: bytes | None = None
-csv_name: str | None = None
-csv_uploaded_at: str | None = None
-if uploaded is not None:
-    csv_bytes = uploaded.getvalue()
-    csv_name = uploaded.name
-    csv_uploaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    st.session_state["csv_bytes"] = csv_bytes
-    st.session_state["csv_name"] = csv_name
-    st.session_state["csv_uploaded_at"] = csv_uploaded_at
-    save_csv_to_db(csv_name, csv_bytes)
-elif "csv_bytes" in st.session_state:
-    csv_bytes = st.session_state["csv_bytes"]
-    csv_name = st.session_state.get("csv_name", "flights.csv")
-    csv_uploaded_at = st.session_state.get("csv_uploaded_at", "")
-    st.caption(
-        f"Using cached CSV: **{csv_name}** (uploaded {csv_uploaded_at})"
+if selected_source == "csv_upload":
+    uploaded = st.file_uploader(
+        "Upload your daily flights CSV (FL3XX export)",
+        type=["csv"],
+        key="flights_csv",
     )
-else:
-    name, content, uploaded_at = load_csv_from_db()
-    if content is not None:
-        csv_bytes = content
-        csv_name = name or "flights.csv"
-        csv_uploaded_at = uploaded_at or ""
+
+    # Priority order: upload → session → DB
+    csv_bytes: bytes | None = None
+    csv_name: str | None = None
+    csv_uploaded_at: str | None = None
+    if uploaded is not None:
+        csv_bytes = uploaded.getvalue()
+        csv_name = uploaded.name
+        csv_uploaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
         st.session_state["csv_bytes"] = csv_bytes
         st.session_state["csv_name"] = csv_name
         st.session_state["csv_uploaded_at"] = csv_uploaded_at
+        save_csv_to_db(csv_name, csv_bytes)
+    elif "csv_bytes" in st.session_state:
+        csv_bytes = st.session_state["csv_bytes"]
+        csv_name = st.session_state.get("csv_name", "flights.csv")
+        csv_uploaded_at = st.session_state.get("csv_uploaded_at", "")
         st.caption(
-            f"Loaded CSV from storage: **{csv_name}** (uploaded {csv_uploaded_at})"
+            f"Using cached CSV: **{csv_name}** (uploaded {csv_uploaded_at})"
         )
     else:
-        st.info("Upload today’s FL3XX flights CSV to begin.")
+        name, content, uploaded_at = load_csv_from_db()
+        if content is not None:
+            csv_bytes = content
+            csv_name = name or "flights.csv"
+            csv_uploaded_at = uploaded_at or ""
+            st.session_state["csv_bytes"] = csv_bytes
+            st.session_state["csv_name"] = csv_name
+            st.session_state["csv_uploaded_at"] = csv_uploaded_at
+            st.caption(
+                f"Loaded CSV from storage: **{csv_name}** (uploaded {csv_uploaded_at})"
+            )
+        else:
+            st.info("Upload today’s FL3XX flights CSV to begin.")
+            st.stop()
+
+    if csv_bytes is None:
+        st.error("CSV data unavailable. Upload a file to continue.")
         st.stop()
 
-if csv_bytes is None:
-    st.error("CSV data unavailable. Upload a file to continue.")
-    st.stop()
-
-schedule_payload = load_schedule(
-    selected_source,
-    csv_bytes=csv_bytes,
-    metadata={
+    schedule_metadata = {
         "filename": csv_name,
         "uploaded_at": csv_uploaded_at,
-    },
-)
+    }
+    schedule_payload = load_schedule(
+        "csv_upload",
+        csv_bytes=csv_bytes,
+        metadata=schedule_metadata,
+    )
+
+elif selected_source == "fl3xx_api":
+    config = _build_fl3xx_config_from_secrets()
+    if not config.auth_header and not config.api_token:
+        st.error(
+            "Configure the FL3XX API credentials in Streamlit secrets (key 'fl3xx_api') "
+            "or via the FL3XX_API_TOKEN environment variable."
+        )
+        st.stop()
+
+    cache_entry = load_fl3xx_cache()
+    try:
+        flights, api_metadata = _get_fl3xx_schedule(config=config)
+        schedule_metadata = api_metadata
+        schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
+        status_bits = [
+            "FL3XX flights fetched at",
+            (api_metadata.get("fetched_at") or "unknown time"),
+            "UTC.",
+        ]
+        if api_metadata.get("used_cache"):
+            status_bits.append("Using cached schedule data.")
+        else:
+            status_bits.append("Latest API response loaded.")
+        if api_metadata.get("changed"):
+            status_bits.append("Changes detected since previous fetch.")
+        else:
+            status_bits.append("No schedule changes detected.")
+        next_refresh = api_metadata.get("next_refresh_after")
+        if next_refresh:
+            status_bits.append(f"Next refresh after {next_refresh}.")
+        st.caption(" ".join(status_bits))
+    except Exception as exc:
+        if cache_entry:
+            st.warning(
+                "Unable to refresh FL3XX flights. Using cached data fetched at "
+                f"{cache_entry.get('fetched_at') or 'unknown time'} UTC.\n{exc}"
+            )
+            fallback_metadata = {
+                "from_date": cache_entry.get("from_date"),
+                "to_date": cache_entry.get("to_date"),
+                "time_zone": "UTC",
+                "value": "ALL",
+                "fetched_at": cache_entry.get("fetched_at"),
+                "hash": cache_entry.get("hash"),
+                "used_cache": True,
+                "changed": False,
+                "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "next_refresh_after": None,
+                "request_url": config.base_url,
+                "request_params": {
+                    "from": cache_entry.get("from_date"),
+                    "to": cache_entry.get("to_date"),
+                    "timeZone": "UTC",
+                    "value": "ALL",
+                    **config.extra_params,
+                },
+            }
+            flights = cache_entry.get("flights", [])
+            schedule_metadata = fallback_metadata
+            schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
+        else:
+            st.error(f"Unable to load FL3XX flights: {exc}")
+            st.stop()
+
+else:
+    st.error(f"Unsupported schedule source: {selected_source}")
+    st.stop()
+
+if schedule_payload is None:
+    st.error("Schedule data unavailable.")
+    st.stop()
+
 df_raw = schedule_payload.frame
 
 # Harmonize legacy column names before validation so older CSV exports remain compatible
