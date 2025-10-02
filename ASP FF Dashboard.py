@@ -5,7 +5,6 @@ import json
 import sqlite3
 import imaplib, email
 from email.utils import parsedate_to_datetime
-from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -15,6 +14,8 @@ from dateutil.tz import tzoffset
 from pathlib import Path
 import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
+
+from data_sources import ScheduleSource, load_schedule
 
 # ============================
 # Page config
@@ -1307,12 +1308,35 @@ def tail_from_asp(text: str) -> list[str]:
 
 
 # ============================
-# File upload with persistence
+# Schedule data source selection
 # ============================
-uploaded = st.file_uploader("Upload your daily flights CSV (FL3XX export)", type=["csv"], key="flights_csv")
+DATA_SOURCE_OPTIONS = {
+    "csv_upload": "Upload CSV (current)",
+    "fl3xx_api": "FL3XX API (preview)",
+}
 
-def _load_csv_from_bytes(b: bytes) -> pd.DataFrame:
-    return pd.read_csv(BytesIO(b))
+with st.sidebar:
+    st.subheader("Schedule data source")
+    option_keys = list(DATA_SOURCE_OPTIONS.keys())
+    default_source = st.session_state.get("schedule_source_choice", option_keys[0])
+    if default_source not in option_keys:
+        default_source = option_keys[0]
+    default_index = option_keys.index(default_source)
+    selected_source: ScheduleSource = st.radio(
+        "Select source",
+        options=option_keys,
+        index=default_index,
+        format_func=lambda key: DATA_SOURCE_OPTIONS[key],
+        key="schedule_source_choice",
+    )
+
+uploaded = None
+if selected_source == "csv_upload":
+    uploaded = st.file_uploader(
+        "Upload your daily flights CSV (FL3XX export)",
+        type=["csv"],
+        key="flights_csv",
+    )
 
 btn_cols = st.columns([1, 3, 1])
 with btn_cols[0]:
@@ -1326,34 +1350,61 @@ with btn_cols[0]:
             conn.execute("DELETE FROM tail_overrides")
         st.rerun()
 
+if selected_source == "fl3xx_api":
+    st.info(
+        "FL3XX API loading is being scaffolded. "
+        "Once credentials are configured, the dashboard will fetch the schedule directly."
+    )
+    st.stop()
+
 # Priority order: upload → session → DB
+csv_bytes: bytes | None = None
+csv_name: str | None = None
+csv_uploaded_at: str | None = None
 if uploaded is not None:
     csv_bytes = uploaded.getvalue()
+    csv_name = uploaded.name
+    csv_uploaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     st.session_state["csv_bytes"] = csv_bytes
-    st.session_state["csv_name"] = uploaded.name
-    st.session_state["csv_uploaded_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    save_csv_to_db(uploaded.name, csv_bytes)
-    df_raw = _load_csv_from_bytes(csv_bytes)
+    st.session_state["csv_name"] = csv_name
+    st.session_state["csv_uploaded_at"] = csv_uploaded_at
+    save_csv_to_db(csv_name, csv_bytes)
 elif "csv_bytes" in st.session_state:
-    df_raw = _load_csv_from_bytes(st.session_state["csv_bytes"])
+    csv_bytes = st.session_state["csv_bytes"]
+    csv_name = st.session_state.get("csv_name", "flights.csv")
+    csv_uploaded_at = st.session_state.get("csv_uploaded_at", "")
     st.caption(
-        f"Using cached CSV: **{st.session_state.get('csv_name','flights.csv')}** "
-        f"(uploaded {st.session_state.get('csv_uploaded_at','')})"
+        f"Using cached CSV: **{csv_name}** (uploaded {csv_uploaded_at})"
     )
 else:
     name, content, uploaded_at = load_csv_from_db()
     if content is not None:
-        st.session_state["csv_bytes"] = content
-        st.session_state["csv_name"] = name or "flights.csv"
-        st.session_state["csv_uploaded_at"] = uploaded_at or ""
-        df_raw = _load_csv_from_bytes(content)
+        csv_bytes = content
+        csv_name = name or "flights.csv"
+        csv_uploaded_at = uploaded_at or ""
+        st.session_state["csv_bytes"] = csv_bytes
+        st.session_state["csv_name"] = csv_name
+        st.session_state["csv_uploaded_at"] = csv_uploaded_at
         st.caption(
-            f"Loaded CSV from storage: **{st.session_state['csv_name']}** "
-            f"(uploaded {st.session_state['csv_uploaded_at']})"
+            f"Loaded CSV from storage: **{csv_name}** (uploaded {csv_uploaded_at})"
         )
     else:
         st.info("Upload today’s FL3XX flights CSV to begin.")
         st.stop()
+
+if csv_bytes is None:
+    st.error("CSV data unavailable. Upload a file to continue.")
+    st.stop()
+
+schedule_payload = load_schedule(
+    selected_source,
+    csv_bytes=csv_bytes,
+    metadata={
+        "filename": csv_name,
+        "uploaded_at": csv_uploaded_at,
+    },
+)
+df_raw = schedule_payload.frame
 
 # Harmonize legacy column names before validation so older CSV exports remain compatible
 column_renames = {}
