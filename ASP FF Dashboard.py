@@ -282,6 +282,17 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
     if auth_header is not None:
         auth_header = str(auth_header)
 
+    auth_header_name_value = (
+        merged.get("auth_header_name")
+        or merged.get("authorization_header_name")
+        or st.secrets.get("FL3XX_AUTH_HEADER_NAME")
+        or os.getenv("FL3XX_AUTH_HEADER_NAME")
+    )
+    if auth_header_name_value is not None:
+        auth_header_name = str(auth_header_name_value)
+    else:
+        auth_header_name = "Authorization"
+
     headers = merged.get("headers")
     extra_headers = dict(headers) if isinstance(headers, Mapping) else {}
 
@@ -306,6 +317,7 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         base_url=base_url,
         api_token=api_token,
         auth_header=auth_header,
+        auth_header_name=auth_header_name,
         extra_headers=extra_headers,
         verify_ssl=verify_ssl,
         timeout=timeout,
@@ -321,8 +333,9 @@ def _get_fl3xx_schedule(
         config = _build_fl3xx_config_from_secrets()
     if not config.auth_header and not config.api_token:
         raise RuntimeError(
-            "FL3XX API credentials are not configured. Set 'api_token' or 'authorization' "
-            "in Streamlit secrets (fl3xx_api) or the FL3XX_API_TOKEN environment variable."
+            "FL3XX API credentials are not configured. Set 'api_token' or 'auth_header' "
+            "in Streamlit secrets (fl3xx_api) or the FL3XX_API_TOKEN environment variable. "
+            "Use 'auth_header_name' to override the header name when providing an auth token."
         )
 
     current_time = now or datetime.now(timezone.utc)
@@ -1631,7 +1644,9 @@ elif selected_source == "fl3xx_api":
     if not config.auth_header and not config.api_token:
         st.error(
             "Configure the FL3XX API credentials in Streamlit secrets (key 'fl3xx_api') "
-            "or via the FL3XX_API_TOKEN environment variable."
+            "or via the FL3XX_API_TOKEN environment variable. Provide 'api_token' or "
+            "'auth_header', and optionally 'auth_header_name' if your API expects a "
+            "different header."
         )
         st.stop()
 

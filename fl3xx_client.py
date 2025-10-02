@@ -21,6 +21,7 @@ class Fl3xxApiConfig:
     base_url: str = DEFAULT_FL3XX_BASE_URL
     api_token: Optional[str] = None
     auth_header: Optional[str] = None
+    auth_header_name: str = "Authorization"
     extra_headers: Dict[str, str] = field(default_factory=dict)
     verify_ssl: bool = True
     timeout: int = 30
@@ -29,7 +30,8 @@ class Fl3xxApiConfig:
     def build_headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
         if self.auth_header:
-            headers["Authorization"] = self.auth_header
+            header_name = self.auth_header_name or "Authorization"
+            headers[header_name] = self.auth_header
         elif self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         headers.update(self.extra_headers)
