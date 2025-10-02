@@ -160,6 +160,55 @@ def test_fetch_flight_crew_uses_expected_endpoint():
     assert call["headers"]["Authorization"] == "Bearer token123"
 
 
+def test_fetch_flight_crew_handles_payload_wrapped_in_items_mapping():
+    crew_payload = {
+        "items": {
+            "1": {"role": "CMD", "firstName": "Alex", "lastName": "Doe"},
+            "2": {"role": "FO", "firstName": "Jamie", "lastName": "Smith"},
+        }
+    }
+    expected_url = "https://app.fl3xx.us/api/external/flight/456/crew"
+    session = FakeSession(response_map={expected_url: FakeResponse(crew_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    crew = fetch_flight_crew(config, 456, session=session)
+
+    assert crew == [
+        {"role": "CMD", "firstName": "Alex", "lastName": "Doe"},
+        {"role": "FO", "firstName": "Jamie", "lastName": "Smith"},
+    ]
+
+
+def test_fetch_flight_crew_supports_crew_members_key():
+    crew_payload = {
+        "crewMembers": [
+            {"role": "CMD", "firstName": "Alex", "lastName": "Doe"},
+            {"role": "FO", "firstName": "Jamie", "lastName": "Smith"},
+        ]
+    }
+    expected_url = "https://app.fl3xx.us/api/external/flight/789/crew"
+    session = FakeSession(response_map={expected_url: FakeResponse(crew_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    crew = fetch_flight_crew(config, 789, session=session)
+
+    assert crew == [
+        {"role": "CMD", "firstName": "Alex", "lastName": "Doe"},
+        {"role": "FO", "firstName": "Jamie", "lastName": "Smith"},
+    ]
+
+
+def test_fetch_flight_crew_returns_empty_list_for_none_items():
+    crew_payload = {"items": None}
+    expected_url = "https://app.fl3xx.us/api/external/flight/987/crew"
+    session = FakeSession(response_map={expected_url: FakeResponse(crew_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    crew = fetch_flight_crew(config, 987, session=session)
+
+    assert crew == []
+
+
 def test_enrich_flights_with_crew_populates_names():
     flights = [{"flightId": 123}]
     crew_payload = [
