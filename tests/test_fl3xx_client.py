@@ -102,6 +102,14 @@ def test_build_headers_allows_empty_token_scheme():
     assert headers["Authorization"] == "abc123"
 
 
+def test_build_headers_defaults_to_raw_token_for_custom_header_name():
+    config = Fl3xxApiConfig(api_token="abc123", auth_header_name="X-Auth-Token")
+
+    headers = config.build_headers()
+
+    assert headers["X-Auth-Token"] == "abc123"
+
+
 def test_fetch_flights_accepts_payload_wrapped_in_items_list():
     payload = {"items": [{"bookingIdentifier": "ABC"}]}
     response = FakeResponse(payload)
