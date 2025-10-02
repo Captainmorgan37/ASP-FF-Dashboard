@@ -90,3 +90,22 @@ def test_build_config_allows_custom_auth_header_name(monkeypatch):
     headers = config.build_headers()
     assert headers["X-Auth-Token"] == "Token abc123"
     assert "Authorization" not in headers or headers["Authorization"] != "Token abc123"
+
+
+def test_build_config_allows_custom_token_scheme(monkeypatch):
+    secrets_mapping = {
+        "fl3xx_api": {
+            "api_token": "abc123",
+            "api_token_scheme": "Token",
+            "auth_header_name": "X-Auth-Token",
+        }
+    }
+
+    monkeypatch.setattr(st, "secrets", secrets_mapping, raising=False)
+
+    config = _build_fl3xx_config_from_secrets()
+
+    assert config.api_token == "abc123"
+    assert config.api_token_scheme == "Token"
+    headers = config.build_headers()
+    assert headers["X-Auth-Token"] == "Token abc123"

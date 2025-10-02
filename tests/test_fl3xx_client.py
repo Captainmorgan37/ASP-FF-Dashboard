@@ -82,6 +82,26 @@ def test_build_headers_supports_custom_auth_header_name():
     assert "Authorization" not in headers or headers["Authorization"] != "Token abc123"
 
 
+def test_build_headers_supports_custom_token_scheme_and_header_name():
+    config = Fl3xxApiConfig(
+        api_token="abc123",
+        auth_header_name="X-Auth-Token",
+        api_token_scheme="Token",
+    )
+
+    headers = config.build_headers()
+
+    assert headers["X-Auth-Token"] == "Token abc123"
+
+
+def test_build_headers_allows_empty_token_scheme():
+    config = Fl3xxApiConfig(api_token="abc123", api_token_scheme="")
+
+    headers = config.build_headers()
+
+    assert headers["Authorization"] == "abc123"
+
+
 def test_fetch_flights_accepts_payload_wrapped_in_items_list():
     payload = {"items": [{"bookingIdentifier": "ABC"}]}
     response = FakeResponse(payload)
