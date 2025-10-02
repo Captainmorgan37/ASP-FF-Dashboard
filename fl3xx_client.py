@@ -158,7 +158,7 @@ def _normalise_crew_payload(payload: Any) -> List[Dict[str, Any]]:
         return None
 
     if isinstance(payload, MutableMapping):
-        for key in ("crewMembers", "items", "crew", "data", "results"):
+        for key in ("crewMembers", "items", "crew", "data", "results", "crews"):
             if key in payload:
                 members = _coerce_members(payload[key])
                 if members is not None:

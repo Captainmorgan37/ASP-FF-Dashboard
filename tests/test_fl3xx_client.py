@@ -198,6 +198,36 @@ def test_fetch_flight_crew_supports_crew_members_key():
     ]
 
 
+def test_fetch_flight_crew_supports_crews_key():
+    crew_payload = {
+        "flightId": 123456,
+        "externalReference": None,
+        "crews": [
+            {
+                "role": "CMD",
+                "firstName": "Stuart",
+                "middleName": "Reid",
+                "lastName": "Weaver",
+                "logName": "sweaver@airsprint.com",
+            },
+            {
+                "role": "FO",
+                "firstName": "Jason",
+                "middleName": "Alexander",
+                "lastName": "MacNeil",
+                "logName": "jmacneil@airsprint.com",
+            },
+        ],
+    }
+    expected_url = "https://app.fl3xx.us/api/external/flight/123456/crew"
+    session = FakeSession(response_map={expected_url: FakeResponse(crew_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    crew = fetch_flight_crew(config, 123456, session=session)
+
+    assert crew == crew_payload["crews"]
+
+
 def test_fetch_flight_crew_returns_empty_list_for_none_items():
     crew_payload = {"items": None}
     expected_url = "https://app.fl3xx.us/api/external/flight/987/crew"
