@@ -27,6 +27,12 @@ from fl3xx_client import (
     fetch_flights,
 )
 
+# Global lookup maps populated after loading airport metadata. Define them early so
+# helper functions can reference the names during the initial Streamlit run.
+ICAO_TZ_MAP: dict[str, str] = {}
+ICAO_TO_IATA_MAP: dict[str, str] = {}
+IATA_TO_ICAO_MAP: dict[str, str] = {}
+
 # ============================
 # Page config
 # ============================
