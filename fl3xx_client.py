@@ -72,6 +72,13 @@ def _normalise_payload(data: Any) -> List[Dict[str, Any]]:
     raise ValueError("Unsupported FL3XX API payload structure")
 
 
+def compute_flights_digest(flights: Iterable[Any]) -> str:
+    """Return a stable SHA256 digest for the provided flight payload."""
+
+    digest_input = json.dumps(list(flights), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(digest_input).hexdigest()
+
+
 def fetch_flights(
     config: Fl3xxApiConfig,
     *,
@@ -112,8 +119,7 @@ def fetch_flights(
     payload = response.json()
     flights = _normalise_payload(payload)
 
-    digest_input = json.dumps(flights, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    digest = hashlib.sha256(digest_input).hexdigest()
+    digest = compute_flights_digest(flights)
     fetched_at = reference_time.isoformat().replace("+00:00", "Z")
 
     metadata = {
@@ -129,4 +135,137 @@ def fetch_flights(
     return flights, metadata
 
 
-__all__ = ["Fl3xxApiConfig", "DEFAULT_FL3XX_BASE_URL", "compute_fetch_dates", "fetch_flights"]
+def _build_flight_endpoint(base_url: str, flight_id: Any) -> str:
+    base = base_url.rstrip("/")
+    if base.lower().endswith("/flights"):
+        base = base[: -len("/flights")]
+    return f"{base}/{flight_id}/crew"
+
+
+def fetch_flight_crew(
+    config: Fl3xxApiConfig,
+    flight_id: Any,
+    *,
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, Any]]:
+    """Return the crew payload for a specific flight."""
+
+    http = session or requests.Session()
+    close_session = session is None
+    try:
+        response = http.get(
+            _build_flight_endpoint(config.base_url, flight_id),
+            headers=config.build_headers(),
+            timeout=config.timeout,
+            verify=config.verify_ssl,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, MutableMapping) and "items" in payload:
+            items = payload["items"]
+            if isinstance(items, Iterable):
+                return [item for item in items if isinstance(item, MutableMapping)]
+        raise ValueError("Unsupported FL3XX crew payload structure")
+    finally:
+        if close_session:
+            try:
+                http.close()
+            except AttributeError:
+                pass
+
+
+def _select_crew_member(crew: Iterable[Dict[str, Any]], role: str) -> Optional[Dict[str, Any]]:
+    for member in crew:
+        if not isinstance(member, MutableMapping):
+            continue
+        member_role = str(member.get("role") or "").upper()
+        if member_role == role.upper():
+            return member
+    return None
+
+
+def _format_crew_name(member: Optional[Dict[str, Any]]) -> str:
+    if not member:
+        return ""
+    parts = []
+    for key in ("firstName", "middleName", "lastName"):
+        value = member.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            parts.append(str(value))
+    if parts:
+        return " ".join(parts)
+    for fallback_key in ("logName", "email", "trigram", "personnelNumber"):
+        fallback = member.get(fallback_key)
+        if isinstance(fallback, str):
+            fallback = fallback.strip()
+        if fallback:
+            return str(fallback)
+    return ""
+
+
+def enrich_flights_with_crew(
+    config: Fl3xxApiConfig,
+    flights: Iterable[Dict[str, Any]],
+    *,
+    force: bool = False,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Populate crew information (PIC/SIC names) onto the provided flights."""
+
+    summary = {"fetched": 0, "errors": [], "updated": False}
+    mutable_flights = [flight for flight in flights if isinstance(flight, MutableMapping)]
+    if not mutable_flights:
+        return summary
+
+    http = session or requests.Session()
+    close_session = session is None
+    try:
+        for flight in mutable_flights:
+            flight_id = flight.get("flightId") or flight.get("id")
+            if not flight_id:
+                continue
+            if not force and flight.get("picName") and flight.get("sicName"):
+                continue
+            try:
+                crew_payload = fetch_flight_crew(config, flight_id, session=http)
+            except Exception as exc:  # pragma: no cover - defensive path
+                summary["errors"].append({"flight_id": flight_id, "error": str(exc)})
+                continue
+
+            summary["fetched"] += 1
+            flight["crewMembers"] = crew_payload
+            pic_member = _select_crew_member(crew_payload, "CMD")
+            sic_member = _select_crew_member(crew_payload, "FO")
+            pic_name = _format_crew_name(pic_member)
+            sic_name = _format_crew_name(sic_member)
+            if pic_name:
+                if flight.get("picName") != pic_name:
+                    summary["updated"] = True
+                flight["picName"] = pic_name
+            if sic_name:
+                if flight.get("sicName") != sic_name:
+                    summary["updated"] = True
+                flight["sicName"] = sic_name
+    finally:
+        if close_session:
+            try:
+                http.close()
+            except AttributeError:
+                pass
+
+    return summary
+
+
+__all__ = [
+    "Fl3xxApiConfig",
+    "DEFAULT_FL3XX_BASE_URL",
+    "compute_fetch_dates",
+    "compute_flights_digest",
+    "fetch_flights",
+    "fetch_flight_crew",
+    "enrich_flights_with_crew",
+]

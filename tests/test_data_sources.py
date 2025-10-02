@@ -16,6 +16,8 @@ class Fl3xxApiLoaderTests(unittest.TestCase):
                 "blockOffEstUTC": "2025-10-02T01:00:00.000Z",
                 "blockOnEstUTC": "2025-10-02T02:17:00.000Z",
                 "workflowCustomName": "FEX As Available",
+                "picName": "Stuart Weaver",
+                "sicName": "Jason MacNeil",
             }
         ]
 
@@ -36,8 +38,8 @@ class Fl3xxApiLoaderTests(unittest.TestCase):
         self.assertEqual(row["Off-Block (Sched)"], "02.10.2025 01:00")
         self.assertEqual(row["On-Block (Sched)"], "02.10.2025 02:17")
         self.assertEqual(row["Flight time (Est)"], "01:17")
-        self.assertEqual(row["PIC"], "")
-        self.assertEqual(row["SIC"], "")
+        self.assertEqual(row["PIC"], "Stuart Weaver")
+        self.assertEqual(row["SIC"], "Jason MacNeil")
 
     def test_handles_missing_or_invalid_fields(self):
         flights = [
