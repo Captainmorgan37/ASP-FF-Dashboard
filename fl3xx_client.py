@@ -22,7 +22,7 @@ class Fl3xxApiConfig:
     api_token: Optional[str] = None
     auth_header: Optional[str] = None
     auth_header_name: str = "Authorization"
-    api_token_scheme: Optional[str] = "Bearer"
+    api_token_scheme: Optional[str] = None
     extra_headers: Dict[str, str] = field(default_factory=dict)
     verify_ssl: bool = True
     timeout: int = 30
@@ -34,8 +34,12 @@ class Fl3xxApiConfig:
         if self.auth_header:
             headers[header_name] = self.auth_header
         elif self.api_token:
-            scheme = (self.api_token_scheme or "").strip()
             token = str(self.api_token)
+            scheme = self.api_token_scheme
+            if scheme is None:
+                scheme = "Bearer" if header_name.lower() == "authorization" else ""
+            else:
+                scheme = scheme.strip()
             headers[header_name] = f"{scheme} {token}".strip() if scheme else token
         headers.update(self.extra_headers)
         return headers

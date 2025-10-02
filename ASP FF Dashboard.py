@@ -301,7 +301,10 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         or os.getenv("FL3XX_API_TOKEN_SCHEME")
     )
     if token_scheme_value is None:
-        api_token_scheme = "Bearer"
+        if auth_header_name.lower() == "authorization":
+            api_token_scheme = "Bearer"
+        else:
+            api_token_scheme = ""
     else:
         api_token_scheme = str(token_scheme_value)
 
