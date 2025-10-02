@@ -2476,7 +2476,16 @@ dep_delay        = _base["_DepActual_ts"] - _base["ETD_UTC"]   # Takeoff (FA) �
 eta_fa_vs_sched  = _base["_ETA_FA_ts"]    - _base["ETA_UTC"]   # ETA(FA) − On-Block (Sched)
 arr_vs_sched     = _base["_ArrActual_ts"] - _base["ETA_UTC"]   # Landing (FA) − On-Block (Sched)
 
-cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
+if "Status" in _base.columns:
+    depart_delay_status = _base["Status"].eq("🔴 Departed (Delay)")
+else:
+    depart_delay_status = pd.Series(False, index=_base.index)
+
+cell_dep = (
+    dep_delay.notna()
+    & (dep_delay > delay_thr_td)
+    & (~depart_delay_status)
+)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
 cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
@@ -2530,7 +2539,6 @@ def _style_ops(x: pd.DataFrame):
     if "Status" in x.columns:
         delay_statuses = {
             "🔴 Arrived (Delay)",
-            "🔴 Departed (Delay)",
             "🟠 Delayed Arrival",
             "🔴 DELAY",
         }
@@ -2904,7 +2912,16 @@ dep_var = _show["_DepActual_ts"] - _show["ETD_UTC"]   # Takeoff (FA) − Off-Blo
 eta_var = _show["_ETA_FA_ts"]    - _show["ETA_UTC"]   # ETA(FA) − On-Block (Sched)
 arr_var = _show["_ArrActual_ts"] - _show["ETA_UTC"]   # Landing (FA) − On-Block (Sched)
 
-cell_dep = dep_var.notna() & (dep_var > thr)
+if "Status" in _show.columns:
+    depart_delay_status_qn = _show["Status"].eq("🔴 Departed (Delay)")
+else:
+    depart_delay_status_qn = pd.Series(False, index=_show.index)
+
+cell_dep = (
+    dep_var.notna()
+    & (dep_var > thr)
+    & (~depart_delay_status_qn)
+)
 cell_eta = eta_var.notna() & (eta_var > thr)
 cell_arr = arr_var.notna() & (arr_var > thr)
 
