@@ -1518,7 +1518,7 @@ def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: da
 # ============================
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    show_only_upcoming = st.checkbox("Show only upcoming departures", value=True)
+    show_only_upcoming = st.checkbox("Show only upcoming departures", value=False)
 with c2:
     limit_next_hours = st.checkbox("Limit to next X hours", value=False)
 with c3:
@@ -1625,14 +1625,14 @@ def tail_from_asp(text: str) -> list[str]:
 # Schedule data source selection
 # ============================
 DATA_SOURCE_OPTIONS = {
-    "csv_upload": "Upload CSV",
     "fl3xx_api": "FL3XX API (automatic)",
+    "csv_upload": "Upload CSV",
 }
 
 with st.sidebar:
     st.subheader("Schedule data source")
     option_keys = list(DATA_SOURCE_OPTIONS.keys())
-    default_source = st.session_state.get("schedule_source_choice", option_keys[0])
+    default_source = st.session_state.get("schedule_source_choice", "fl3xx_api")
     if default_source not in option_keys:
         default_source = option_keys[0]
     default_index = option_keys.index(default_source)
