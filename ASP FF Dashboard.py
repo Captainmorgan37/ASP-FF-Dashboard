@@ -1377,7 +1377,12 @@ def _parse_route_mismatch_status(status_text: str):
     }
 
 # ---- Booking chooser ----
-def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: str, event_dt_utc: datetime) -> pd.Series | None:
+def choose_booking_for_event(
+    subj_info: dict,
+    tails_dashed: list[str],
+    event: str,
+    event_dt_utc: datetime | None,
+) -> pd.Series | None:
     cand = df_clean.copy()
     if tails_dashed:
         cand = cand[cand["Aircraft"].isin(tails_dashed)]  # CSV is dashed
@@ -1481,13 +1486,24 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
         return None
 
     cand = cand.copy()
+
+    if event_dt_utc is None:
+        cand = cand.sort_values(sched_col)
+        best = cand.iloc[0]
+        return best.drop(labels=["Δ"]) if "Δ" in best else best
+
     cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
     cand = cand.sort_values("Δ")
 
     MAX_WINDOW = pd.Timedelta(hours=12) if event == "Diversion" else pd.Timedelta(hours=3)
     best = cand.iloc[0]
-    if best["Δ"] <= MAX_WINDOW:
+    best_delta = best.get("Δ")
+    if pd.notna(best_delta) and best_delta <= MAX_WINDOW:
         return best.drop(labels=["Δ"]) if "Δ" in best else best
+
+    if len(cand) == 1:
+        return best.drop(labels=["Δ"]) if "Δ" in best else best
+
     return None
 
 def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: datetime | None) -> pd.Series | None:
@@ -3107,15 +3123,28 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
                     event = "EDCT"
 
-                # Choose actual timestamp
+                # Choose timestamps
+                match_dt_utc = None
                 if event == "Departure":
-                    actual_dt_utc = body_info.get("dep_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                    match_dt_utc = (
+                        body_info.get("dep_time_utc")
+                        or explicit_dt
+                        or subj_info.get("actual_time_utc")
+                        or hdr_dt
+                    )
                 elif event == "Arrival":
-                    actual_dt_utc = body_info.get("arr_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                    match_dt_utc = (
+                        body_info.get("arr_time_utc")
+                        or explicit_dt
+                        or subj_info.get("actual_time_utc")
+                        or hdr_dt
+                    )
                 elif event == "EDCT":
-                    actual_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt or now_utc
+                    match_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt
                 else:
-                    actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                    match_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt
+
+                actual_dt_utc = match_dt_utc or now_utc
 
                 # --- dashed tails (literal + ASP mapped)
                 tails_dashed = []
@@ -3129,9 +3158,9 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 bookings, _tails_unused, _evt_unused = extract_candidates(text)
                 booking_token = bookings[0] if bookings else None
 
-                selected_row = select_leg_row_for_booking(booking_token, event, actual_dt_utc)
+                selected_row = select_leg_row_for_booking(booking_token, event, match_dt_utc)
                 if selected_row is None:
-                    match_row = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
+                    match_row = choose_booking_for_event(subj_info, tails_dashed, event, match_dt_utc)
                     if match_row is not None:
                         selected_row = match_row
 
