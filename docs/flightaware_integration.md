@@ -28,34 +28,6 @@ so updating the tests alone will not surface a visible change in the dashboard.
   dashboard you would import `flightaware_alerts` inside `ASP FF Dashboard.py`
   and replace or augment the existing IMAP processing logic.【F:ASP FF Dashboard.py†L1-L210】【F:ASP FF Dashboard.py†L3006-L3099】
 
-## Enabling AeroAPI Status Updates in the UI
-
-The Streamlit dashboard now supports fetching status updates directly from
-FlightAware AeroAPI in addition to IMAP alerts. To test the API-driven flow:
-
-1. Add the following secrets to your Streamlit deployment (for example in
-   `.streamlit/secrets.toml`):
-
-   ```toml
-   FLIGHTAWARE_API_KEY = "your-aeroapi-key"
-   # optional overrides
-   FLIGHTAWARE_API_BASE = "https://aeroapi.flightaware.com/aeroapi"
-   FLIGHTAWARE_TIMEOUT = 30
-   FLIGHTAWARE_VERIFY_SSL = true
-   # Provide any extra headers required by your account (optional)
-   [FLIGHTAWARE_EXTRA_HEADERS]
-   X-Custom-Header = "value"
-   ```
-
-2. Launch the dashboard and enable **“Use FlightAware AeroAPI for status
-   updates”**. When active, the app fetches recent flights for each tail number
-   via `GET /flights/{ident}`, maps the results to departure/arrival/ETA events,
-   and persists them in the existing status store. IMAP polling is automatically
-   disabled while API mode is active to avoid duplicate updates.【F:ASP FF Dashboard.py†L1970-L2056】【F:ASP FF Dashboard.py†L3270-L3338】
-
-3. To revert to the previous behaviour, uncheck the AeroAPI option; IMAP polling
-   controls become available again without restarting the app.【F:ASP FF Dashboard.py†L3338-L3386】
-
 ## Where to Update API Calls
 
 * In-app changes (Streamlit): Integrate the helpers directly in `ASP FF
