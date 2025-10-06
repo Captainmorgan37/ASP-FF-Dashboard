@@ -1,4 +1,4 @@
-"""Utilities for configuring ForeFlight flight alert subscriptions."""
+"""Utilities for configuring FlightAware AeroAPI flight alert subscriptions."""
 
 from __future__ import annotations
 
@@ -7,19 +7,16 @@ from typing import Iterable, List, Mapping, Optional, Sequence
 
 import requests
 
-DEFAULT_FOREFLIGHT_ALERTS_URL = "https://api.foreflight.com/alerts/v1/alerts"
+DEFAULT_FLIGHTAWARE_ALERTS_URL = "https://aeroapi.flightaware.com/aeroapi/alerts"
 DEFAULT_FLIGHT_ALERT_EVENTS = ["out", "off", "on", "in"]
 
 
 @dataclass(frozen=True)
-class ForeFlightApiConfig:
-    """Configuration for interacting with the ForeFlight Alerts API."""
+class FlightAwareApiConfig:
+    """Configuration for interacting with the FlightAware AeroAPI Alerts endpoint."""
 
-    base_url: str = DEFAULT_FOREFLIGHT_ALERTS_URL
+    base_url: str = DEFAULT_FLIGHTAWARE_ALERTS_URL
     api_key: Optional[str] = None
-    auth_header: Optional[str] = None
-    auth_header_name: str = "Authorization"
-    api_key_scheme: Optional[str] = "Bearer"
     extra_headers: Mapping[str, str] | None = None
     verify_ssl: bool = True
     timeout: int = 30
@@ -28,14 +25,8 @@ class ForeFlightApiConfig:
         headers = {"Accept": "application/json"}
         if self.extra_headers:
             headers.update(dict(self.extra_headers))
-
-        header_name = self.auth_header_name or "Authorization"
-        if self.auth_header:
-            headers[header_name] = self.auth_header
-        elif self.api_key:
-            token = str(self.api_key)
-            scheme = (self.api_key_scheme or "").strip()
-            headers[header_name] = f"{scheme} {token}".strip() if scheme else token
+        if self.api_key:
+            headers.setdefault("x-apikey", str(self.api_key))
         return headers
 
     @property
@@ -44,53 +35,57 @@ class ForeFlightApiConfig:
 
 
 @dataclass
-class ForeFlightAlert:
-    """Representation of a ForeFlight flight alert subscription."""
+class FlightAwareAlert:
+    """Representation of a FlightAware flight alert subscription."""
 
     identifier: str
     events: List[str]
     alert_id: Optional[str] = None
-    label: Optional[str] = None
+    description: Optional[str] = None
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "ForeFlightAlert":
+    def from_payload(cls, payload: Mapping[str, object]) -> "FlightAwareAlert":
         identifier = str(
             payload.get("identifier")
+            or payload.get("ident")
             or payload.get("tail")
-            or payload.get("aircraft")
             or payload.get("registration")
+            or payload.get("aircraft")
             or ""
         ).strip()
         events = [str(evt).lower() for evt in payload.get("events", []) if isinstance(evt, str)]
-        alert_id = payload.get("id") or payload.get("uuid")
-        label = payload.get("label") or payload.get("name")
+        alert_id = payload.get("id") or payload.get("alert_id") or payload.get("uuid")
+        description = payload.get("description") or payload.get("label") or payload.get("name")
         return cls(
             identifier=identifier,
             events=events,
             alert_id=str(alert_id) if alert_id else None,
-            label=str(label) if label else None,
+            description=str(description) if description else None,
         )
 
 
-def _normalise_alerts(payload: object) -> List[ForeFlightAlert]:
+def _normalise_alerts(payload: object) -> List[FlightAwareAlert]:
     if payload is None:
         return []
     if isinstance(payload, Mapping):
         for key in ("items", "alerts", "data", "results"):
             if key in payload and isinstance(payload[key], Iterable):
                 return _normalise_alerts(payload[key])
-        # A mapping could represent a single alert definition
-        return [ForeFlightAlert.from_payload(payload)]
+        return [FlightAwareAlert.from_payload(payload)]
     if isinstance(payload, Iterable):
-        alerts: List[ForeFlightAlert] = []
+        alerts: List[FlightAwareAlert] = []
         for item in payload:
             if isinstance(item, Mapping):
-                alerts.append(ForeFlightAlert.from_payload(item))
+                alerts.append(FlightAwareAlert.from_payload(item))
         return alerts
-    raise ValueError("Unsupported ForeFlight alerts payload structure")
+    raise ValueError("Unsupported FlightAware alerts payload structure")
 
 
-def list_alerts(config: ForeFlightApiConfig, *, session: Optional[requests.Session] = None) -> List[ForeFlightAlert]:
+def list_alerts(
+    config: FlightAwareApiConfig,
+    *,
+    session: Optional[requests.Session] = None,
+) -> List[FlightAwareAlert]:
     """Return the current alert subscriptions configured for the account."""
 
     http = session or requests.Session()
@@ -105,7 +100,7 @@ def list_alerts(config: ForeFlightApiConfig, *, session: Optional[requests.Sessi
     return _normalise_alerts(payload)
 
 
-def _build_alert_payload(tail: str, events: Sequence[str], label: Optional[str]) -> Mapping[str, object]:
+def _build_alert_payload(tail: str, events: Sequence[str], description: Optional[str]) -> Mapping[str, object]:
     seen = set()
     clean_events = []
     for event in events:
@@ -114,29 +109,29 @@ def _build_alert_payload(tail: str, events: Sequence[str], label: Optional[str])
             seen.add(lower)
             clean_events.append(lower)
     body: dict[str, object] = {
-        "identifier": tail,
+        "ident": tail,
         "events": clean_events,
     }
-    if label:
-        body["label"] = label
+    if description:
+        body["description"] = description
     return body
 
 
-def _alert_matches_tail(alert: ForeFlightAlert, tail: str) -> bool:
+def _alert_matches_tail(alert: FlightAwareAlert, tail: str) -> bool:
     return alert.identifier.replace("-", "").upper() == tail.replace("-", "").upper()
 
 
 def ensure_alert_subscription(
-    config: ForeFlightApiConfig,
+    config: FlightAwareApiConfig,
     tail: str,
     *,
     events: Optional[Sequence[str]] = None,
-    label: Optional[str] = None,
+    description: Optional[str] = None,
     session: Optional[requests.Session] = None,
-) -> ForeFlightAlert:
+) -> FlightAwareAlert:
     """Ensure that an alert subscription exists for the requested tail.
 
-    The function returns the resulting :class:`ForeFlightAlert` definition.
+    The function returns the resulting :class:`FlightAwareAlert` definition.
     If an alert already exists but differs from the desired configuration it
     will be updated in-place.
     """
@@ -147,10 +142,10 @@ def ensure_alert_subscription(
     try:
         existing_alerts = list_alerts(config, session=http)
         match = next((alert for alert in existing_alerts if _alert_matches_tail(alert, tail)), None)
-        payload = _build_alert_payload(tail, desired_events, label)
+        payload = _build_alert_payload(tail, desired_events, description)
 
         if match and sorted(match.events) == sorted(evt.lower() for evt in desired_events) and (
-            label is None or match.label == label
+            description is None or match.description == description
         ):
             return match
 
@@ -172,33 +167,33 @@ def ensure_alert_subscription(
                 verify=config.verify_ssl,
             )
         response.raise_for_status()
-        return ForeFlightAlert.from_payload(response.json())
+        return FlightAwareAlert.from_payload(response.json())
     finally:
         if close_session:
             http.close()
 
 
 def configure_test_alerts(
-    config: ForeFlightApiConfig,
+    config: FlightAwareApiConfig,
     tails: Iterable[str],
     *,
     events: Optional[Sequence[str]] = None,
-    label_prefix: str = "Test Flight Alert",
+    description_prefix: str = "Test Flight Alert",
     session: Optional[requests.Session] = None,
-) -> List[ForeFlightAlert]:
+) -> List[FlightAwareAlert]:
     """Create or update alert subscriptions for a collection of tail numbers."""
 
     http = session or requests.Session()
     close_session = session is None
     try:
-        results: List[ForeFlightAlert] = []
+        results: List[FlightAwareAlert] = []
         for tail in tails:
-            label = f"{label_prefix} {tail}".strip()
+            description = f"{description_prefix} {tail}".strip()
             alert = ensure_alert_subscription(
                 config,
                 tail,
                 events=events,
-                label=label,
+                description=description,
                 session=http,
             )
             results.append(alert)
