@@ -1377,7 +1377,13 @@ def _parse_route_mismatch_status(status_text: str):
     }
 
 # ---- Booking chooser ----
-def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: str, event_dt_utc: datetime) -> pd.Series | None:
+def choose_booking_for_event(
+    subj_info: dict,
+    tails_dashed: list[str],
+    event: str,
+    event_dt_utc: datetime | None,
+    event_dt_is_placeholder: bool = False,
+) -> pd.Series | None:
     cand = df_clean.copy()
     if tails_dashed:
         cand = cand[cand["Aircraft"].isin(tails_dashed)]  # CSV is dashed
@@ -1481,16 +1487,37 @@ def choose_booking_for_event(subj_info: dict, tails_dashed: list[str], event: st
         return None
 
     cand = cand.copy()
+
+    if event_dt_utc is None:
+        cand = cand.sort_values(sched_col)
+        best = cand.iloc[0]
+        return best.drop(labels=["Δ"]) if "Δ" in best else best
+
+    if event_dt_is_placeholder:
+        cand = cand.sort_values(sched_col)
+        best = cand.iloc[0]
+        return best.drop(labels=["Δ"]) if "Δ" in best else best
+
     cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
     cand = cand.sort_values("Δ")
 
     MAX_WINDOW = pd.Timedelta(hours=12) if event == "Diversion" else pd.Timedelta(hours=3)
     best = cand.iloc[0]
-    if best["Δ"] <= MAX_WINDOW:
+    best_delta = best.get("Δ")
+    if pd.notna(best_delta) and best_delta <= MAX_WINDOW:
         return best.drop(labels=["Δ"]) if "Δ" in best else best
+
+    if event_dt_is_placeholder and len(cand) == 1:
+        return best.drop(labels=["Δ"]) if "Δ" in best else best
+
     return None
 
-def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: datetime | None) -> pd.Series | None:
+def select_leg_row_for_booking(
+    booking: str | None,
+    event: str,
+    event_dt_utc: datetime | None,
+    event_dt_is_placeholder: bool = False,
+) -> pd.Series | None:
     if not booking:
         return None
     subset = df_clean[df_clean["Booking"].astype(str) == str(booking)].copy()
@@ -1504,7 +1531,7 @@ def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: da
     else:
         sched_col = "ETD_UTC"
 
-    if event_dt_utc is None:
+    if event_dt_utc is None or event_dt_is_placeholder:
         subset = subset.sort_values(sched_col)
         return subset.iloc[0]
 
@@ -3107,15 +3134,42 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
                     event = "EDCT"
 
-                # Choose actual timestamp
+                # Choose timestamps (track whether the value is just a placeholder)
+                def _pick_ts(*choices):
+                    for ts, is_placeholder in choices:
+                        if ts:
+                            return ts, is_placeholder
+                    return None, True
+
                 if event == "Departure":
-                    actual_dt_utc = body_info.get("dep_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                    match_dt_utc, match_dt_is_placeholder = _pick_ts(
+                        (body_info.get("dep_time_utc"), False),
+                        (explicit_dt, False),
+                        (subj_info.get("actual_time_utc"), False),
+                        (hdr_dt, True),
+                    )
                 elif event == "Arrival":
-                    actual_dt_utc = body_info.get("arr_time_utc") or explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                    match_dt_utc, match_dt_is_placeholder = _pick_ts(
+                        (body_info.get("arr_time_utc"), False),
+                        (explicit_dt, False),
+                        (subj_info.get("actual_time_utc"), False),
+                        (hdr_dt, True),
+                    )
                 elif event == "EDCT":
-                    actual_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt or now_utc
+                    match_dt_utc, match_dt_is_placeholder = _pick_ts(
+                        (edct_info.get("edct_time_utc"), False),
+                        (explicit_dt, False),
+                        (hdr_dt, True),
+                    )
                 else:
-                    actual_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt or now_utc
+                    match_dt_utc, match_dt_is_placeholder = _pick_ts(
+                        (explicit_dt, False),
+                        (subj_info.get("actual_time_utc"), False),
+                        (hdr_dt, True),
+                    )
+
+                actual_dt_utc = match_dt_utc or now_utc
+                timestamp_is_placeholder = match_dt_is_placeholder or match_dt_utc is None
 
                 # --- dashed tails (literal + ASP mapped)
                 tails_dashed = []
@@ -3129,9 +3183,20 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 bookings, _tails_unused, _evt_unused = extract_candidates(text)
                 booking_token = bookings[0] if bookings else None
 
-                selected_row = select_leg_row_for_booking(booking_token, event, actual_dt_utc)
+                selected_row = select_leg_row_for_booking(
+                    booking_token,
+                    event,
+                    match_dt_utc,
+                    timestamp_is_placeholder,
+                )
                 if selected_row is None:
-                    match_row = choose_booking_for_event(subj_info, tails_dashed, event, actual_dt_utc)
+                    match_row = choose_booking_for_event(
+                        subj_info,
+                        tails_dashed,
+                        event,
+                        match_dt_utc,
+                        timestamp_is_placeholder,
+                    )
                     if match_row is not None:
                         selected_row = match_row
 
