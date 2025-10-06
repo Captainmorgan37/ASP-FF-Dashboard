@@ -17,6 +17,7 @@ from dateutil.tz import tzoffset
 from pathlib import Path
 import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
+import requests
 
 from data_sources import ScheduleSource, load_schedule
 from fl3xx_client import (
@@ -25,6 +26,13 @@ from fl3xx_client import (
     compute_flights_digest,
     enrich_flights_with_crew,
     fetch_flights,
+)
+from flightaware_status import (
+    DEFAULT_AEROAPI_BASE_URL,
+    FlightAwareStatusConfig,
+    build_status_payload,
+    derive_event_times,
+    fetch_flights_for_ident,
 )
 
 # Global lookup maps populated after loading airport metadata. Define them early so
@@ -275,6 +283,151 @@ def _to_iso8601_z(dt: datetime | None) -> str | None:
     if dt is None:
         return None
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _secret_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    return default
+
+
+def _read_secret_headers(value: Any) -> Mapping[str, str] | None:
+    if isinstance(value, Mapping):
+        return {str(k): str(v) for k, v in value.items()}
+    return None
+
+
+def _clean_schedule_ts(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.to_pydatetime()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return None
+
+
+def build_flightaware_status_config() -> FlightAwareStatusConfig | None:
+    api_key = st.secrets.get("FLIGHTAWARE_API_KEY") or st.secrets.get("flightaware_api_key")
+    if not api_key:
+        return None
+
+    base = st.secrets.get("FLIGHTAWARE_API_BASE") or st.secrets.get("flightaware_api_base")
+    if not base:
+        base = DEFAULT_AEROAPI_BASE_URL
+
+    timeout_val = st.secrets.get("FLIGHTAWARE_TIMEOUT") or st.secrets.get("flightaware_timeout")
+    try:
+        timeout = int(timeout_val) if timeout_val is not None else 30
+    except (TypeError, ValueError):
+        timeout = 30
+
+    verify = _secret_bool(st.secrets.get("FLIGHTAWARE_VERIFY_SSL"), default=True)
+
+    extra_headers = (
+        _read_secret_headers(st.secrets.get("FLIGHTAWARE_EXTRA_HEADERS"))
+        or _read_secret_headers(st.secrets.get("flightaware_extra_headers"))
+    )
+
+    return FlightAwareStatusConfig(
+        base_url=str(base),
+        api_key=str(api_key),
+        extra_headers=extra_headers,
+        verify_ssl=verify,
+        timeout=timeout,
+    )
+
+
+def fetch_aeroapi_status_updates(
+    frame: pd.DataFrame,
+    config: FlightAwareStatusConfig,
+) -> dict[str, dict[str, dict[str, object]]]:
+    if frame.empty:
+        return {}
+
+    updates: dict[str, dict[str, dict[str, object]]] = {}
+
+    with requests.Session() as session:
+        for tail, group in frame.groupby("Aircraft"):
+            if tail is None or (isinstance(tail, float) and pd.isna(tail)):
+                continue
+            tail_str = str(tail).strip()
+            if not tail_str:
+                continue
+
+            try:
+                flights = fetch_flights_for_ident(config, tail_str, session=session)
+            except Exception as exc:
+                raise RuntimeError(f"FlightAware fetch failed for {tail_str}: {exc}") from exc
+
+            if not flights:
+                continue
+
+            remaining = list(flights)
+
+            for _, row in group.sort_values("ETD_UTC").iterrows():
+                sched_dep = _clean_schedule_ts(row.get("ETD_UTC"))
+                sched_arr = _clean_schedule_ts(row.get("ETA_UTC"))
+
+                best_idx: int | None = None
+                best_score: float | None = None
+                best_events: dict[str, Any] | None = None
+
+                for idx, flight in enumerate(remaining):
+                    events = dict(derive_event_times(flight))
+                    anchor = events.get("Departure") or events.get("ArrivalForecast") or events.get("Arrival")
+                    if anchor is None:
+                        continue
+                    if sched_dep is not None:
+                        score = abs((anchor - sched_dep).total_seconds())
+                    else:
+                        score = (0 if events.get("Departure") else 1_000_000) + idx
+
+                    if best_idx is None or score < best_score:
+                        best_idx = idx
+                        best_score = score
+                        best_events = events
+
+                if best_idx is None or best_events is None:
+                    continue
+
+                flight = remaining.pop(best_idx)
+                status_payload = build_status_payload(
+                    best_events,
+                    scheduled_departure=sched_dep,
+                    scheduled_arrival=sched_arr,
+                )
+                if not status_payload:
+                    continue
+
+                identifier = (
+                    flight.get("ident")
+                    or flight.get("fa_flight_id")
+                    or flight.get("registration")
+                    or tail_str
+                )
+                flight_id = flight.get("fa_flight_id") or flight.get("flight_id") or flight.get("uuid")
+
+                for payload in status_payload.values():
+                    payload.setdefault("identifier", str(identifier).strip())
+                    if flight_id:
+                        payload.setdefault("flightaware_id", str(flight_id))
+
+                leg_key = row.get("_LegKey") or row.get("Booking")
+                if leg_key:
+                    updates.setdefault(str(leg_key), {}).update(status_payload)
+
+    return updates
 
 
 def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
@@ -1969,6 +2122,46 @@ df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 df_clean = df.copy()
 
 # ============================
+# FlightAware API integration
+# ============================
+flightaware_config = build_flightaware_status_config()
+default_use_api = st.session_state.get("use_flightaware_api")
+if default_use_api is None:
+    default_use_api = bool(flightaware_config)
+
+use_flightaware_api = st.checkbox(
+    "Use FlightAware AeroAPI for status updates",
+    value=bool(default_use_api),
+    help=(
+        "Fetch recent FlightAware flight status directly from AeroAPI instead of relying on the "
+        "IMAP mailbox alerts."
+    ),
+)
+st.session_state["use_flightaware_api"] = use_flightaware_api
+
+api_status_placeholder = st.empty()
+api_updates: dict[str, dict[str, dict[str, object]]] = {}
+api_error: str | None = None
+
+if use_flightaware_api:
+    if not flightaware_config:
+        api_error = "Missing FLIGHTAWARE_API_KEY"
+        api_status_placeholder.warning(
+            "Configure `FLIGHTAWARE_API_KEY` (and optional base URL/headers) in Streamlit secrets to enable AeroAPI."
+        )
+        use_flightaware_api = False
+        st.session_state["use_flightaware_api"] = False
+    else:
+        try:
+            api_updates = fetch_aeroapi_status_updates(df, flightaware_config)
+        except Exception as exc:
+            api_error = str(exc)
+            api_status_placeholder.error(f"FlightAware API error: {exc}")
+            api_updates = {}
+
+api_mode_active = bool(use_flightaware_api and flightaware_config and api_error is None)
+
+# ============================
 # Email-driven status + enrich FA/EDCT times
 # ============================
 events_map = load_status_map()
@@ -1976,6 +2169,27 @@ if st.session_state.get("status_updates"):
     for key, upd in st.session_state["status_updates"].items():
         et = upd.get("type") or "Unknown"
         events_map.setdefault(key, {})[et] = upd
+
+if api_mode_active:
+    applied_events = 0
+    for leg_key, status_map in api_updates.items():
+        if not status_map:
+            continue
+        events_map.setdefault(leg_key, {})
+        for event_type, payload in status_map.items():
+            events_map[leg_key][event_type] = payload
+            upsert_status(
+                leg_key,
+                event_type,
+                payload.get("status"),
+                payload.get("actual_time_utc"),
+                payload.get("delta_min"),
+            )
+            applied_events += 1
+    if applied_events:
+        api_status_placeholder.info(f"FlightAware AeroAPI applied {applied_events} update(s).")
+    else:
+        api_status_placeholder.caption("FlightAware AeroAPI returned no new updates for the current schedule.")
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
     rec = events_map.get(leg_key)
@@ -3353,11 +3567,15 @@ if IMAP_SENDER:
 else:
     st.caption("IMAP filter: **From = ALL senders**")
 
-enable_poll = st.checkbox(
-    "Enable IMAP polling",
-    value=False,
-    help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
-)
+enable_poll = False
+if api_mode_active:
+    st.info("IMAP polling is disabled while FlightAware AeroAPI mode is active.")
+else:
+    enable_poll = st.checkbox(
+        "Enable IMAP polling",
+        value=False,
+        help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
+    )
 
 if enable_poll:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
