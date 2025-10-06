@@ -2,11 +2,12 @@ import pytest
 
 from flightaware_alerts import (
     DEFAULT_FLIGHT_ALERT_EVENTS,
-    FlightAwareAlert,
     FlightAwareApiConfig,
     configure_test_alerts,
+    delete_alert_subscription,
     ensure_alert_subscription,
     list_alerts,
+    set_default_alert_endpoint,
 )
 
 
@@ -43,6 +44,10 @@ class FakeSession:
 
     def put(self, url, *, json=None, headers=None, timeout=None, verify=None):
         self.calls.append(("PUT", url, headers, json))
+        return self._pop_response()
+
+    def delete(self, url, *, headers=None, timeout=None, verify=None):
+        self.calls.append(("DELETE", url, headers, None))
         return self._pop_response()
 
     def close(self):
@@ -102,6 +107,58 @@ def test_ensure_alert_subscription_updates_existing_when_events_differ(default_c
     assert session.calls[1][1].endswith("/alert-1")
 
 
+def test_ensure_alert_subscription_updates_when_target_url_changes(default_config):
+    existing = {
+        "id": "alert-1",
+        "ident": "ASP668",
+        "events": DEFAULT_FLIGHT_ALERT_EVENTS,
+        "target_url": "https://old.example",
+    }
+    session = FakeSession([
+        FakeResponse([existing]),
+        FakeResponse({
+            "id": "alert-1",
+            "ident": "ASP668",
+            "events": DEFAULT_FLIGHT_ALERT_EVENTS,
+            "target_url": "https://new.example",
+        }),
+    ])
+
+    alert = ensure_alert_subscription(
+        default_config,
+        "ASP668",
+        target_url="https://new.example",
+        session=session,
+    )
+
+    assert alert.target_url == "https://new.example"
+    assert session.calls[1][0] == "PUT"
+    assert session.calls[1][3]["target_url"] == "https://new.example"
+
+
+def test_ensure_alert_subscription_no_update_when_target_url_matches(default_config):
+    existing = {
+        "id": "alert-1",
+        "ident": "ASP668",
+        "events": DEFAULT_FLIGHT_ALERT_EVENTS,
+        "target_url": "https://same.example",
+    }
+    session = FakeSession([
+        FakeResponse([existing]),
+    ])
+
+    alert = ensure_alert_subscription(
+        default_config,
+        "ASP668",
+        target_url="https://same.example",
+        session=session,
+    )
+
+    assert alert.target_url == "https://same.example"
+    assert len(session.calls) == 1
+    assert session.calls[0][0] == "GET"
+
+
 def test_configure_test_alerts_reuses_session(default_config):
     responses = [
         FakeResponse([]),
@@ -115,3 +172,27 @@ def test_configure_test_alerts_reuses_session(default_config):
 
     assert [alert.identifier for alert in alerts] == ["ASP501", "ASP653"]
     assert [call[0] for call in session.calls] == ["GET", "POST", "GET", "POST"]
+
+
+def test_set_default_alert_endpoint_sends_payload(default_config):
+    session = FakeSession([
+        FakeResponse({"status": "ok"}),
+    ])
+
+    result = set_default_alert_endpoint(default_config, "https://alerts.example", session=session)
+
+    assert result == {"status": "ok"}
+    assert session.calls[0][0] == "PUT"
+    assert session.calls[0][1].endswith("/endpoint")
+    assert session.calls[0][3] == {"target_url": "https://alerts.example"}
+
+
+def test_delete_alert_subscription_invokes_delete(default_config):
+    session = FakeSession([
+        FakeResponse({}, 204),
+    ])
+
+    delete_alert_subscription(default_config, "alert-1", session=session)
+
+    assert session.calls[0][0] == "DELETE"
+    assert session.calls[0][1].endswith("/alert-1")
