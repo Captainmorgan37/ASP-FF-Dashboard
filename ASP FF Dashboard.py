@@ -1235,7 +1235,15 @@ def _parse_time_token_to_utc(time_token: str, base_date_utc: datetime) -> dateti
         dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        dt_utc = dt.astimezone(timezone.utc)
+        if base_date_utc is not None:
+            base_utc = base_date_utc.astimezone(timezone.utc)
+            delta = dt_utc - base_utc
+            if delta > timedelta(hours=12):
+                dt_utc -= timedelta(days=1)
+            elif delta < -timedelta(hours=12):
+                dt_utc += timedelta(days=1)
+        return dt_utc
     except Exception:
         return None
 
@@ -1384,6 +1392,8 @@ def choose_booking_for_event(
     event_dt_utc: datetime | None,
 ) -> pd.Series | None:
     cand = df_clean.copy()
+    total_len = len(cand)
+    route_filter_hit = False
     if tails_dashed:
         cand = cand[cand["Aircraft"].isin(tails_dashed)]  # CSV is dashed
         if cand.empty:
@@ -1394,6 +1404,7 @@ def choose_booking_for_event(
     raw_to   = (subj_info.get("to_airport") or "").strip().upper()
 
     def match_token(cdf, col_iata, col_icao, token):
+        nonlocal route_filter_hit
         token_norm = (token or "").strip().upper()
         if not token_norm:
             return cdf
@@ -1423,27 +1434,32 @@ def choose_booking_for_event(
                 & (icao_series.str[1:] == tok_iata)
             )
             if derived_mask.any():
+                route_filter_hit = True
                 return cdf[derived_mask]
 
             mapped_icao = IATA_TO_ICAO_MAP.get(tok_iata)
             if mapped_icao:
                 mapped_mask = icao_series == mapped_icao
                 if mapped_mask.any():
+                    route_filter_hit = True
                     return cdf[mapped_mask]
 
             iata_mask = iata_series == tok_iata
             if iata_mask.any():
+                route_filter_hit = True
                 return cdf[iata_mask]
 
         if tok_icao:
             icao_mask = icao_series == tok_icao
             if icao_mask.any():
+                route_filter_hit = True
                 return cdf[icao_mask]
 
             mapped_iata = ICAO_TO_IATA_MAP.get(tok_icao)
             if mapped_iata:
                 mapped_mask = iata_series == mapped_iata
                 if mapped_mask.any():
+                    route_filter_hit = True
                     return cdf[mapped_mask]
 
         return cdf.iloc[0:0]
@@ -1489,8 +1505,10 @@ def choose_booking_for_event(
 
     if event_dt_utc is None:
         cand = cand.sort_values(sched_col)
-        best = cand.iloc[0]
-        return best.drop(labels=["Δ"]) if "Δ" in best else best
+        if len(cand) == 1:
+            best = cand.iloc[0]
+            return best.drop(labels=["Δ"]) if "Δ" in best else best
+        return None
 
     cand["Δ"] = (cand[sched_col] - event_dt_utc).abs()
     cand = cand.sort_values("Δ")
@@ -1501,7 +1519,10 @@ def choose_booking_for_event(
     if pd.notna(best_delta) and best_delta <= MAX_WINDOW:
         return best.drop(labels=["Δ"]) if "Δ" in best else best
 
-    if len(cand) == 1:
+    if len(cand) == 1 and (
+        event_dt_utc is None
+        or pd.isna(best_delta)
+    ):
         return best.drop(labels=["Δ"]) if "Δ" in best else best
 
     return None
@@ -3132,6 +3153,13 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                         or subj_info.get("actual_time_utc")
                         or hdr_dt
                     )
+                    actual_dt_utc = (
+                        body_info.get("dep_time_utc")
+                        or subj_info.get("actual_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                        or now_utc
+                    )
                 elif event == "Arrival":
                     match_dt_utc = (
                         body_info.get("arr_time_utc")
@@ -3139,12 +3167,43 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                         or subj_info.get("actual_time_utc")
                         or hdr_dt
                     )
+                    actual_dt_utc = (
+                        body_info.get("arr_time_utc")
+                        or subj_info.get("actual_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                        or now_utc
+                    )
+                elif event == "ArrivalForecast":
+                    match_dt_utc = (
+                        body_info.get("eta_time_utc")
+                        or explicit_dt
+                        or subj_info.get("actual_time_utc")
+                        or hdr_dt
+                    )
+                    actual_dt_utc = (
+                        body_info.get("eta_time_utc")
+                        or subj_info.get("actual_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                        or now_utc
+                    )
                 elif event == "EDCT":
                     match_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt
+                    actual_dt_utc = (
+                        edct_info.get("edct_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                        or now_utc
+                    )
                 else:
                     match_dt_utc = explicit_dt or subj_info.get("actual_time_utc") or hdr_dt
-
-                actual_dt_utc = match_dt_utc or now_utc
+                    actual_dt_utc = (
+                        subj_info.get("actual_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                        or now_utc
+                    )
 
                 # --- dashed tails (literal + ASP mapped)
                 tails_dashed = []
