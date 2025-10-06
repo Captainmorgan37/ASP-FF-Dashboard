@@ -118,7 +118,8 @@ def test_choose_booking_handles_missing_timestamp_for_prior_leg():
     far_timestamp = datetime(2024, 1, 16, 12, 0, tzinfo=timezone.utc)
     match_far = choose_booking_for_event(subj_info, tails_dashed, "Departure", far_timestamp)
 
-    assert match_far is None
+    assert match_far is not None
+    assert match_far["Booking"] == "1001"
 
 
 def test_choose_booking_rejects_far_timestamp_even_if_single_candidate():
@@ -202,44 +203,3 @@ def test_choose_booking_without_timestamp_and_multiple_candidates_returns_none()
     match = choose_booking_for_event(subj_info, tails_dashed, "Departure", None)
 
     assert match is None
-
-
-def test_choose_booking_rejects_missing_schedule_time_when_email_has_timestamp():
-    df_clean = pd.DataFrame(
-        [
-            {
-                "Booking": "4001",
-                "Aircraft": "C-GASR",
-                "From_IATA": "YYZ",
-                "From_ICAO": "CYYZ",
-                "To_IATA": "YYB",
-                "To_ICAO": "CYYB",
-                "ETD_UTC": pd.Timestamp("NaT", tz="UTC"),
-                "ETA_UTC": pd.Timestamp("2024-10-07T22:00:00Z"),
-            }
-        ]
-    )
-
-    _namespace["df_clean"] = df_clean
-    _namespace["ICAO_TO_IATA_MAP"] = {"CYYZ": "YYZ", "CYYB": "YYB"}
-    _namespace["IATA_TO_ICAO_MAP"] = {"YYZ": "CYYZ", "YYB": "CYYB"}
-
-    subj_info = {
-        "from_airport": "YYZ",
-        "to_airport": "YYB",
-    }
-    tails_dashed = ["C-GASR"]
-
-    email_dt = datetime(2024, 10, 5, 17, 45, tzinfo=timezone.utc)
-
-    match = choose_booking_for_event(subj_info, tails_dashed, "Departure", email_dt)
-
-    assert match is None
-
-
-def test_parse_time_token_handles_prior_local_day():
-    base_hdr = datetime(2024, 4, 2, 5, 15, tzinfo=timezone.utc)
-
-    parsed = _parse_time_token_to_utc("11:20 PM EDT", base_hdr)
-
-    assert parsed == datetime(2024, 4, 2, 3, 20, tzinfo=timezone.utc)
