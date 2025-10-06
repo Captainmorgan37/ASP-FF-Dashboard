@@ -10,10 +10,42 @@ so updating the tests alone will not surface a visible change in the dashboard.
 * `flightaware_alerts.py` centralises all outbound calls to the AeroAPI Alerts
   endpoint. The module accepts a `FlightAwareApiConfig` that determines the base
   URL, headers, and timeout behaviour for every request, and provides helpers
-  for listing, creating, and updating alert subscriptions.【F:flightaware_alerts.py†L10-L145】
+  for listing, creating, and updating alert subscriptions.【F:flightaware_alerts.py†L10-L199】
 * `tests/test_flightaware_alerts.py` verifies the behaviour of the alert helper
   functions by faking HTTP sessions. Updating the tests exercises the Python
   client logic only; no Streamlit components are touched.【F:tests/test_flightaware_alerts.py†L1-L103】
+
+### Exact HTTP traffic
+
+* When the Streamlit toggle **Use FlightAware AeroAPI for status updates** is
+  enabled **and** credentials are provided, the dashboard performs a `GET`
+  request to `/flights/{ident}` for each aircraft tail on the current schedule
+  in order to hydrate departure/arrival events.【F:ASP FF Dashboard.py†L2132-L2195】【F:flightaware_status.py†L39-L92】
+* The application does **not** invoke any alert endpoints today. The only code
+  that exercises `/alerts`, `PUT /alerts/{id}`, or related routes lives in the
+  reusable helpers and their unit tests; they are not executed by the
+  Streamlit runtime.【F:ASP FF Dashboard.py†L2132-L2195】【F:flightaware_alerts.py†L85-L199】
+* As shipped, there are therefore no AeroAPI calls at all unless the dashboard
+  operator opts into the status fetch toggle or imports the helpers in an
+  external automation.
+
+To meet a “alerts only” requirement you can leave the toggle disabled (this is
+the default unless the operator explicitly turns it on) and rely on FlightAware
+alert deliveries via IMAP, or wire the alert helpers into your own provisioning
+script. The repository now ships with a dedicated CLI wrapper,
+`tools/flightaware_alert_manager.py`, to make that setup straightforward. It
+exposes `list`, `ensure`, `set-endpoint`, and `delete` sub-commands that call the
+existing helper functions and can operate against either the live AeroAPI
+service or a JSON-backed sandbox for experimentation.【F:tools/flightaware_alert_manager.py†L1-L230】
+
+* `python tools/flightaware_alert_manager.py --sandbox sandbox.json ensure N556FF`
+  seeds alerts in a local file without touching the network. The sandbox stores
+  the default endpoint and alert payloads so you can iterate safely before
+  copying the configuration into production.【F:tools/flightaware_alert_manager.py†L59-L164】
+* `python tools/flightaware_alert_manager.py --api-key <KEY> set-endpoint https://example/app`
+  performs the required `PUT /alerts/endpoint` call. Subsequent `ensure`
+  commands create or update tail-specific alerts (including optional
+  `--target-url` overrides) using the same API key.【F:tools/flightaware_alert_manager.py†L166-L215】
 
 ## Updating FlightAware Behaviour
 
