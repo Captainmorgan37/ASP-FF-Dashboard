@@ -1503,6 +1503,11 @@ def choose_booking_for_event(
 
     cand = cand.copy()
 
+    if event_dt_utc is not None:
+        cand = cand[cand[sched_col].notna()].copy()
+        if cand.empty:
+            return None
+
     if event_dt_utc is None:
         cand = cand.sort_values(sched_col)
         if len(cand) == 1:
@@ -1516,8 +1521,17 @@ def choose_booking_for_event(
     MAX_WINDOW = pd.Timedelta(hours=12) if event == "Diversion" else pd.Timedelta(hours=3)
     best = cand.iloc[0]
     best_delta = best.get("Δ")
+
+    def _strip_delta(row: pd.Series) -> pd.Series:
+        return row.drop(labels=["Δ"]) if "Δ" in row else row
+
     if pd.notna(best_delta) and best_delta <= MAX_WINDOW:
-        return best.drop(labels=["Δ"]) if "Δ" in best else best
+        return _strip_delta(best)
+
+    if pd.isna(best_delta):
+        if event_dt_utc is None:
+            return _strip_delta(best)
+        return None
 
     if len(cand) == 1 and (
         event_dt_utc is None
