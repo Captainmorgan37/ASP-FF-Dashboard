@@ -1,9 +1,9 @@
 import pytest
 
-from foreflight_alerts import (
+from flightaware_alerts import (
     DEFAULT_FLIGHT_ALERT_EVENTS,
-    ForeFlightAlert,
-    ForeFlightApiConfig,
+    FlightAwareAlert,
+    FlightAwareApiConfig,
     configure_test_alerts,
     ensure_alert_subscription,
     list_alerts,
@@ -51,13 +51,13 @@ class FakeSession:
 
 @pytest.fixture
 def default_config():
-    return ForeFlightApiConfig(api_key="demo-key")
+    return FlightAwareApiConfig(api_key="demo-key")
 
 
 def test_list_alerts_normalises_various_payloads(default_config):
     payload = {
         "items": [
-            {"id": "1", "identifier": "ASP501", "events": ["OUT", "OFF"]},
+            {"id": "1", "ident": "ASP501", "events": ["OUT", "OFF"]},
             {"uuid": "2", "tail": "ASP653", "events": ["ON", "IN"]},
         ]
     }
@@ -73,7 +73,7 @@ def test_list_alerts_normalises_various_payloads(default_config):
 def test_ensure_alert_subscription_creates_new_alert(default_config):
     session = FakeSession([
         FakeResponse([]),  # list existing alerts
-        FakeResponse({"id": "abc", "identifier": "ASP556", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
+        FakeResponse({"id": "abc", "ident": "ASP556", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
     ])
 
     alert = ensure_alert_subscription(default_config, "ASP556", session=session)
@@ -83,15 +83,16 @@ def test_ensure_alert_subscription_creates_new_alert(default_config):
 
     assert session.calls[0][0] == "GET"
     assert session.calls[1][0] == "POST"
-    assert session.calls[1][3]["identifier"] == "ASP556"
+    assert session.calls[1][3]["ident"] == "ASP556"
     assert session.calls[1][3]["events"] == DEFAULT_FLIGHT_ALERT_EVENTS
+    assert session.calls[1][2]["x-apikey"] == "demo-key"
 
 
 def test_ensure_alert_subscription_updates_existing_when_events_differ(default_config):
-    existing = {"id": "alert-1", "identifier": "ASP668", "events": ["out"]}
+    existing = {"id": "alert-1", "ident": "ASP668", "events": ["out"]}
     session = FakeSession([
         FakeResponse([existing]),  # list existing alerts
-        FakeResponse({"id": "alert-1", "identifier": "ASP668", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
+        FakeResponse({"id": "alert-1", "ident": "ASP668", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
     ])
 
     alert = ensure_alert_subscription(default_config, "ASP668", session=session)
@@ -104,9 +105,9 @@ def test_ensure_alert_subscription_updates_existing_when_events_differ(default_c
 def test_configure_test_alerts_reuses_session(default_config):
     responses = [
         FakeResponse([]),
-        FakeResponse({"id": "1", "identifier": "ASP501", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
+        FakeResponse({"id": "1", "ident": "ASP501", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
         FakeResponse([]),
-        FakeResponse({"id": "2", "identifier": "ASP653", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
+        FakeResponse({"id": "2", "ident": "ASP653", "events": DEFAULT_FLIGHT_ALERT_EVENTS}),
     ]
     session = FakeSession(responses)
 
