@@ -1522,6 +1522,8 @@ def choose_booking_for_event(
     if len(cand) == 1 and (
         event_dt_utc is None
         or pd.isna(best_delta)
+        or route_filter_hit
+        or total_len == 1
     ):
         return best.drop(labels=["Δ"]) if "Δ" in best else best
 
