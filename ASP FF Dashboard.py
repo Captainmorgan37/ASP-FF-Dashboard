@@ -1235,7 +1235,15 @@ def _parse_time_token_to_utc(time_token: str, base_date_utc: datetime) -> dateti
         dt = dateparse.parse(s, fuzzy=True, tzinfos=TZINFOS)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        dt_utc = dt.astimezone(timezone.utc)
+        if base_date_utc is not None:
+            base_utc = base_date_utc.astimezone(timezone.utc)
+            delta = dt_utc - base_utc
+            if delta > timedelta(hours=12):
+                dt_utc -= timedelta(days=1)
+            elif delta < -timedelta(hours=12):
+                dt_utc += timedelta(days=1)
+        return dt_utc
     except Exception:
         return None
 

@@ -1,8 +1,10 @@
 import ast
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
+from dateutil import parser as dateparse
+from dateutil.tz import tzoffset
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ASP FF Dashboard.py"
 
@@ -12,6 +14,7 @@ _DEF_NAMES = {
     "derive_iata_from_icao",
     "_airport_token_variants",
     "choose_booking_for_event",
+    "_parse_time_token_to_utc",
 }
 
 
@@ -34,6 +37,22 @@ if missing:
 _namespace: dict[str, object] = {
     "pd": pd,
     "datetime": datetime,
+    "timezone": timezone,
+    "timedelta": timedelta,
+    "dateparse": dateparse,
+    "tzoffset": tzoffset,
+    "TZINFOS": {
+        "UTC": tzoffset("UTC", 0),
+        "GMT": tzoffset("GMT", 0),
+        "EST": tzoffset("EST", -5 * 3600),
+        "EDT": tzoffset("EDT", -4 * 3600),
+        "CST": tzoffset("CST", -6 * 3600),
+        "CDT": tzoffset("CDT", -5 * 3600),
+        "MST": tzoffset("MST", -7 * 3600),
+        "MDT": tzoffset("MDT", -6 * 3600),
+        "PST": tzoffset("PST", -8 * 3600),
+        "PDT": tzoffset("PDT", -7 * 3600),
+    },
     "ICAO_TO_IATA_MAP": {},
     "IATA_TO_ICAO_MAP": {},
 }
@@ -45,12 +64,14 @@ exec(
             "derive_iata_from_icao",
             "_airport_token_variants",
             "choose_booking_for_event",
+            "_parse_time_token_to_utc",
         ]
     ),
     _namespace,
 )
 
 choose_booking_for_event = _namespace["choose_booking_for_event"]
+_parse_time_token_to_utc = _namespace["_parse_time_token_to_utc"]
 
 
 def test_choose_booking_handles_missing_timestamp_for_prior_leg():
