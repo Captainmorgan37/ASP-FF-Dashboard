@@ -4083,10 +4083,13 @@ IMAP_USER = st.secrets.get("IMAP_USER")
 IMAP_PASS = st.secrets.get("IMAP_PASS")
 IMAP_FOLDER = st.secrets.get("IMAP_FOLDER", "INBOX")
 IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., alerts@flightaware.com
+IMAP_EDCT_ONLY_DEFAULT = (
+    str(st.secrets.get("IMAP_EDCT_ONLY", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+)
 
 
 # 2) Define the polling function BEFORE the UI uses it
-def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
+def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: bool = False) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
 
@@ -4165,6 +4168,10 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 body_info = parse_body_firstline(event, body, hdr_dt or now_utc)
                 edct_info = parse_body_edct(body)
 
+                if edct_only and event not in {None, "EDCT"}:
+                    set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
+                    continue
+
                 if event == "Diversion":
                     if body_info.get("from"):
                         subj_info.setdefault("from_airport", body_info["from"])
@@ -4174,6 +4181,10 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False) -> int:
                 # EDCT normalization
                 if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
                     event = "EDCT"
+
+                if edct_only and event != "EDCT":
+                    set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
+                    continue
 
                 # Choose timestamps
                 match_dt_utc = None
@@ -4388,15 +4399,22 @@ if enable_poll:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
                 st.success("IMAP cursor reset to 0 (statuses preserved).")
 
+        imap_edct_only = st.checkbox(
+            "Only process EDCT emails",
+            value=IMAP_EDCT_ONLY_DEFAULT,
+            key="imap_edct_only",
+            help="Ignore Departure/Arrival alerts and only process EDCT-specific messages.",
+        )
+
         max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
 
         if st.button("Poll now", key="poll_now"):
-            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
+            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll, edct_only=imap_edct_only)
             st.success(f"Applied {applied} update(s) from mailbox.")
 
         if poll_on_refresh:
             try:
-                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
+                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll, edct_only=imap_edct_only)
                 if applied:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
