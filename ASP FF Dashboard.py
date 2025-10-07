@@ -8,6 +8,7 @@ import imaplib, email
 from collections.abc import Mapping
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -18,6 +19,13 @@ from pathlib import Path
 import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 import requests
+
+try:
+    import boto3
+    from boto3.dynamodb.conditions import Key
+except ImportError:  # pragma: no cover - optional dependency
+    boto3 = None
+    Key = None
 
 from data_sources import ScheduleSource, load_schedule
 from fl3xx_client import (
@@ -346,6 +354,172 @@ def build_flightaware_status_config() -> FlightAwareStatusConfig | None:
         verify_ssl=verify,
         timeout=timeout,
     )
+
+
+def build_flightaware_webhook_config() -> dict[str, Any] | None:
+    """Read the DynamoDB webhook configuration from Streamlit secrets."""
+
+    if boto3 is None or Key is None:
+        return None
+
+    region = (
+        st.secrets.get("AWS_REGION")
+        or st.secrets.get("aws_region")
+        or os.getenv("AWS_REGION")
+    )
+    if not region:
+        return None
+
+    table_name = (
+        st.secrets.get("FLIGHTAWARE_ALERTS_TABLE")
+        or st.secrets.get("flightaware_alerts_table")
+        or os.getenv("FLIGHTAWARE_ALERTS_TABLE")
+        or "fa-oooi-alerts"
+    )
+
+    access_key = (
+        st.secrets.get("AWS_ACCESS_KEY_ID")
+        or st.secrets.get("aws_access_key_id")
+        or os.getenv("AWS_ACCESS_KEY_ID")
+    )
+    secret_key = (
+        st.secrets.get("AWS_SECRET_ACCESS_KEY")
+        or st.secrets.get("aws_secret_access_key")
+        or os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
+    session_token = (
+        st.secrets.get("AWS_SESSION_TOKEN")
+        or st.secrets.get("aws_session_token")
+        or os.getenv("AWS_SESSION_TOKEN")
+    )
+
+    per_ident_val = (
+        st.secrets.get("FLIGHTAWARE_ALERTS_PER_IDENT")
+        or st.secrets.get("flightaware_alerts_per_ident")
+        or os.getenv("FLIGHTAWARE_ALERTS_PER_IDENT")
+    )
+    try:
+        per_ident = int(per_ident_val) if per_ident_val is not None else 25
+    except (TypeError, ValueError):
+        per_ident = 25
+
+    cache_ttl_val = (
+        st.secrets.get("FLIGHTAWARE_ALERTS_CACHE_TTL")
+        or st.secrets.get("flightaware_alerts_cache_ttl")
+        or os.getenv("FLIGHTAWARE_ALERTS_CACHE_TTL")
+    )
+    try:
+        cache_ttl = int(cache_ttl_val) if cache_ttl_val is not None else 20
+    except (TypeError, ValueError):
+        cache_ttl = 20
+
+    return {
+        "region": str(region),
+        "table_name": str(table_name),
+        "access_key": str(access_key) if access_key else None,
+        "secret_key": str(secret_key) if secret_key else None,
+        "session_token": str(session_token) if session_token else None,
+        "per_ident": per_ident,
+        "cache_ttl": cache_ttl,
+    }
+
+
+def _coerce_dynamodb_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        try:
+            integral = value.to_integral_value()
+        except Exception:
+            integral = None
+        if integral is not None and integral == value:
+            return int(integral)
+        return float(value)
+    if isinstance(value, list):
+        return [_coerce_dynamodb_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _coerce_dynamodb_value(v) for k, v in value.items()}
+    return value
+
+
+def _parse_dynamodb_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, Decimal):
+        value = float(value)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        return parse_any_dt_string_to_utc(value)
+    return None
+
+
+def fetch_flightaware_webhook_events(
+    idents: list[str],
+    config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Fetch recent FlightAware webhook alerts from DynamoDB for the provided idents."""
+
+    if not idents:
+        return []
+    if boto3 is None or Key is None:
+        raise RuntimeError("boto3 is required to fetch FlightAware webhook alerts")
+
+    cache = st.session_state.setdefault("_webhook_alert_cache", {})
+    cache_key = (tuple(sorted(idents)), config.get("table_name"))
+    ttl_seconds = int(config.get("cache_ttl", 20))
+    now = datetime.now(timezone.utc)
+    cached = cache.get(cache_key)
+    if cached:
+        fetched_at = cached.get("fetched_at")
+        if isinstance(fetched_at, datetime) and (now - fetched_at).total_seconds() <= ttl_seconds:
+            return cached.get("items", [])
+
+    session = boto3.Session(
+        aws_access_key_id=config.get("access_key"),
+        aws_secret_access_key=config.get("secret_key"),
+        aws_session_token=config.get("session_token"),
+        region_name=config.get("region"),
+    )
+    table = session.resource("dynamodb").Table(str(config.get("table_name")))
+
+    per_ident = int(config.get("per_ident", 25))
+    rows: list[dict[str, Any]] = []
+
+    for ident in idents:
+        ident_clean = str(ident or "").strip()
+        if not ident_clean:
+            continue
+        try:
+            resp = table.query(
+                KeyConditionExpression=Key("ident").eq(ident_clean),
+                ScanIndexForward=False,
+                Limit=per_ident,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"DynamoDB query failed for ident {ident_clean}: {exc}") from exc
+
+        for item in resp.get("Items", []):
+            normalised = {str(k): _coerce_dynamodb_value(v) for k, v in item.items()}
+            normalised.setdefault("ident", ident_clean)
+            normalised.setdefault("received_at", normalised.get("received_at") or normalised.get("timestamp"))
+            event_dt = None
+            for key in ("source_ts", "event_time", "event_ts", "eventTime", "occurred_at", "received_at"):
+                event_dt = _parse_dynamodb_timestamp(normalised.get(key))
+                if event_dt:
+                    break
+            normalised["_event_dt"] = event_dt
+            rows.append(normalised)
+
+    rows.sort(key=lambda rec: rec.get("_event_dt") or datetime.min)
+
+    cache[cache_key] = {"fetched_at": now, "items": rows}
+    return rows
 
 
 def fetch_aeroapi_status_updates(
@@ -1824,6 +1998,161 @@ def tail_from_asp(text: str) -> list[str]:
         if t:
             tails.append(t)
     return sorted(set(tails))
+
+
+def _normalise_tail_token(value: Any) -> str:
+    token = str(value or "").strip().upper()
+    if not token:
+        return ""
+    token = token.replace(" ", "")
+    if "-" in token:
+        return token
+    if token.startswith("C") and len(token) >= 4:
+        return token[:2] + "-" + token[2:]
+    return token
+
+
+IDENT_TO_TAIL_MAP: dict[str, str] = {}
+TAIL_TO_ASP_MAP: dict[str, str] = {}
+for ident, tail in ASP_MAP.items():
+    tail_norm = _normalise_tail_token(tail)
+    if not tail_norm:
+        continue
+    ident_norm = ident.strip().upper()
+    IDENT_TO_TAIL_MAP[ident_norm] = tail_norm
+    TAIL_TO_ASP_MAP.setdefault(tail_norm, ident_norm)
+    TAIL_TO_ASP_MAP.setdefault(tail_norm.replace("-", ""), ident_norm)
+
+
+def collect_active_webhook_idents(frame: pd.DataFrame) -> list[str]:
+    if frame.empty:
+        return []
+    idents: set[str] = set()
+    aircraft_series = frame.get("Aircraft")
+    if aircraft_series is None:
+        return []
+    for value in aircraft_series.fillna(""):
+        tail_norm = _normalise_tail_token(value)
+        if not tail_norm:
+            continue
+        ident = TAIL_TO_ASP_MAP.get(tail_norm) or TAIL_TO_ASP_MAP.get(tail_norm.replace("-", ""))
+        if ident:
+            idents.add(ident)
+    return sorted(idents)
+
+
+WEBHOOK_EVENT_MAP = {
+    "out": "Departure",
+    "off": "Departure",
+    "departure": "Departure",
+    "takeoff": "Departure",
+    "on": "Arrival",
+    "in": "Arrival",
+    "arrival": "Arrival",
+    "landed": "Arrival",
+}
+
+
+def _normalise_airport_code(value: Any) -> str | None:
+    token = str(value or "").strip().upper()
+    return token or None
+
+
+def apply_flightaware_webhook_updates(
+    records: list[dict[str, Any]],
+    *,
+    events_map: dict[str, dict[str, dict[str, Any]]],
+) -> int:
+    if not records:
+        return 0
+
+    applied = 0
+    for record in records:
+        raw_event = str(record.get("event") or record.get("event_type") or "").strip().lower()
+        event_type = WEBHOOK_EVENT_MAP.get(raw_event)
+        if not event_type:
+            continue
+
+        event_dt = record.get("_event_dt")
+        if not isinstance(event_dt, datetime):
+            continue
+
+        ident = str(record.get("ident") or record.get("identifier") or "").strip().upper()
+
+        tail_candidates: list[str] = []
+        raw_tail = record.get("aircraft") or record.get("tail") or record.get("registration")
+        tail_norm = _normalise_tail_token(raw_tail)
+        if tail_norm:
+            tail_candidates.append(tail_norm)
+        if ident:
+            mapped_tail = IDENT_TO_TAIL_MAP.get(ident)
+            if mapped_tail:
+                tail_candidates.append(mapped_tail)
+
+        tail_candidates = sorted({t for t in tail_candidates if t})
+
+        origin = _normalise_airport_code(
+            record.get("origin")
+            or record.get("from")
+            or record.get("departure")
+            or record.get("from_airport")
+        )
+        destination = _normalise_airport_code(
+            record.get("destination")
+            or record.get("to")
+            or record.get("arrival")
+            or record.get("to_airport")
+        )
+
+        subj_info = {
+            "event_type": event_type,
+            "tail": tail_candidates[0] if tail_candidates else None,
+            "from_airport": origin,
+            "to_airport": destination,
+            "at_airport": destination,
+        }
+
+        match_row = choose_booking_for_event(subj_info, tail_candidates, event_type, event_dt)
+        if match_row is None:
+            continue
+
+        booking = str(match_row.get("Booking") or "")
+        leg_key = str(match_row.get("_LegKey") or booking)
+        if not leg_key:
+            continue
+
+        existing_payload = events_map.get(leg_key, {}).get(event_type)
+        if existing_payload:
+            existing_dt = parse_iso_to_utc(existing_payload.get("actual_time_utc"))
+            if existing_dt and existing_dt >= event_dt:
+                continue
+
+        if event_type == "Arrival":
+            sched_raw = match_row.get("ETA_UTC")
+        else:
+            sched_raw = match_row.get("ETD_UTC")
+        sched_dt = _clean_schedule_ts(sched_raw)
+        delta_min = None
+        if sched_dt is not None:
+            delta_min = int(round((event_dt - sched_dt).total_seconds() / 60.0))
+
+        status_label = "🟣 ARRIVED" if event_type == "Arrival" else "🟢 DEPARTED"
+
+        payload = {
+            "status": status_label,
+            "actual_time_utc": event_dt.isoformat(),
+            "delta_min": delta_min,
+            "source": "webhook",
+            "ident": ident or None,
+            "raw_event": raw_event,
+            "received_at": record.get("received_at"),
+        }
+
+        events_map.setdefault(leg_key, {})[event_type] = payload
+        upsert_status(leg_key, event_type, status_label, payload["actual_time_utc"], delta_min)
+        applied += 1
+
+    return applied
 # ---------------------------------------------------------------------------
 
 
@@ -2161,6 +2490,26 @@ if use_flightaware_api:
 
 api_mode_active = bool(use_flightaware_api and flightaware_config and api_error is None)
 
+webhook_status_placeholder = st.empty()
+webhook_config = build_flightaware_webhook_config()
+default_use_webhook = st.session_state.get("use_flightaware_webhook")
+if default_use_webhook is None:
+    default_use_webhook = bool(webhook_config)
+
+use_webhook_alerts = False
+if webhook_config:
+    use_webhook_alerts = st.checkbox(
+        "Use FlightAware webhook alerts (DynamoDB)",
+        value=bool(default_use_webhook),
+        help=(
+            "Apply recent OOOI webhook events stored in DynamoDB. "
+            "Configure AWS credentials and the DynamoDB table in Streamlit secrets."
+        ),
+    )
+    st.session_state["use_flightaware_webhook"] = use_webhook_alerts
+else:
+    st.session_state["use_flightaware_webhook"] = False
+
 # ============================
 # Email-driven status + enrich FA/EDCT times
 # ============================
@@ -2190,6 +2539,28 @@ if api_mode_active:
         api_status_placeholder.info(f"FlightAware AeroAPI applied {applied_events} update(s).")
     else:
         api_status_placeholder.caption("FlightAware AeroAPI returned no new updates for the current schedule.")
+
+if use_webhook_alerts and webhook_config:
+    webhook_idents = collect_active_webhook_idents(df_clean)
+    if webhook_idents:
+        try:
+            webhook_records = fetch_flightaware_webhook_events(webhook_idents, webhook_config)
+            applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
+        except Exception as exc:
+            webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
+        else:
+            if applied_webhook:
+                webhook_status_placeholder.info(
+                    f"FlightAware webhook applied {applied_webhook} update(s)."
+                )
+            else:
+                webhook_status_placeholder.caption(
+                    "FlightAware webhook returned no new updates for the current schedule."
+                )
+    else:
+        webhook_status_placeholder.caption(
+            "FlightAware webhook has no mapped ASP callsigns for the current schedule."
+        )
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
     rec = events_map.get(leg_key)
