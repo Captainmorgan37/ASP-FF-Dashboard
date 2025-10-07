@@ -78,6 +78,34 @@ additional UI plumbing is needed before any changes appear in the live dashboard
 
 ## AWS Webhook Ingestion Pipeline
 
+### Prerequisites for the Streamlit webhook toggle
+
+The Streamlit checkbox **“Use FlightAware webhook alerts (DynamoDB)”** only
+appears when the app can import `boto3` and read the required AWS settings. If
+you are running the dashboard locally and the toggle is missing, install the AWS
+SDK for Python before launching Streamlit:
+
+```bash
+python -m pip install --upgrade boto3
+```
+
+The package is already listed in `requirements.txt`, so alternatively you can
+install every dependency in one step:
+
+```bash
+python -m pip install --upgrade -r requirements.txt
+```
+
+After installing `boto3`, make sure the following secrets (or environment
+variables) are populated so that `build_flightaware_webhook_config()` succeeds:
+
+* `AWS_REGION`
+* `AWS_ACCESS_KEY_ID`
+* `AWS_SECRET_ACCESS_KEY`
+
+Launch the dashboard again and the webhook toggle will render when those values
+are available.
+
 The production FlightAware alerts are currently processed through a managed AWS
 pipeline that feeds the Streamlit dashboard. The high-level flow is:
 
