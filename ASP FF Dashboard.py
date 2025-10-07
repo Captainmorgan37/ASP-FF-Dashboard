@@ -2368,7 +2368,10 @@ def apply_flightaware_webhook_updates(
                 upsert_status(leg_key, event_type, status_label, payload["actual_time_utc"], delta_min)
                 applied += 1
 
-        if event_type == "Arrival" and forecast_dt is not None:
+        if forecast_dt is not None:
+            # Webhook payloads may include an ETA alongside departure or enroute events.
+            # Apply the forecast regardless of the triggering event type so the dashboard
+            # can surface the latest arrival estimate.
             existing_forecast = leg_events.get("ArrivalForecast")
             update_forecast = True
             if existing_forecast:
