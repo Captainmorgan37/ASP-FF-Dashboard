@@ -433,10 +433,22 @@ def _diag_flightaware_webhook() -> tuple[bool, str]:
     def _get_secret(key: str) -> str | None:
         candidates = (key, key.lower())
         for candidate in candidates:
+            value: Any | None = None
+            # Streamlit's Secrets object does not always expose ``.get`` (it behaves
+            # like a Mapping but omits some dict helpers), so try a few safe access
+            # patterns before giving up.
             try:
-                value = st.secrets.get(candidate)
+                getter = getattr(st.secrets, "get", None)
+                if callable(getter):  # pragma: no branch - simple attribute guard
+                    value = getter(candidate)
             except Exception:
                 value = None
+            if value is None:
+                try:
+                    if candidate in st.secrets:  # type: ignore[operator]
+                        value = st.secrets[candidate]
+                except Exception:
+                    value = None
             if value is not None and str(value).strip():
                 return str(value).strip()
         env_val = os.getenv(key)
