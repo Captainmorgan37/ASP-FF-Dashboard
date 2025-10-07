@@ -2254,6 +2254,9 @@ WEBHOOK_EVENT_MAP = {
     "in": "Arrival",
     "arrival": "Arrival",
     "landed": "Arrival",
+    "diverted": "Diversion",
+    "diversion": "Diversion",
+    "div": "Diversion",
 }
 
 
@@ -2361,7 +2364,7 @@ def apply_flightaware_webhook_updates(
 
         leg_events = events_map.setdefault(leg_key, {})
 
-        if event_type == "Arrival":
+        if event_type in ("Arrival", "Diversion"):
             sched_raw = match_row.get("ETA_UTC")
         else:
             sched_raw = match_row.get("ETD_UTC")
@@ -2378,7 +2381,13 @@ def apply_flightaware_webhook_updates(
                 if sched_dt is not None:
                     delta_min = int(round((event_dt - sched_dt).total_seconds() / 60.0))
 
-                status_label = "🟣 ARRIVED" if event_type == "Arrival" else "🟢 DEPARTED"
+                if event_type == "Arrival":
+                    status_label = "🟣 ARRIVED"
+                elif event_type == "Departure":
+                    status_label = "🟢 DEPARTED"
+                else:
+                    divert_display = destination or subj_info.get("to_airport") or "—"
+                    status_label = f"🔷 DIVERTED to {divert_display}"
 
                 payload = {
                     "status": status_label,
@@ -2389,6 +2398,9 @@ def apply_flightaware_webhook_updates(
                     "raw_event": raw_event,
                     "received_at": record.get("received_at"),
                 }
+
+                if event_type == "Diversion":
+                    payload["divert_to"] = divert_display
 
                 leg_events[event_type] = payload
                 upsert_status(leg_key, event_type, status_label, payload["actual_time_utc"], delta_min)
