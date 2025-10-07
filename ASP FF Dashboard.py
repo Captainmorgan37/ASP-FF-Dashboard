@@ -43,6 +43,31 @@ from flightaware_status import (
     fetch_flights_for_ident,
 )
 
+
+def _show_secrets_shape() -> None:
+    """Display which Streamlit secrets are available without revealing values."""
+
+    st.write("Top-level st.secrets keys:", list(st.secrets.keys()))
+
+    check: dict[str, str] = {}
+    for key in [
+        "AWS_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "FLIGHTAWARE_ALERTS_TABLE",
+    ]:
+        value = st.secrets.get(key)
+        check[key] = "present" if isinstance(value, str) and value.strip() else "missing/empty"
+
+    st.write("Presence check:", check)
+
+    for section in ["aws", "AWS", "flightaware", "secrets"]:
+        if section in st.secrets:
+            st.write(f"Found nested section [{section}] with keys:", list(st.secrets[section].keys()))
+
+
+_show_secrets_shape()
+
 # Global lookup maps populated after loading airport metadata. Define them early so
 # helper functions can reference the names during the initial Streamlit run.
 ICAO_TZ_MAP: dict[str, str] = {}
