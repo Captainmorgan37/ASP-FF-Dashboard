@@ -106,6 +106,12 @@ variables) are populated so that `build_flightaware_webhook_config()` succeeds:
 Launch the dashboard again and the webhook toggle will render when those values
 are available.
 
+#### Troubleshooting “Missing secrets”
+
+If the diagnostics panel still reports `Missing secrets: AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY`, it means the app could not read **non-empty** values for one or more of those keys. The `_resolve_secret()` helper trims whitespace and treats empty strings as “missing,” so the entries must be present either in `.streamlit/secrets.toml` or as environment variables with actual values. After updating secrets, restart the Streamlit app so that `st.secrets` is reloaded. Once the credentials are visible to the app, the warning will disappear; any subsequent issues (for example, IAM permission errors) will surface as a different DynamoDB connection error instead of the “Missing secrets” message.
+
+> **Security note:** Do not commit real credentials to the repository. A public GitHub project exposes every tracked file—including `.streamlit/secrets.toml`—to anyone who clones or forks it. Keep production secrets in a local, untracked `secrets.toml` (or inject them via environment variables in your deployment platform) and rely on placeholders or mocked values inside the repo.
+
 The production FlightAware alerts are currently processed through a managed AWS
 pipeline that feeds the Streamlit dashboard. The high-level flow is:
 
