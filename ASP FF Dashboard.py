@@ -2038,13 +2038,28 @@ def choose_booking_for_event(
             return _strip_delta(best)
         return None
 
-    if len(cand) == 1 and (
-        event_dt_utc is None
-        or pd.isna(best_delta)
-        or route_filter_hit
-        or total_len == 1
-    ):
-        return best.drop(labels=["Δ"]) if "Δ" in best else best
+    if len(cand) == 1:
+        # When the event timestamp is unknown (or cannot be compared) fall back
+        # to the lone candidate.  Otherwise require that the timestamp based
+        # distance check passed; relying solely on route/tail heuristics caused
+        # stale webhook events to be applied to future legs.
+        if event_dt_utc is None or pd.isna(best_delta):
+            return best.drop(labels=["Δ"]) if "Δ" in best else best
+
+        sched_val = best.get(sched_col)
+        sched_dt: datetime | None = None
+        if isinstance(sched_val, pd.Timestamp):
+            if pd.notna(sched_val):
+                sched_dt = sched_val.to_pydatetime()
+        elif isinstance(sched_val, datetime):
+            sched_dt = sched_val
+            if sched_dt.tzinfo is None:
+                sched_dt = sched_dt.replace(tzinfo=timezone.utc)
+
+        if route_filter_hit and sched_dt is not None and event_dt_utc >= sched_dt:
+            return best.drop(labels=["Δ"]) if "Δ" in best else best
+
+        return None
 
     return None
 
