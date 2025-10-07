@@ -2718,44 +2718,8 @@ df["Arrives In"] = (df["ETA_UTC"] - now_utc).apply(fmt_td)
 df_clean = df.copy()
 
 # ============================
-# FlightAware API integration
+# FlightAware webhook integration
 # ============================
-flightaware_config = build_flightaware_status_config()
-default_use_api = st.session_state.get("use_flightaware_api")
-if default_use_api is None:
-    default_use_api = bool(flightaware_config)
-
-use_flightaware_api = st.checkbox(
-    "Use FlightAware AeroAPI for status updates",
-    value=bool(default_use_api),
-    help=(
-        "Fetch recent FlightAware flight status directly from AeroAPI instead of relying on the "
-        "IMAP mailbox alerts."
-    ),
-)
-st.session_state["use_flightaware_api"] = use_flightaware_api
-
-api_status_placeholder = st.empty()
-api_updates: dict[str, dict[str, dict[str, object]]] = {}
-api_error: str | None = None
-
-if use_flightaware_api:
-    if not flightaware_config:
-        api_error = "Missing FLIGHTAWARE_API_KEY"
-        api_status_placeholder.warning(
-            "Configure `FLIGHTAWARE_API_KEY` (and optional base URL/headers) in Streamlit secrets to enable AeroAPI."
-        )
-        use_flightaware_api = False
-        st.session_state["use_flightaware_api"] = False
-    else:
-        try:
-            api_updates = fetch_aeroapi_status_updates(df, flightaware_config)
-        except Exception as exc:
-            api_error = str(exc)
-            api_status_placeholder.error(f"FlightAware API error: {exc}")
-            api_updates = {}
-
-api_mode_active = bool(use_flightaware_api and flightaware_config and api_error is None)
 
 webhook_status_placeholder = st.empty()
 webhook_diag_placeholder = st.empty()
@@ -2815,27 +2779,6 @@ if st.session_state.get("status_updates"):
     for key, upd in st.session_state["status_updates"].items():
         et = upd.get("type") or "Unknown"
         events_map.setdefault(key, {})[et] = upd
-
-if api_mode_active:
-    applied_events = 0
-    for leg_key, status_map in api_updates.items():
-        if not status_map:
-            continue
-        events_map.setdefault(leg_key, {})
-        for event_type, payload in status_map.items():
-            events_map[leg_key][event_type] = payload
-            upsert_status(
-                leg_key,
-                event_type,
-                payload.get("status"),
-                payload.get("actual_time_utc"),
-                payload.get("delta_min"),
-            )
-            applied_events += 1
-    if applied_events:
-        api_status_placeholder.info(f"FlightAware AeroAPI applied {applied_events} update(s).")
-    else:
-        api_status_placeholder.caption("FlightAware AeroAPI returned no new updates for the current schedule.")
 
 webhook_records: list[dict[str, Any]] = []
 webhook_fetch_error: str | None = None
@@ -4425,15 +4368,11 @@ if IMAP_SENDER:
 else:
     st.caption("IMAP filter: **From = ALL senders**")
 
-enable_poll = False
-if api_mode_active:
-    st.info("IMAP polling is disabled while FlightAware AeroAPI mode is active.")
-else:
-    enable_poll = st.checkbox(
-        "Enable IMAP polling",
-        value=False,
-        help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
-    )
+enable_poll = st.checkbox(
+    "Enable IMAP polling",
+    value=False,
+    help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
+)
 
 if enable_poll:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
