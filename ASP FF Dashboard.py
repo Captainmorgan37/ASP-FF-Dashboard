@@ -2733,35 +2733,36 @@ default_use_webhook = st.session_state.get("use_flightaware_webhook")
 if default_use_webhook is None:
     default_use_webhook = bool(webhook_config)
 
-use_webhook_alerts = False
-show_webhook_debug = False
 webhook_debug_default = st.session_state.get("show_webhook_debug")
 if webhook_debug_default is None:
     webhook_debug_default = False
 
-if webhook_config:
-    use_webhook_alerts = st.checkbox(
-        "Use FlightAware webhook alerts (DynamoDB)",
-        value=bool(default_use_webhook),
-        help=(
-            "Apply recent OOOI webhook events stored in DynamoDB. "
-            "Configure AWS credentials and the DynamoDB table in Streamlit secrets."
-        ),
-    )
-    st.session_state["use_flightaware_webhook"] = use_webhook_alerts
+use_webhook_alerts = st.checkbox(
+    "Use FlightAware webhook alerts (DynamoDB)",
+    value=bool(default_use_webhook),
+    help=(
+        "Apply recent OOOI webhook events stored in DynamoDB. "
+        "Configure AWS credentials and the DynamoDB table in Streamlit secrets."
+    ),
+)
+st.session_state["use_flightaware_webhook"] = use_webhook_alerts
 
-    show_webhook_debug = st.checkbox(
-        "Show FlightAware webhook diagnostics",
-        value=bool(webhook_debug_default),
-        help=(
-            "Display connection status, record counts, and recent webhook payloads "
-            "returned from DynamoDB."
-        ),
+show_webhook_debug = st.checkbox(
+    "Show FlightAware webhook diagnostics",
+    value=bool(webhook_debug_default),
+    help=(
+        "Display connection status, record counts, and recent webhook payloads "
+        "returned from DynamoDB."
+    ),
+)
+st.session_state["show_webhook_debug"] = show_webhook_debug
+
+if use_webhook_alerts and not webhook_config:
+    message = webhook_diag_msg or "Missing DynamoDB configuration for webhook alerts."
+    webhook_status_placeholder.error(
+        "FlightAware webhook integration is not configured: "
+        f"{message}"
     )
-    st.session_state["show_webhook_debug"] = show_webhook_debug
-else:
-    st.session_state["use_flightaware_webhook"] = False
-    st.session_state["show_webhook_debug"] = False
 
 # ============================
 # Email-driven status + enrich FA/EDCT times
