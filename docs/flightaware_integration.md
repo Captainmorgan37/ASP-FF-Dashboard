@@ -17,22 +17,19 @@ so updating the tests alone will not surface a visible change in the dashboard.
 
 ### Exact HTTP traffic
 
-* When the Streamlit toggle **Use FlightAware AeroAPI for status updates** is
-  enabled **and** credentials are provided, the dashboard performs a `GET`
-  request to `/flights/{ident}` for each aircraft tail on the current schedule
-  in order to hydrate departure/arrival events.【F:ASP FF Dashboard.py†L2132-L2195】【F:flightaware_status.py†L39-L92】
+* The Streamlit dashboard no longer issues direct AeroAPI requests for status
+  updates. Departure and arrival events are driven by IMAP e-mail alerts or the
+  optional DynamoDB webhook integration instead.【F:ASP FF Dashboard.py†L2693-L3114】
 * The application does **not** invoke any alert endpoints today. The only code
   that exercises `/alerts`, `PUT /alerts/{id}`, or related routes lives in the
   reusable helpers and their unit tests; they are not executed by the
-  Streamlit runtime.【F:ASP FF Dashboard.py†L2132-L2195】【F:flightaware_alerts.py†L85-L199】
-* As shipped, there are therefore no AeroAPI calls at all unless the dashboard
-  operator opts into the status fetch toggle or imports the helpers in an
-  external automation.
+  Streamlit runtime.【F:ASP FF Dashboard.py†L2693-L3114】【F:flightaware_alerts.py†L85-L199】
+* As shipped, AeroAPI calls only occur when you import the helpers in an
+  external automation or run the accompanying CLI tools.
 
-To meet a “alerts only” requirement you can leave the toggle disabled (this is
-the default unless the operator explicitly turns it on) and rely on FlightAware
-alert deliveries via IMAP, or wire the alert helpers into your own provisioning
-script. The repository now ships with a dedicated CLI wrapper,
+To meet a “alerts only” requirement you can rely on FlightAware alert deliveries
+via IMAP, leverage the webhook pipeline, or wire the alert helpers into your own
+provisioning script. The repository now ships with a dedicated CLI wrapper,
 `tools/flightaware_alert_manager.py`, to make that setup straightforward. It
 exposes `list`, `ensure`, `set-endpoint`, and `delete` sub-commands that call the
 existing helper functions and can operate against either the live AeroAPI
@@ -53,12 +50,13 @@ service or a JSON-backed sandbox for experimentation.【F:tools/flightaware_aler
   headers or adjust the subscription payload), modify the functions in
   `flightaware_alerts.py` and extend the related tests to cover the new
   behaviour.【F:flightaware_alerts.py†L94-L199】【F:tests/test_flightaware_alerts.py†L44-L103】
-* The Streamlit UI currently consumes FlightAware data indirectly from e-mail by
-  connecting to the configured IMAP mailbox (`IMAP_SENDER` and related secrets).
-  Because the UI does not yet call the AeroAPI helpers, changing those helpers
-  will not immediately alter what appears on screen. To wire the API into the
-  dashboard you would import `flightaware_alerts` inside `ASP FF Dashboard.py`
-  and replace or augment the existing IMAP processing logic.【F:ASP FF Dashboard.py†L1-L210】【F:ASP FF Dashboard.py†L3006-L3099】
+* The Streamlit UI consumes FlightAware data indirectly from e-mail by
+  connecting to the configured IMAP mailbox (`IMAP_SENDER` and related secrets)
+  or via the DynamoDB webhook feed. Because the UI does not call the AeroAPI
+  helpers, changing those helpers will not immediately alter what appears on
+  screen. To wire the API into the dashboard you would import
+  `flightaware_status` or `flightaware_alerts` inside `ASP FF Dashboard.py` and
+  replace or augment the existing IMAP processing logic.【F:ASP FF Dashboard.py†L1-L210】【F:ASP FF Dashboard.py†L2693-L3114】
 
 ## Where to Update API Calls
 
