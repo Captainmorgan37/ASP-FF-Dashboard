@@ -2067,6 +2067,18 @@ def apply_flightaware_webhook_updates(
         return 0
 
     applied = 0
+
+    def _first_valid_dt(candidates: list[tuple[str, Any]]) -> tuple[datetime | None, str | None]:
+        for key, value in candidates:
+            if value is None:
+                continue
+            if isinstance(value, Mapping):
+                continue
+            dt = _parse_dynamodb_timestamp(value)
+            if dt:
+                return dt, key
+        return None, None
+
     for record in records:
         raw_event = str(record.get("event") or record.get("event_type") or "").strip().lower()
         event_type = WEBHOOK_EVENT_MAP.get(raw_event)
@@ -2075,7 +2087,7 @@ def apply_flightaware_webhook_updates(
 
         event_dt = record.get("_event_dt")
         if not isinstance(event_dt, datetime):
-            continue
+            event_dt = None
 
         ident = str(record.get("ident") or record.get("identifier") or "").strip().upper()
 
@@ -2112,7 +2124,29 @@ def apply_flightaware_webhook_updates(
             "at_airport": destination,
         }
 
-        match_row = choose_booking_for_event(subj_info, tail_candidates, event_type, event_dt)
+        forecast_candidates: list[tuple[str, Any]] = [
+            ("eta", record.get("eta")),
+            ("eta_ts", record.get("eta_ts")),
+            ("estimated_in", record.get("estimated_in")),
+            ("estimated_on", record.get("estimated_on")),
+        ]
+        raw_payload = record.get("raw") if isinstance(record.get("raw"), Mapping) else None
+        if isinstance(raw_payload, Mapping):
+            forecast_candidates.append(("raw.eta", raw_payload.get("eta")))
+            forecast_candidates.append(("raw.estimated_in", raw_payload.get("estimated_in")))
+            forecast_candidates.append(("raw.estimated_on", raw_payload.get("estimated_on")))
+            flight_payload = raw_payload.get("flight") if isinstance(raw_payload.get("flight"), Mapping) else None
+            if isinstance(flight_payload, Mapping):
+                for key in ("eta", "estimated_in", "estimated_on", "scheduled_in", "scheduled_on"):
+                    forecast_candidates.append((f"raw.flight.{key}", flight_payload.get(key)))
+        forecast_dt, forecast_source = _first_valid_dt(forecast_candidates)
+
+        match_dt = event_dt or forecast_dt
+        if match_dt is None and not tail_candidates and not origin and not destination:
+            # Without any timing or routing information we cannot reliably match a leg.
+            continue
+
+        match_row = choose_booking_for_event(subj_info, tail_candidates, event_type, match_dt)
         if match_row is None:
             continue
 
@@ -2121,36 +2155,73 @@ def apply_flightaware_webhook_updates(
         if not leg_key:
             continue
 
-        existing_payload = events_map.get(leg_key, {}).get(event_type)
-        if existing_payload:
-            existing_dt = parse_iso_to_utc(existing_payload.get("actual_time_utc"))
-            if existing_dt and existing_dt >= event_dt:
-                continue
+        leg_events = events_map.setdefault(leg_key, {})
 
         if event_type == "Arrival":
             sched_raw = match_row.get("ETA_UTC")
         else:
             sched_raw = match_row.get("ETD_UTC")
         sched_dt = _clean_schedule_ts(sched_raw)
-        delta_min = None
-        if sched_dt is not None:
-            delta_min = int(round((event_dt - sched_dt).total_seconds() / 60.0))
 
-        status_label = "🟣 ARRIVED" if event_type == "Arrival" else "🟢 DEPARTED"
+        if event_dt is not None:
+            existing_payload = leg_events.get(event_type)
+            if existing_payload:
+                existing_dt = parse_iso_to_utc(existing_payload.get("actual_time_utc"))
+                if existing_dt and existing_dt >= event_dt:
+                    event_dt = None
+            if event_dt is not None:
+                delta_min = None
+                if sched_dt is not None:
+                    delta_min = int(round((event_dt - sched_dt).total_seconds() / 60.0))
 
-        payload = {
-            "status": status_label,
-            "actual_time_utc": event_dt.isoformat(),
-            "delta_min": delta_min,
-            "source": "webhook",
-            "ident": ident or None,
-            "raw_event": raw_event,
-            "received_at": record.get("received_at"),
-        }
+                status_label = "🟣 ARRIVED" if event_type == "Arrival" else "🟢 DEPARTED"
 
-        events_map.setdefault(leg_key, {})[event_type] = payload
-        upsert_status(leg_key, event_type, status_label, payload["actual_time_utc"], delta_min)
-        applied += 1
+                payload = {
+                    "status": status_label,
+                    "actual_time_utc": event_dt.isoformat(),
+                    "delta_min": delta_min,
+                    "source": "webhook",
+                    "ident": ident or None,
+                    "raw_event": raw_event,
+                    "received_at": record.get("received_at"),
+                }
+
+                leg_events[event_type] = payload
+                upsert_status(leg_key, event_type, status_label, payload["actual_time_utc"], delta_min)
+                applied += 1
+
+        if event_type == "Arrival" and forecast_dt is not None:
+            existing_forecast = leg_events.get("ArrivalForecast")
+            update_forecast = True
+            if existing_forecast:
+                existing_dt = parse_iso_to_utc(existing_forecast.get("actual_time_utc"))
+                if existing_dt and existing_dt == forecast_dt:
+                    update_forecast = False
+            if update_forecast:
+                delta_min_forecast = None
+                if sched_dt is not None:
+                    delta_min_forecast = int(round((forecast_dt - sched_dt).total_seconds() / 60.0))
+
+                forecast_payload = {
+                    "status": "🟦 ARRIVING SOON",
+                    "actual_time_utc": forecast_dt.isoformat(),
+                    "delta_min": delta_min_forecast,
+                    "source": "webhook",
+                    "ident": ident or None,
+                    "raw_event": raw_event,
+                    "received_at": record.get("received_at"),
+                    "_forecast_source": forecast_source,
+                }
+
+                leg_events["ArrivalForecast"] = forecast_payload
+                upsert_status(
+                    leg_key,
+                    "ArrivalForecast",
+                    forecast_payload["status"],
+                    forecast_payload["actual_time_utc"],
+                    delta_min_forecast,
+                )
+                applied += 1
 
     return applied
 # ---------------------------------------------------------------------------
