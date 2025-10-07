@@ -325,27 +325,155 @@ def _clean_schedule_ts(value: Any) -> datetime | None:
     return None
 
 
+def _read_streamlit_secret(key: str) -> Any | None:
+    try:
+        secrets_obj = st.secrets
+    except Exception:
+        return None
+
+    value: Any | None = None
+
+    # Many Streamlit runtimes expose ``.get`` and mapping helpers, but not all.
+    getter = getattr(secrets_obj, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key)
+        except Exception:
+            value = None
+    if value is not None:
+        return value
+
+    try:
+        if isinstance(secrets_obj, Mapping) and key in secrets_obj:
+            return secrets_obj[key]
+    except Exception:
+        value = None
+
+    try:
+        value = secrets_obj[key]  # type: ignore[index]
+    except Exception:
+        value = None
+    if value is not None:
+        return value
+
+    try:
+        value = getattr(secrets_obj, key)
+    except Exception:
+        value = None
+    if value is not None:
+        return value
+
+    try:
+        raw_store = getattr(secrets_obj, "_secrets", None)
+        if isinstance(raw_store, Mapping) and key in raw_store:
+            return raw_store[key]
+    except Exception:
+        return None
+
+    return None
+
+
+def _mapping_get(mapping: Any, key: str) -> Any | None:
+    if not isinstance(mapping, Mapping):
+        return None
+
+    try:
+        if key in mapping:
+            return mapping[key]
+    except Exception:
+        pass
+
+    getter = getattr(mapping, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key)
+        except Exception:
+            value = None
+        else:
+            if value is not None:
+                return value
+
+    try:
+        return mapping[key]
+    except Exception:
+        return None
+
+
+def _normalize_secret_value(value: Any, *, allow_blank: bool = False) -> Any | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed and not allow_blank:
+            return None
+        return trimmed
+    return value
+
+
+def _resolve_secret(*keys: str, default: Any | None = None, allow_blank: bool = False) -> Any | None:
+    for key in keys:
+        candidates = [key]
+        if key.lower() != key:
+            candidates.append(key.lower())
+
+        for candidate in candidates:
+            value = _normalize_secret_value(
+                _read_streamlit_secret(candidate), allow_blank=allow_blank
+            )
+
+            if value is None and "_" in candidate:
+                section, _, nested = candidate.partition("_")
+                section_value = _read_streamlit_secret(section)
+                if isinstance(section_value, Mapping):
+                    for nested_key in {nested, nested.upper(), nested.lower()}:
+                        nested_value = _normalize_secret_value(
+                            _mapping_get(section_value, nested_key), allow_blank=allow_blank
+                        )
+                        if nested_value is not None:
+                            value = nested_value
+                            break
+
+            if value is None:
+                env_names = [
+                    key,
+                    candidate,
+                    key.upper(),
+                    key.lower(),
+                    candidate.upper(),
+                    candidate.lower(),
+                ]
+                for env_name in dict.fromkeys(env_names):
+                    env_val = _normalize_secret_value(
+                        os.getenv(env_name), allow_blank=allow_blank
+                    )
+                    if env_val is not None:
+                        value = env_val
+                        break
+
+            if value is not None:
+                return value
+
+    return default
+
+
 def build_flightaware_status_config() -> FlightAwareStatusConfig | None:
-    api_key = st.secrets.get("FLIGHTAWARE_API_KEY") or st.secrets.get("flightaware_api_key")
+    api_key = _resolve_secret("FLIGHTAWARE_API_KEY")
     if not api_key:
         return None
 
-    base = st.secrets.get("FLIGHTAWARE_API_BASE") or st.secrets.get("flightaware_api_base")
+    base = _resolve_secret("FLIGHTAWARE_API_BASE")
     if not base:
         base = DEFAULT_AEROAPI_BASE_URL
 
-    timeout_val = st.secrets.get("FLIGHTAWARE_TIMEOUT") or st.secrets.get("flightaware_timeout")
+    timeout_val = _resolve_secret("FLIGHTAWARE_TIMEOUT")
     try:
         timeout = int(timeout_val) if timeout_val is not None else 30
     except (TypeError, ValueError):
         timeout = 30
 
-    verify = _secret_bool(st.secrets.get("FLIGHTAWARE_VERIFY_SSL"), default=True)
+    verify = _secret_bool(_resolve_secret("FLIGHTAWARE_VERIFY_SSL"), default=True)
 
-    extra_headers = (
-        _read_secret_headers(st.secrets.get("FLIGHTAWARE_EXTRA_HEADERS"))
-        or _read_secret_headers(st.secrets.get("flightaware_extra_headers"))
-    )
+    extra_headers = _read_secret_headers(_resolve_secret("FLIGHTAWARE_EXTRA_HEADERS"))
 
     return FlightAwareStatusConfig(
         base_url=str(base),
@@ -362,52 +490,23 @@ def build_flightaware_webhook_config() -> dict[str, Any] | None:
     if boto3 is None or Key is None:
         return None
 
-    region = (
-        st.secrets.get("AWS_REGION")
-        or st.secrets.get("aws_region")
-        or os.getenv("AWS_REGION")
-    )
+    region = _resolve_secret("AWS_REGION")
     if not region:
         return None
 
-    table_name = (
-        st.secrets.get("FLIGHTAWARE_ALERTS_TABLE")
-        or st.secrets.get("flightaware_alerts_table")
-        or os.getenv("FLIGHTAWARE_ALERTS_TABLE")
-        or "fa-oooi-alerts"
-    )
+    table_name = _resolve_secret("FLIGHTAWARE_ALERTS_TABLE") or "fa-oooi-alerts"
 
-    access_key = (
-        st.secrets.get("AWS_ACCESS_KEY_ID")
-        or st.secrets.get("aws_access_key_id")
-        or os.getenv("AWS_ACCESS_KEY_ID")
-    )
-    secret_key = (
-        st.secrets.get("AWS_SECRET_ACCESS_KEY")
-        or st.secrets.get("aws_secret_access_key")
-        or os.getenv("AWS_SECRET_ACCESS_KEY")
-    )
-    session_token = (
-        st.secrets.get("AWS_SESSION_TOKEN")
-        or st.secrets.get("aws_session_token")
-        or os.getenv("AWS_SESSION_TOKEN")
-    )
+    access_key = _resolve_secret("AWS_ACCESS_KEY_ID")
+    secret_key = _resolve_secret("AWS_SECRET_ACCESS_KEY")
+    session_token = _resolve_secret("AWS_SESSION_TOKEN")
 
-    per_ident_val = (
-        st.secrets.get("FLIGHTAWARE_ALERTS_PER_IDENT")
-        or st.secrets.get("flightaware_alerts_per_ident")
-        or os.getenv("FLIGHTAWARE_ALERTS_PER_IDENT")
-    )
+    per_ident_val = _resolve_secret("FLIGHTAWARE_ALERTS_PER_IDENT")
     try:
         per_ident = int(per_ident_val) if per_ident_val is not None else 25
     except (TypeError, ValueError):
         per_ident = 25
 
-    cache_ttl_val = (
-        st.secrets.get("FLIGHTAWARE_ALERTS_CACHE_TTL")
-        or st.secrets.get("flightaware_alerts_cache_ttl")
-        or os.getenv("FLIGHTAWARE_ALERTS_CACHE_TTL")
-    )
+    cache_ttl_val = _resolve_secret("FLIGHTAWARE_ALERTS_CACHE_TTL")
     try:
         cache_ttl = int(cache_ttl_val) if cache_ttl_val is not None else 20
     except (TypeError, ValueError):
@@ -430,20 +529,6 @@ def _diag_flightaware_webhook() -> tuple[bool, str]:
     if boto3 is None or Key is None:
         return False, "boto3 is not installed. Add boto3 to requirements.txt to enable DynamoDB access."
 
-    def _get_secret(key: str) -> str | None:
-        candidates = (key, key.lower())
-        for candidate in candidates:
-            try:
-                value = st.secrets.get(candidate)
-            except Exception:
-                value = None
-            if value is not None and str(value).strip():
-                return str(value).strip()
-        env_val = os.getenv(key)
-        if env_val and str(env_val).strip():
-            return str(env_val).strip()
-        return None
-
     required = [
         "AWS_REGION",
         "AWS_ACCESS_KEY_ID",
@@ -452,7 +537,7 @@ def _diag_flightaware_webhook() -> tuple[bool, str]:
     ]
     missing = []
     for name in required:
-        value = _get_secret(name)
+        value = _resolve_secret(name)
         if not value:
             if name == "FLIGHTAWARE_ALERTS_TABLE":
                 value = "fa-oooi-alerts"
@@ -463,12 +548,14 @@ def _diag_flightaware_webhook() -> tuple[bool, str]:
 
     try:
         session = boto3.Session(
-            aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"),
-            aws_session_token=_get_secret("AWS_SESSION_TOKEN"),
-            region_name=_get_secret("AWS_REGION"),
+            aws_access_key_id=_resolve_secret("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=_resolve_secret("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=_resolve_secret("AWS_SESSION_TOKEN"),
+            region_name=_resolve_secret("AWS_REGION"),
         )
-        table = session.resource("dynamodb").Table(_get_secret("FLIGHTAWARE_ALERTS_TABLE") or "fa-oooi-alerts")
+        table = session.resource("dynamodb").Table(
+            _resolve_secret("FLIGHTAWARE_ALERTS_TABLE") or "fa-oooi-alerts"
+        )
     except Exception as exc:  # pragma: no cover - environment specific
         return False, f"DynamoDB session setup failed: {exc}"
 
