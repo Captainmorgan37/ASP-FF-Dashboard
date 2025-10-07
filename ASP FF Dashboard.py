@@ -1824,12 +1824,23 @@ def derive_iata_from_icao(icao: str) -> str:
     return ""
 
 def display_airport(icao: str, iata: str) -> str:
+    """Return the best airport token available for display."""
+
     i = (icao or "").strip().upper()
     a = (iata or "").strip().upper()
-    if i and len(i) == 4:
+
+    # Prefer the "ICAO" value when provided, even if it is not a
+    # four-character identifier. Some FL3XX API responses supply an IATA
+    # identifier (or another local code such as an FAA/TC identifier) in this
+    # field when no ICAO exists. Showing that token avoids a blank schedule
+    # entry and allows downstream FlightAware matching logic to work with the
+    # displayed value.
+    if i:
         return i
-    if a and len(a) == 3:
+
+    if a:
         return a
+
     return "—"
 
 
