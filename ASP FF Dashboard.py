@@ -424,6 +424,72 @@ def build_flightaware_webhook_config() -> dict[str, Any] | None:
     }
 
 
+def _diag_flightaware_webhook() -> tuple[bool, str]:
+    """Perform a lightweight connectivity check for the FlightAware webhook table."""
+
+    if boto3 is None or Key is None:
+        return False, "boto3 is not installed. Add boto3 to requirements.txt to enable DynamoDB access."
+
+    def _get_secret(key: str) -> str | None:
+        candidates = (key, key.lower())
+        for candidate in candidates:
+            try:
+                value = st.secrets.get(candidate)
+            except Exception:
+                value = None
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        env_val = os.getenv(key)
+        if env_val and str(env_val).strip():
+            return str(env_val).strip()
+        return None
+
+    required = [
+        "AWS_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "FLIGHTAWARE_ALERTS_TABLE",
+    ]
+    missing = []
+    for name in required:
+        value = _get_secret(name)
+        if not value:
+            if name == "FLIGHTAWARE_ALERTS_TABLE":
+                value = "fa-oooi-alerts"
+            if not value:
+                missing.append(name)
+    if missing:
+        return False, f"Missing secrets: {', '.join(sorted(missing))}"
+
+    try:
+        session = boto3.Session(
+            aws_access_key_id=_get_secret("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=_get_secret("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=_get_secret("AWS_SESSION_TOKEN"),
+            region_name=_get_secret("AWS_REGION"),
+        )
+        table = session.resource("dynamodb").Table(_get_secret("FLIGHTAWARE_ALERTS_TABLE") or "fa-oooi-alerts")
+    except Exception as exc:  # pragma: no cover - environment specific
+        return False, f"DynamoDB session setup failed: {exc}"
+
+    try:
+        table.load()
+    except Exception as exc:  # pragma: no cover - environment specific
+        return False, f"DynamoDB DescribeTable failed: {exc}"
+
+    try:
+        table.query(
+            KeyConditionExpression=Key("ident").eq("ASP501"),
+            Limit=1,
+            ScanIndexForward=False,
+        )
+    except Exception as exc:  # pragma: no cover - environment specific
+        # Permission or table errors should surface, but empty result sets are fine
+        return False, f"DynamoDB query failed: {exc}"
+
+    return True, "ok"
+
+
 def _coerce_dynamodb_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         try:
@@ -2562,7 +2628,20 @@ if use_flightaware_api:
 api_mode_active = bool(use_flightaware_api and flightaware_config and api_error is None)
 
 webhook_status_placeholder = st.empty()
+webhook_diag_placeholder = st.empty()
 webhook_config = build_flightaware_webhook_config()
+try:
+    webhook_diag_ok, webhook_diag_msg = _diag_flightaware_webhook()
+except Exception as diag_exc:  # pragma: no cover - defensive fallback
+    webhook_diag_ok, webhook_diag_msg = False, f"Diagnostics failed: {diag_exc}"
+
+if webhook_diag_ok:
+    webhook_diag_placeholder.success("FlightAware webhook integration detected.")
+else:
+    webhook_diag_placeholder.warning(
+        f"FlightAware webhook integration unavailable: {webhook_diag_msg}"
+    )
+
 default_use_webhook = st.session_state.get("use_flightaware_webhook")
 if default_use_webhook is None:
     default_use_webhook = bool(webhook_config)
