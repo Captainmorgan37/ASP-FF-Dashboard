@@ -2568,6 +2568,11 @@ if default_use_webhook is None:
     default_use_webhook = bool(webhook_config)
 
 use_webhook_alerts = False
+show_webhook_debug = False
+webhook_debug_default = st.session_state.get("show_webhook_debug")
+if webhook_debug_default is None:
+    webhook_debug_default = False
+
 if webhook_config:
     use_webhook_alerts = st.checkbox(
         "Use FlightAware webhook alerts (DynamoDB)",
@@ -2578,8 +2583,19 @@ if webhook_config:
         ),
     )
     st.session_state["use_flightaware_webhook"] = use_webhook_alerts
+
+    show_webhook_debug = st.checkbox(
+        "Show FlightAware webhook diagnostics",
+        value=bool(webhook_debug_default),
+        help=(
+            "Display connection status, record counts, and recent webhook payloads "
+            "returned from DynamoDB."
+        ),
+    )
+    st.session_state["show_webhook_debug"] = show_webhook_debug
 else:
     st.session_state["use_flightaware_webhook"] = False
+    st.session_state["show_webhook_debug"] = False
 
 # ============================
 # Email-driven status + enrich FA/EDCT times
@@ -2611,27 +2627,83 @@ if api_mode_active:
     else:
         api_status_placeholder.caption("FlightAware AeroAPI returned no new updates for the current schedule.")
 
-if use_webhook_alerts and webhook_config:
+webhook_records: list[dict[str, Any]] = []
+webhook_fetch_error: str | None = None
+webhook_cache_entry: Mapping[str, Any] | None = None
+applied_webhook = 0
+
+should_fetch_webhook = bool(webhook_config) and (use_webhook_alerts or show_webhook_debug)
+if should_fetch_webhook:
     webhook_idents = collect_active_webhook_idents(df_clean)
     if webhook_idents:
         try:
             webhook_records = fetch_flightaware_webhook_events(webhook_idents, webhook_config)
-            applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
+            cache_dict = st.session_state.get("_webhook_alert_cache")
+            if isinstance(cache_dict, Mapping):
+                cache_key = (tuple(sorted(webhook_idents)), webhook_config.get("table_name"))
+                webhook_cache_entry = cache_dict.get(cache_key)
+            if use_webhook_alerts:
+                applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
         except Exception as exc:
-            webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
+            webhook_fetch_error = str(exc)
+            if use_webhook_alerts:
+                webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
         else:
-            if applied_webhook:
-                webhook_status_placeholder.info(
-                    f"FlightAware webhook applied {applied_webhook} update(s)."
-                )
-            else:
-                webhook_status_placeholder.caption(
-                    "FlightAware webhook returned no new updates for the current schedule."
-                )
+            if use_webhook_alerts:
+                if applied_webhook:
+                    webhook_status_placeholder.info(
+                        f"FlightAware webhook applied {applied_webhook} update(s)."
+                    )
+                else:
+                    webhook_status_placeholder.caption(
+                        "FlightAware webhook returned no new updates for the current schedule."
+                    )
     else:
-        webhook_status_placeholder.caption(
-            "FlightAware webhook has no mapped ASP callsigns for the current schedule."
-        )
+        if use_webhook_alerts:
+            webhook_status_placeholder.caption(
+                "FlightAware webhook has no mapped ASP callsigns for the current schedule."
+            )
+
+if show_webhook_debug:
+    debug_container = st.container()
+    if webhook_fetch_error:
+        debug_container.error(f"Webhook diagnostics error: {webhook_fetch_error}")
+    elif not should_fetch_webhook:
+        debug_container.info("Enable webhook alerts to run diagnostics.")
+    else:
+        fetched_at_display = None
+        if webhook_cache_entry and isinstance(webhook_cache_entry, Mapping):
+            fetched_at = webhook_cache_entry.get("fetched_at")
+            if isinstance(fetched_at, datetime):
+                fetched_at_display = fetched_at.astimezone(timezone.utc).isoformat()
+
+        if fetched_at_display:
+            debug_container.caption(f"Last fetch (UTC): {fetched_at_display}")
+
+        if webhook_records:
+            per_ident: dict[str, int] = {}
+            for record in webhook_records:
+                ident = str(record.get("ident") or "").strip() or "(missing ident)"
+                per_ident[ident] = per_ident.get(ident, 0) + 1
+
+            summary_rows = sorted(per_ident.items(), key=lambda item: item[0])
+            debug_container.write(
+                {
+                    "records_returned": len(webhook_records),
+                    "idents_covered": summary_rows,
+                }
+            )
+
+            debug_frame = pd.DataFrame(webhook_records)
+            if not debug_frame.empty:
+                for col in ("_event_dt", "received_at", "event_time", "event_ts", "source_ts"):
+                    if col in debug_frame.columns:
+                        debug_frame[col] = pd.to_datetime(debug_frame[col], errors="coerce")
+                debug_container.dataframe(debug_frame.head(25))
+        else:
+            debug_container.info(
+                "DynamoDB returned zero webhook records for the current schedule/filter criteria."
+            )
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
     rec = events_map.get(leg_key)
