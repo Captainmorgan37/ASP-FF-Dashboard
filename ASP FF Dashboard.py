@@ -2672,14 +2672,78 @@ df["Status"] = [
 
 # Pull persisted times
 dep_actual_list, eta_fore_list, arr_actual_list, edct_list = [], [], [], []
+dep_stage_list: list[str | None] = []
+arr_stage_list: list[str | None] = []
 route_mismatch_flags: list[bool] = []
 route_mismatch_msgs: list[str] = []
+def _canonical_stage(value: Any) -> str | None:
+    if not value:
+        return None
+    token = str(value).strip().lower()
+    if not token:
+        return None
+    stage_aliases = {
+        "out": "out",
+        "departure": "out",
+        "off": "off",
+        "takeoff": "off",
+        "on": "on",
+        "arrival": "in",
+        "in": "in",
+        "landed": "in",
+    }
+    return stage_aliases.get(token)
+
+
+_STAGE_LABEL_MAP = {
+    "out": "OUT",
+    "off": "OFF",
+    "on": "ON",
+    "in": "IN",
+}
+
+_STAGE_COLOR_MAP = {
+    "out": "#1e88e5",
+    "off": "#2e7d32",
+    "on": "#fb8c00",
+    "in": "#6a1b9a",
+}
+
+
+def _format_stage_time(ts: pd.Timestamp | datetime | None, stage: str | None) -> str:
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return "—"
+    try:
+        if pd.isna(ts):
+            return "—"
+    except Exception:
+        pass
+
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.to_pydatetime()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts = ts.astimezone(timezone.utc)
+    label = _STAGE_LABEL_MAP.get(stage or "")
+    time_str = ts.strftime("%H:%MZ")
+    return f"{label} · {time_str}" if label else time_str
+
+
 for idx, (leg_key, booking) in enumerate(zip(df["_LegKey"], df["Booking"])):
     rec = _events_for_leg(leg_key, booking)
-    dep_actual_list.append(parse_iso_to_utc(rec.get("Departure", {}).get("actual_time_utc")))
+
+    dep_payload = rec.get("Departure", {})
+    arr_payload = rec.get("Arrival", {})
+
+    dep_actual_list.append(parse_iso_to_utc(dep_payload.get("actual_time_utc")))
     eta_fore_list.append(parse_iso_to_utc(rec.get("ArrivalForecast", {}).get("actual_time_utc")))
-    arr_actual_list.append(parse_iso_to_utc(rec.get("Arrival", {}).get("actual_time_utc")))
+    arr_actual_list.append(parse_iso_to_utc(arr_payload.get("actual_time_utc")))
     edct_list.append(parse_iso_to_utc(rec.get("EDCT", {}).get("actual_time_utc")))
+
+    dep_stage = _canonical_stage(dep_payload.get("raw_event"))
+    arr_stage = _canonical_stage(arr_payload.get("raw_event"))
+    dep_stage_list.append(dep_stage)
+    arr_stage_list.append(arr_stage)
 
     mismatch_flag = False
     mismatch_msg = ""
@@ -2706,17 +2770,27 @@ for idx, (leg_key, booking) in enumerate(zip(df["_LegKey"], df["Booking"])):
 # Display columns
 # Takeoff (FA): show EDCT (purple) until a true Departure arrives, then overwrite with actual time
 takeoff_display = []
-for dep_dt, edct_dt in zip(dep_actual_list, edct_list):
+for dep_dt, edct_dt, stage in zip(dep_actual_list, edct_list, dep_stage_list):
     if dep_dt:
-        takeoff_display.append(fmt_dt_utc(dep_dt))
+        takeoff_display.append(_format_stage_time(dep_dt, stage))
     elif edct_dt:
-        takeoff_display.append(f"EDCT - {fmt_dt_utc(edct_dt)}")
+        takeoff_display.append(f"EDCT · {edct_dt.astimezone(timezone.utc).strftime('%H:%MZ')}")
     else:
         takeoff_display.append("—")
 
+landing_display = []
+for arr_dt, stage in zip(arr_actual_list, arr_stage_list):
+    if arr_dt:
+        landing_display.append(_format_stage_time(arr_dt, stage))
+    else:
+        landing_display.append("—")
+
 df["Takeoff (FA)"] = takeoff_display
 df["ETA (FA)"]     = [fmt_dt_utc(x) for x in eta_fore_list]
-df["Landing (FA)"] = [fmt_dt_utc(x) for x in arr_actual_list]
+df["Landing (FA)"] = landing_display
+
+df["_DepStage"] = dep_stage_list
+df["_ArrStage"] = arr_stage_list
 
 # Hidden raw timestamps for styling/calcs (do NOT treat EDCT as actual)
 df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)     # True actual OUT only
@@ -2967,12 +3041,20 @@ view_df["Landing (FA)"]      = view_df["_ArrActual_ts"]   # datetime or NaT
 # we'll keep it as a STRING column (sorting by this one won't be chronological — others will).
 def _takeoff_display(row):
     if pd.notna(row["_DepActual_ts"]):
-        return row["_DepActual_ts"].strftime("%H:%MZ")
+        return _format_stage_time(row["_DepActual_ts"], row.get("_DepStage"))
     if pd.notna(row["_EDCT_ts"]):
-        return "EDCT " + row["_EDCT_ts"].strftime("%H:%MZ")
+        return "EDCT · " + row["_EDCT_ts"].strftime("%H:%MZ")
     return "—"
 
+
+def _landing_display(row):
+    if pd.notna(row["_ArrActual_ts"]):
+        return _format_stage_time(row["_ArrActual_ts"], row.get("_ArrStage"))
+    return "—"
+
+
 view_df["Takeoff (FA)"] = view_df.apply(_takeoff_display, axis=1)
+view_df["Landing (FA)"] = view_df.apply(_landing_display, axis=1)
 
 df_display = view_df[display_cols].copy()
 
@@ -3164,6 +3246,28 @@ def _style_ops(x: pd.DataFrame):
     mask_eta = cell_eta.reindex(x.index, fill_value=False)
     mask_arr = cell_arr.reindex(x.index, fill_value=False)
 
+    if "_DepStage" in _base.columns and "Takeoff (FA)" in x.columns:
+        stage_series = _base["_DepStage"].astype(str).str.lower().replace({"nan": "", "none": ""})
+        for stage_key in ("out", "off"):
+            if stage_key not in _STAGE_COLOR_MAP:
+                continue
+            mask_stage = stage_series.eq(stage_key).reindex(x.index, fill_value=False)
+            stage_css = f"color: {_STAGE_COLOR_MAP[stage_key]}; font-weight: 600;"
+            styles.loc[mask_stage, "Takeoff (FA)"] = (
+                styles.loc[mask_stage, "Takeoff (FA)"].fillna("") + stage_css
+            )
+
+    if "_ArrStage" in _base.columns and "Landing (FA)" in x.columns:
+        stage_series = _base["_ArrStage"].astype(str).str.lower().replace({"nan": "", "none": ""})
+        for stage_key in ("on", "in"):
+            if stage_key not in _STAGE_COLOR_MAP:
+                continue
+            mask_stage = stage_series.eq(stage_key).reindex(x.index, fill_value=False)
+            stage_css = f"color: {_STAGE_COLOR_MAP[stage_key]}; font-weight: 600;"
+            styles.loc[mask_stage, "Landing (FA)"] = (
+                styles.loc[mask_stage, "Landing (FA)"].fillna("") + stage_css
+            )
+
     styles.loc[mask_dep, "Takeoff (FA)"] = (
         styles.loc[mask_dep, "Takeoff (FA)"].fillna("") + cell_css
     )
@@ -3214,7 +3318,7 @@ fmt_map = {
     "Off-Block (Sched)": lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "On-Block (Sched)":  lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
-    "Landing (FA)":      lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "Landing (FA)":      lambda v: v if isinstance(v, str) else (v.strftime("%H:%MZ") if pd.notna(v) else "—"),
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
 
