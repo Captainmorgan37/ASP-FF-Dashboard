@@ -75,3 +75,103 @@ service or a JSON-backed sandbox for experimentation.【F:tools/flightaware_aler
 
 In short, the updated tests confirm that the Python client is ready for use, but
 additional UI plumbing is needed before any changes appear in the live dashboard.
+
+## AWS Webhook Ingestion Pipeline
+
+The production FlightAware alerts are currently processed through a managed AWS
+pipeline that feeds the Streamlit dashboard. The high-level flow is:
+
+```
+FlightAware AeroAPI (alerts) → API Gateway (HTTP API) → Lambda (Python) →
+DynamoDB → Streamlit app (polls table every ~10 s)
+```
+
+All infrastructure lives in the `us-east-2` region.
+
+### API Gateway (`fa-oooi-api`)
+
+* **Type:** HTTP API with a `$default` stage.
+* **Route:** `POST /fa/post`
+* **Invoke URL:** `https://cgkogti9qd.execute-api.us-east-2.amazonaws.com/fa/post?token=<SHARED_TOKEN>`
+* **Integration:** Lambda proxy integration to `fa-oooi-webhook`.
+* The shared token embedded in the invoke URL must match the Lambda environment
+  variable described below.
+
+### Lambda Webhook (`fa-oooi-webhook`)
+
+* **Runtime:** Python 3.11.
+* **Purpose:** Validates the `token` query string parameter, normalises the
+  incoming AeroAPI payload, and writes an item into DynamoDB.
+* **Environment variables:**
+  * `DDB_TABLE=fa-oooi-alerts`
+  * `SHARED_TOKEN=<same token as in API Gateway>`
+* **Permissions:** Inline IAM policy granting `dynamodb:PutItem` on the target
+  table.
+* **Logging:** Default CloudWatch Logs group for the function.
+
+### DynamoDB Table (`fa-oooi-alerts`)
+
+* **Primary key:**
+  * Partition key `ident` (string)
+  * Sort key `received_at` (string, ISO 8601 UTC timestamp)
+* **Optional attributes:** `ttl_epoch` for time-to-live expiry.
+* Items include the normalised fields plus the raw payload, for example:
+
+  ```json
+  {
+    "ident": "ASP501",
+    "received_at": "2025-10-06T18:42:10Z",
+    "event": "on",
+    "aircraft": "C-FASP",
+    "origin": "CYYC",
+    "destination": "CYYZ",
+    "source_ts": "1730835600",
+    "raw": { "…": "FlightAware payload" }
+  }
+  ```
+
+### IAM Access for Streamlit
+
+* Programmatic IAM user `streamlit-dynamodb-reader` holds read-only permissions
+  (`dynamodb:Query`, `dynamodb:DescribeTable`) on the table.
+* Credentials are stored in Streamlit secrets:
+  * `AWS_REGION=us-east-2`
+  * `AWS_ACCESS_KEY_ID=<read-only key>`
+  * `AWS_SECRET_ACCESS_KEY=<read-only secret>`
+
+### FlightAware Alert Configuration
+
+* Five tail-specific alerts exist for `ASP501`, `ASP653`, `ASP548`, `ASP556`,
+  and `ASP668`.
+* Each alert enables the `out`, `off`, `on`, and `in` events (others disabled).
+* `target_url` is the API Gateway invoke URL with the shared token query
+  string. The optional account-wide endpoint (`PUT /aeroapi/alerts/endpoint`)
+  is not in use.
+
+### Lambda Contract
+
+* **Request expectations:** JSON body with keys such as `event`, `ident` or
+  `fa_flight_id`, optional `aircraft`/`registration`, `origin`, `destination`,
+  and `timestamp`.
+* **Authentication:** Requires `?token=<SHARED_TOKEN>`; otherwise responds with
+  `401`.
+* **Responses:** `200 {"status": "ok"}` on success, `400` for malformed JSON.
+* **Storage:** Successful requests call `PutItem` with the normalised structure
+  outlined above.
+
+### Streamlit Consumption
+
+* The dashboard polls DynamoDB roughly every 10 seconds using the read-only
+  IAM credentials and `boto3` helpers inside `ASP FF Dashboard.py` to refresh
+  per-ident timelines.【F:ASP FF Dashboard.py†L360-L505】【F:ASP FF Dashboard.py†L2502-L2506】
+* Recent items are fetched with `KeyConditionExpression=Key("ident").eq(ident)`
+  and `ScanIndexForward=False` so the latest events appear first.
+
+### Testing and Operations
+
+* Manual tests: `Invoke-RestMethod -Method Post -Uri <WEBHOOK_URL> -Body '{"event":"on","ident":"ASP501"}'`
+  and confirm the record in DynamoDB.
+* Monitoring: Review the Lambda’s CloudWatch Logs for delivery diagnostics.
+* Security: Rotate the shared token by updating both the Lambda environment
+  variable and the per-alert `target_url` values. The Streamlit user remains
+  read-only to limit blast radius.
