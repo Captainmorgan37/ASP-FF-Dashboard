@@ -3797,12 +3797,15 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
     if edited_df is None or original_df is None or original_df.empty:
         return
 
+    frames = [frame for frame in (original_df, edited_df, base_df) if isinstance(frame, pd.DataFrame)]
+    for frame in frames:
+        if "_LegKey" not in frame.columns and "Leg Identifier" in frame.columns:
+            frame["_LegKey"] = frame["Leg Identifier"]
+        if "_LegKey" in frame.columns:
+            frame["_LegKey"] = frame["_LegKey"].astype(str)
+
     key_col = "_LegKey" if all(
-        col in frame.columns for frame, col in (
-            (original_df, "_LegKey"),
-            (edited_df, "_LegKey"),
-            (base_df, "_LegKey"),
-        )
+        "_LegKey" in frame.columns for frame in (original_df, edited_df, base_df)
     ) else "Booking"
 
     orig_idx = original_df.set_index(key_col)
@@ -3811,6 +3814,9 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         return
 
     base_lookup = base_df.drop_duplicates(subset=[key_col]).set_index(key_col)
+    leg_lookup = None
+    if "_LegKey" in base_df.columns:
+        leg_lookup = base_df.drop_duplicates(subset=["_LegKey"]).set_index("_LegKey")
 
     time_saved = 0
     time_cleared = 0
@@ -3825,11 +3831,35 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         orig_row = orig_idx.loc[key]
 
         if isinstance(base_row, pd.DataFrame):
-            base_row = base_row.iloc[0]
+            if "_LegKey" in row and "_LegKey" in base_row.columns:
+                match = base_row[base_row["_LegKey"].astype(str) == str(row.get("_LegKey"))]
+                if not match.empty:
+                    base_row = match.iloc[0]
+                else:
+                    base_row = base_row.iloc[0]
+            else:
+                base_row = base_row.iloc[0]
         if isinstance(orig_row, pd.DataFrame):
-            orig_row = orig_row.iloc[0]
+            if "_LegKey" in row and "_LegKey" in orig_row.columns:
+                match = orig_row[orig_row["_LegKey"].astype(str) == str(row.get("_LegKey"))]
+                if not match.empty:
+                    orig_row = match.iloc[0]
+                else:
+                    orig_row = orig_row.iloc[0]
+            else:
+                orig_row = orig_row.iloc[0]
 
         booking_val = str(base_row.get("Booking", "")) if isinstance(base_row, pd.Series) else ""
+        leg_key_val = None
+        if isinstance(base_row, pd.Series):
+            leg_key_val = base_row.get("_LegKey")
+        if leg_key_val is None and leg_lookup is not None:
+            lookup_key = str(row.get("_LegKey")) if "_LegKey" in row else None
+            if lookup_key and lookup_key in leg_lookup.index:
+                leg_key_val = lookup_key
+        if leg_key_val is None:
+            leg_key_val = key
+        leg_key_str = str(leg_key_val)
 
         # Tail overrides (expected tail registration)
         new_tail_raw = row.get("Aircraft", "")
@@ -3842,10 +3872,10 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         if new_tail != orig_tail:
             if new_tail:
                 cleaned_tail = new_tail.upper()
-                upsert_tail_override(str(key), cleaned_tail)
+                upsert_tail_override(leg_key_str, cleaned_tail)
                 tail_saved += 1
             else:
-                delete_tail_override(str(key))
+                delete_tail_override(leg_key_str)
                 tail_cleared += 1
 
         # Time overrides for selected columns
@@ -3865,9 +3895,9 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
                 continue
 
             if new_val is None:
-                delete_status(str(key), event_type)
-                if st.session_state.get("status_updates", {}).get(key, {}).get("type") == event_type:
-                    st.session_state["status_updates"].pop(key, None)
+                delete_status(leg_key_str, event_type)
+                if st.session_state.get("status_updates", {}).get(leg_key_str, {}).get("type") == event_type:
+                    st.session_state["status_updates"].pop(leg_key_str, None)
                 time_cleared += 1
                 continue
 
@@ -3876,10 +3906,10 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
             if planned is not None and pd.notna(planned):
                 delta_min = int(round((pd.Timestamp(new_val) - planned).total_seconds() / 60.0))
 
-            upsert_status(str(key), event_type, status_label, new_val.isoformat(), delta_min)
+            upsert_status(leg_key_str, event_type, status_label, new_val.isoformat(), delta_min)
             st.session_state.setdefault("status_updates", {})
-            st.session_state["status_updates"][key] = {
-                **st.session_state["status_updates"].get(key, {}),
+            st.session_state["status_updates"][leg_key_str] = {
+                **st.session_state["status_updates"].get(leg_key_str, {}),
                 "type": event_type,
                 "actual_time_utc": new_val.isoformat(),
                 "delta_min": delta_min,
