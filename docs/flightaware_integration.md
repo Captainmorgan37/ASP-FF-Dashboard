@@ -159,6 +159,48 @@ All infrastructure lives in the `us-east-2` region.
 * **Storage:** Successful requests call `PutItem` with the normalised structure
   outlined above.
 
+## Next Steps for an All-AWS Enterprise Edition
+
+To evolve the proof-of-concept into an enterprise-ready deployment that stays
+entirely within AWS, prioritise the following streams of work:
+
+1. **Harden the ingestion tier.** Add request validation (payload schemas, size
+   limits) at API Gateway, enable WAF for IP allow/deny rules, and introduce a
+   dead-letter queue (DLQ) on the Lambda to capture failed writes for replay.
+   Define throttling limits and custom authorisers if third parties will post to
+   the endpoint.【F:docs/flightaware_integration.md†L126-L146】
+2. **Automate infrastructure provisioning.** Capture the API Gateway, Lambda,
+   DynamoDB table, IAM roles, and supporting resources in AWS CDK, Terraform, or
+   CloudFormation so environments (dev/stage/prod) can be recreated reliably.
+   Pair this with AWS CodePipeline/CodeBuild or GitHub Actions for CI/CD, and
+   include unit/integration tests plus canary deployments for the webhook.
+3. **Elevate data lifecycle management.** Enable DynamoDB TTL on `ttl_epoch`,
+   stream expired/archived records into Kinesis Firehose or Lambda for cold
+   storage in S3/Glacier, and back-fill analytics needs with Athena/QuickSight.
+   Consider partitioning by operator or business unit if additional fleets join.
+4. **Deploy a managed presentation layer on AWS.** Containerise the Streamlit
+   app and host it on App Runner, ECS Fargate, or EKS with an Application Load
+   Balancer. Store secrets (read-only credentials, API keys) in AWS Secrets
+   Manager, and front the UI with CloudFront plus AWS SSO/Cognito for managed
+   authentication instead of embedding IAM keys in configuration.【F:docs/flightaware_integration.md†L85-L124】
+5. **Improve observability and alerting.** Standardise structured logging,
+   enable AWS X-Ray tracing, and create CloudWatch metrics/alarms for end-to-end
+   latency, DynamoDB throttles, and Lambda errors. Surface dashboards in
+   CloudWatch or Grafana and configure SNS/Slack alerts for operational events.
+6. **Institutionalise security operations.** Rotate shared tokens via Secrets
+   Manager, enforce IAM least privilege with SCPs, adopt AWS Config and Security
+   Hub checks, and add guardrails (service control policies) in a multi-account
+   landing zone. Apply encryption-at-rest (KMS customer-managed keys) and
+   encryption-in-transit (TLS) everywhere.
+7. **Support downstream integrations.** Publish alert updates to EventBridge or
+   SNS so other enterprise systems (maintenance, crew ops) can subscribe without
+   polling DynamoDB. Optionally expose read APIs (AppSync/GraphQL or REST) with
+   fine-grained IAM/authorisation for partner access.
+
+Completing these tracks yields a fully AWS-hosted, auditable, and scalable
+platform that can onboard new aircraft or business units with minimal manual
+intervention while meeting enterprise security and reliability requirements.
+
 ### Streamlit Consumption
 
 * The dashboard polls DynamoDB roughly every 10 seconds using the read-only
