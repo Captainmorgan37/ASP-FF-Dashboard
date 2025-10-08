@@ -1,0 +1,10 @@
+version: 1.0
+runtime: python3
+build:
+  commands:
+    build:
+      - pip install --no-cache-dir -r requirements.txt
+run:
+  command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+  network:
+    port: 8501
