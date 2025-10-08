@@ -3119,11 +3119,9 @@ df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
 
 if not df.empty:
     eta_fa_series = df["_ETA_FA_ts"]
-    mask_eta_fa = eta_fa_series.notna()
-    if mask_eta_fa.any():
-        df.loc[mask_eta_fa, "Arrives In"] = (
-            (eta_fa_series[mask_eta_fa] - now_utc).apply(fmt_td)
-        )
+    eta_countdown_source = eta_fa_series.combine_first(df["ETA_UTC"])
+    countdown_now = pd.Timestamp.now(tz=timezone.utc)
+    df["Arrives In"] = (eta_countdown_source - countdown_now).apply(fmt_td)
 
 df["_RouteMismatch"] = route_mismatch_flags
 df["_RouteMismatchMsg"] = route_mismatch_msgs
