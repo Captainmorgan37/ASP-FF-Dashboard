@@ -3,13 +3,16 @@ runtime: python311
 
 build:
   commands:
+    pre-build:
+      - echo "no-op prebuild"
     build:
-      - echo "Build step (no dependency installs)"
+      - echo "no-op build"
+    post-build:
+      - echo "no-op postbuild"
 
 run:
   runtime-version: 3.11
   pre-run:
     - python3 -m pip install --upgrade pip setuptools wheel
     - python3 -m pip install --no-cache-dir -r requirements.txt
-  command: |
-    bash -lc 'streamlit run ASP\ FF\ Dashboard.py --server.port $PORT --server.address 0.0.0.0 --logger.level=debug'
+  command: bash -lc "streamlit run ASP\ FF\ Dashboard.py --server.port $PORT --server.address 0.0.0.0 --logger.level=debug"
