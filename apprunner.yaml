@@ -13,15 +13,7 @@ build:
 run:
   runtime-version: 3.11
   pre-run:
-    - python3 -V
-    - which python3 || true
-    - python3 -m pip --version
     - python3 -m pip install --upgrade pip setuptools wheel
     - python3 -m pip install --no-cache-dir -r requirements.txt
-    - python3 -m pip show streamlit
-    - python3 - <<'PY'
-import streamlit, sys
-print("Streamlit version:", streamlit.__version__)
-print("Python exe:", sys.executable)
-PY
-  command: python3 -m streamlit run asp_ff_dashboard.py --server.port $PORT --server.address 0.0.0.0 --logger.level=debug
+    - python3 -m pip show streamlit || true
+  command: bash -lc "python3 -m streamlit run asp_ff_dashboard.py --server.port $PORT --server.address 0.0.0.0 --logger.level=debug"
