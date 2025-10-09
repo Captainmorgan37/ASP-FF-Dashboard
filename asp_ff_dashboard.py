@@ -304,9 +304,26 @@ def _secret_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
-def _read_secret_headers(value: Any) -> Mapping[str, str] | None:
+def _coerce_mapping(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
-        return {str(k): str(v) for k, v in value.items()}
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, Mapping):
+            return parsed
+    return None
+
+
+def _read_secret_headers(value: Any) -> Mapping[str, str] | None:
+    mapping = _coerce_mapping(value)
+    if mapping:
+        return {str(k): str(v) for k, v in mapping.items()}
     return None
 
 
@@ -407,6 +424,83 @@ def _normalize_secret_value(value: Any, *, allow_blank: bool = False) -> Any | N
             return None
         return trimmed
     return value
+
+
+def _fl3xx_secret_diagnostics_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+
+    def _add_row(source: str, present: bool, details: str) -> None:
+        rows.append(
+            {
+                "Source": source,
+                "Detected": "✅" if present else "⚠️",
+                "Details": details,
+            }
+        )
+
+    for key in ("fl3xx_api", "FL3XX_API", "FL3XX"):
+        raw = _read_streamlit_secret(key)
+        mapping = _coerce_mapping(raw)
+        if mapping is None:
+            if raw is None:
+                _add_row(f"st.secrets['{key}']", False, "Secret not defined")
+            else:
+                _add_row(
+                    f"st.secrets['{key}']",
+                    False,
+                    f"Found {type(raw).__name__}; expected a mapping with credential keys.",
+                )
+            continue
+
+        api_token = _normalize_secret_value(mapping.get("api_token"), allow_blank=True)
+        auth_header = _normalize_secret_value(
+            mapping.get("auth_header") or mapping.get("authorization"), allow_blank=True
+        )
+
+        _add_row(
+            f"st.secrets['{key}']['api_token']",
+            bool(api_token),
+            "Value provided" if api_token else "Missing or blank value",
+        )
+        _add_row(
+            f"st.secrets['{key}']['auth_header']",
+            bool(auth_header),
+            "Value provided" if auth_header else "Missing or blank value",
+        )
+
+    explicit_token = _normalize_secret_value(
+        _read_streamlit_secret("FL3XX_API_TOKEN"), allow_blank=True
+    )
+    if explicit_token is not None:
+        _add_row(
+            "st.secrets['FL3XX_API_TOKEN']",
+            bool(explicit_token),
+            "Value provided" if explicit_token else "Value present but blank",
+        )
+    else:
+        _add_row("st.secrets['FL3XX_API_TOKEN']", False, "Secret not defined")
+
+    env_token = _normalize_secret_value(os.getenv("FL3XX_API_TOKEN"), allow_blank=True)
+    _add_row(
+        "env:FL3XX_API_TOKEN",
+        bool(env_token),
+        "Environment variable set" if env_token else "Environment variable not set",
+    )
+
+    auth_header_name = _normalize_secret_value(
+        _read_streamlit_secret("FL3XX_AUTH_HEADER_NAME") or os.getenv("FL3XX_AUTH_HEADER_NAME"),
+        allow_blank=True,
+    )
+    if auth_header_name:
+        _add_row("FL3XX_AUTH_HEADER_NAME", True, f"Using header name '{auth_header_name}'")
+    else:
+        _add_row(
+            "FL3XX_AUTH_HEADER_NAME",
+            True,
+            "Falling back to default Authorization header",
+        )
+
+    return rows
 
 
 def _resolve_secret(*keys: str, default: Any | None = None, allow_blank: bool = False) -> Any | None:
@@ -759,13 +853,13 @@ def fetch_aeroapi_status_updates(
 def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
     merged: dict[str, Any] = {}
     for key in ("fl3xx_api", "FL3XX_API", "FL3XX"):
-        value = st.secrets.get(key)
-        if isinstance(value, Mapping):
+        value = _coerce_mapping(_read_streamlit_secret(key))
+        if value:
             merged.update(dict(value))
 
     base_url = str(merged.get("base_url") or DEFAULT_FL3XX_BASE_URL)
 
-    api_token = merged.get("api_token") or st.secrets.get("FL3XX_API_TOKEN") or os.getenv("FL3XX_API_TOKEN")
+    api_token = merged.get("api_token") or _read_streamlit_secret("FL3XX_API_TOKEN") or os.getenv("FL3XX_API_TOKEN")
     if api_token is not None:
         api_token = str(api_token)
 
@@ -776,7 +870,7 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
     auth_header_name_value = (
         merged.get("auth_header_name")
         or merged.get("authorization_header_name")
-        or st.secrets.get("FL3XX_AUTH_HEADER_NAME")
+        or _read_streamlit_secret("FL3XX_AUTH_HEADER_NAME")
         or os.getenv("FL3XX_AUTH_HEADER_NAME")
     )
     if auth_header_name_value is not None:
@@ -788,7 +882,7 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         merged.get("api_token_scheme")
         or merged.get("token_scheme")
         or merged.get("token_type")
-        or st.secrets.get("FL3XX_API_TOKEN_SCHEME")
+        or _read_streamlit_secret("FL3XX_API_TOKEN_SCHEME")
         or os.getenv("FL3XX_API_TOKEN_SCHEME")
     )
     if token_scheme_value is None:
@@ -799,13 +893,11 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
     else:
         api_token_scheme = str(token_scheme_value)
 
-    headers = merged.get("headers")
-    extra_headers = dict(headers) if isinstance(headers, Mapping) else {}
+    headers = _coerce_mapping(merged.get("headers"))
+    extra_headers = {str(k): str(v) for k, v in headers.items()} if headers else {}
 
-    params = merged.get("params")
-    extra_params = (
-        {str(k): str(v) for k, v in params.items()} if isinstance(params, Mapping) else {}
-    )
+    params = _coerce_mapping(merged.get("params"))
+    extra_params = {str(k): str(v) for k, v in params.items()} if params else {}
 
     verify_ssl_value = merged.get("verify_ssl", True)
     if isinstance(verify_ssl_value, str):
@@ -1228,7 +1320,11 @@ def _build_delay_msg(
     return "\n".join(lines)
 
 def post_to_telus_team(team: str, text: str) -> tuple[bool, str]:
-    url = st.secrets.get("TELUS_WEBHOOKS", {}).get(team)
+    telus_hooks = _read_streamlit_secret("TELUS_WEBHOOKS")
+    if isinstance(telus_hooks, Mapping):
+        url = _mapping_get(telus_hooks, team)
+    else:
+        url = None
     if not url:
         return False, f"No webhook configured for team '{team}'."
     try:
@@ -2151,7 +2247,7 @@ def _parse_asp_map_text(txt: str) -> dict[str, str]:
 
 
 # Prefer secrets if present
-_secrets_map = st.secrets.get("ASP_MAP", None)
+_secrets_map = _read_streamlit_secret("ASP_MAP")
 if isinstance(_secrets_map, dict) and _secrets_map:
     ASP_MAP = {k.upper(): v.upper() for k, v in _secrets_map.items()}
 else:
@@ -2519,11 +2615,20 @@ elif selected_source == "fl3xx_api":
     config = _build_fl3xx_config_from_secrets()
     if not config.auth_header and not config.api_token:
         st.error(
-            "Configure the FL3XX API credentials in Streamlit secrets (key 'fl3xx_api') "
-            "or via the FL3XX_API_TOKEN environment variable. Provide 'api_token' or "
-            "'auth_header', and optionally 'auth_header_name' if your API expects a "
-            "different header."
+            "FL3XX API credentials are not configured. Provide an API token or a pre-built "
+            "authorization header before selecting the automatic schedule source."
         )
+        with st.expander("How to supply FL3XX credentials", expanded=True):
+            st.markdown(
+                "- Add a `[fl3xx_api]` section to Streamlit secrets with `api_token` or `auth_header`.\n"
+                "- Alternatively, set the `FL3XX_API_TOKEN` environment variable (App Runner secret).\n"
+                "- Optional: set `FL3XX_AUTH_HEADER_NAME` when the API expects a different header name."
+            )
+            diag_rows = _fl3xx_secret_diagnostics_rows()
+            if diag_rows:
+                st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+            else:
+                st.caption("No FL3XX credential hints detected in secrets or environment variables.")
         st.stop()
 
     cache_entry = load_fl3xx_cache()
@@ -4046,7 +4151,11 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
             with btn_col:
                 btn_key = f"notify_{booking_str}_{idx}"
                 if st.button("📣 Notify", key=btn_key):
-                    teams = list(st.secrets.get("TELUS_WEBHOOKS", {}).keys())
+                    telus_hooks = _read_streamlit_secret("TELUS_WEBHOOKS")
+                    if isinstance(telus_hooks, Mapping):
+                        teams = list(telus_hooks.keys())
+                    else:
+                        teams = []
                     if not teams:
                         st.error("No TELUS teams configured in secrets.")
                     else:
@@ -4081,14 +4190,12 @@ else:
 # ============================
 
 # 1) IMAP secrets/config FIRST
-IMAP_HOST = st.secrets.get("IMAP_HOST")
-IMAP_USER = st.secrets.get("IMAP_USER")
-IMAP_PASS = st.secrets.get("IMAP_PASS")
-IMAP_FOLDER = st.secrets.get("IMAP_FOLDER", "INBOX")
-IMAP_SENDER = st.secrets.get("IMAP_SENDER")  # e.g., alerts@flightaware.com
-IMAP_EDCT_ONLY_DEFAULT = (
-    str(st.secrets.get("IMAP_EDCT_ONLY", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
-)
+IMAP_HOST = _resolve_secret("IMAP_HOST")
+IMAP_USER = _resolve_secret("IMAP_USER")
+IMAP_PASS = _resolve_secret("IMAP_PASS")
+IMAP_FOLDER = _resolve_secret("IMAP_FOLDER", default="INBOX") or "INBOX"
+IMAP_SENDER = _resolve_secret("IMAP_SENDER")  # e.g., alerts@flightaware.com
+IMAP_EDCT_ONLY_DEFAULT = _secret_bool(_resolve_secret("IMAP_EDCT_ONLY"), default=False)
 
 
 # 2) Define the polling function BEFORE the UI uses it
