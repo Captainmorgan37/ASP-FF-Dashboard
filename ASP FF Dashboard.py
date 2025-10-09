@@ -526,6 +526,157 @@ def _fl3xx_secret_diagnostics_rows() -> list[dict[str, str]]:
     return rows
 
 
+def _flightaware_aeroapi_secret_diagnostics_rows() -> list[dict[str, str]]:
+    """Return diagnostics for FlightAware AeroAPI configuration."""
+
+    rows: list[dict[str, str]] = []
+
+    def _add_row(source: str, present: bool, details: str) -> None:
+        rows.append(
+            {
+                "Source": source,
+                "Detected": "✅" if present else "⚠️",
+                "Details": details,
+            }
+        )
+
+    api_key = _normalize_secret_value(_resolve_secret("FLIGHTAWARE_API_KEY"), allow_blank=True)
+    _add_row(
+        "FLIGHTAWARE_API_KEY",
+        bool(api_key),
+        "Value provided" if api_key else "Missing or blank value",
+    )
+
+    base_url = _normalize_secret_value(_resolve_secret("FLIGHTAWARE_API_BASE"), allow_blank=True)
+    if base_url:
+        _add_row("FLIGHTAWARE_API_BASE", True, f"Using custom base URL '{base_url}'")
+    else:
+        _add_row(
+            "FLIGHTAWARE_API_BASE",
+            True,
+            f"Defaulting to {DEFAULT_AEROAPI_BASE_URL}",
+        )
+
+    extra_headers = _read_secret_headers(_resolve_secret("FLIGHTAWARE_EXTRA_HEADERS"))
+    if extra_headers:
+        _add_row(
+            "FLIGHTAWARE_EXTRA_HEADERS",
+            True,
+            f"{len(extra_headers)} header(s) detected",
+        )
+
+    timeout_val = _normalize_secret_value(_resolve_secret("FLIGHTAWARE_TIMEOUT"), allow_blank=True)
+    if timeout_val:
+        _add_row("FLIGHTAWARE_TIMEOUT", True, f"Custom timeout = {timeout_val}s")
+
+    verify_val = _normalize_secret_value(_resolve_secret("FLIGHTAWARE_VERIFY_SSL"), allow_blank=True)
+    if verify_val is not None:
+        _add_row("FLIGHTAWARE_VERIFY_SSL", True, f"verify_ssl = {verify_val}")
+
+    return rows
+
+
+def _flightaware_webhook_secret_diagnostics_rows() -> list[dict[str, str]]:
+    """Return diagnostics for the FlightAware webhook/DynamoDB integration."""
+
+    rows: list[dict[str, str]] = []
+
+    def _add_row(source: str, present: bool, details: str) -> None:
+        rows.append(
+            {
+                "Source": source,
+                "Detected": "✅" if present else "⚠️",
+                "Details": details,
+            }
+        )
+
+    for key in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        value = _normalize_secret_value(_resolve_secret(key), allow_blank=True)
+        _add_row(key, bool(value), "Value provided" if value else "Missing or blank value")
+
+    table_name = _normalize_secret_value(
+        _resolve_secret("FLIGHTAWARE_ALERTS_TABLE"), allow_blank=True
+    )
+    if table_name:
+        _add_row("FLIGHTAWARE_ALERTS_TABLE", True, f"Using table '{table_name}'")
+    else:
+        _add_row("FLIGHTAWARE_ALERTS_TABLE", True, "Defaulting to 'fa-oooi-alerts'")
+
+    session_token = _normalize_secret_value(_resolve_secret("AWS_SESSION_TOKEN"), allow_blank=True)
+    if session_token is not None:
+        _add_row(
+            "AWS_SESSION_TOKEN",
+            bool(session_token),
+            "Value provided" if session_token else "Session token not set",
+        )
+
+    if boto3 is None or Key is None:
+        _add_row(
+            "boto3",
+            False,
+            "Install boto3 to enable DynamoDB connectivity diagnostics.",
+        )
+    else:
+        diag_ok, diag_msg = _diag_flightaware_webhook()
+        _add_row(
+            "DynamoDB connectivity",
+            diag_ok,
+            "Diagnostics succeeded" if diag_ok else diag_msg,
+        )
+
+    return rows
+
+
+def _imap_secret_diagnostics_rows() -> list[dict[str, str]]:
+    """Return diagnostics for the IMAP inbox integration."""
+
+    rows: list[dict[str, str]] = []
+
+    def _add_row(source: str, present: bool, details: str) -> None:
+        rows.append(
+            {
+                "Source": source,
+                "Detected": "✅" if present else "⚠️",
+                "Details": details,
+            }
+        )
+
+    for key in ("IMAP_HOST", "IMAP_USER", "IMAP_PASS"):
+        value = _normalize_secret_value(_resolve_secret(key), allow_blank=True)
+        _add_row(key, bool(value), "Value provided" if value else "Missing or blank value")
+
+    folder = _normalize_secret_value(
+        _resolve_secret("IMAP_FOLDER", default="INBOX"), allow_blank=True
+    )
+    if folder:
+        _add_row("IMAP_FOLDER", True, f"Using folder '{folder}'")
+
+    sender = _normalize_secret_value(_resolve_secret("IMAP_SENDER"), allow_blank=True)
+    if sender is not None:
+        _add_row(
+            "IMAP_SENDER",
+            bool(sender),
+            "Sender filter provided" if sender else "Sender filter not set",
+        )
+
+    edct_only = _normalize_secret_value(_resolve_secret("IMAP_EDCT_ONLY"), allow_blank=True)
+    if edct_only is not None:
+        _add_row("IMAP_EDCT_ONLY", True, f"EDCT-only mode = {edct_only}")
+
+    return rows
+
+
+def _collect_secret_diagnostics() -> list[tuple[str, list[dict[str, str]]]]:
+    """Gather diagnostics for all secret-driven integrations."""
+
+    return [
+        ("FL3XX API", _fl3xx_secret_diagnostics_rows()),
+        ("FlightAware AeroAPI", _flightaware_aeroapi_secret_diagnostics_rows()),
+        ("FlightAware webhook (DynamoDB)", _flightaware_webhook_secret_diagnostics_rows()),
+        ("Flight status email inbox", _imap_secret_diagnostics_rows()),
+    ]
+
+
 def _resolve_secret(*keys: str, default: Any | None = None, allow_blank: bool = False) -> Any | None:
     for key in keys:
         candidates = [key]
@@ -1111,6 +1262,17 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         timeout=timeout,
         extra_params=extra_params,
     )
+
+
+def _has_fl3xx_credentials_configured() -> bool:
+    """Return True when either an auth header or API token is available."""
+
+    try:
+        config = _build_fl3xx_config_from_secrets()
+    except Exception:
+        return False
+
+    return bool(config.auth_header or config.api_token)
 
 
 def _get_fl3xx_schedule(
@@ -2713,10 +2875,43 @@ DATA_SOURCE_OPTIONS = {
     "csv_upload": "Upload CSV",
 }
 
+# ============================
+# Configuration diagnostics
+# ============================
+secret_sections = _collect_secret_diagnostics()
+has_secret_warnings = any(
+    row.get("Detected") == "⚠️"
+    for _, section_rows in secret_sections
+    for row in section_rows
+)
+
+st.subheader("Configuration diagnostics")
+st.caption(
+    "The dashboard can still run with manual CSV uploads even when API secrets are missing. "
+    "Use the panel below to review which credentials are currently visible to the app."
+)
+
+with st.expander("Secrets diagnostics", expanded=has_secret_warnings):
+    st.caption(
+        "Checks Streamlit secrets and environment variables for known integrations "
+        "(FL3XX API, FlightAware, IMAP, etc.)."
+    )
+    any_rows_rendered = False
+    for title, rows in secret_sections:
+        if not rows:
+            continue
+        any_rows_rendered = True
+        st.markdown(f"**{title}**")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    if not any_rows_rendered:
+        st.caption("No secret-driven integrations detected.")
+
 with st.sidebar:
     st.subheader("Schedule data source")
     option_keys = list(DATA_SOURCE_OPTIONS.keys())
-    default_source = st.session_state.get("schedule_source_choice", "fl3xx_api")
+    default_source = st.session_state.get("schedule_source_choice")
+    if default_source not in option_keys:
+        default_source = "fl3xx_api" if _has_fl3xx_credentials_configured() else "csv_upload"
     if default_source not in option_keys:
         default_source = option_keys[0]
     default_index = option_keys.index(default_source)
@@ -2807,6 +3002,7 @@ elif selected_source == "fl3xx_api":
             "FL3XX API credentials are not configured. Provide an API token or a pre-built "
             "authorization header before selecting the automatic schedule source."
         )
+        st.info("Open the **Secrets diagnostics** panel above for a breakdown of detected FL3XX credentials.")
         with st.expander("How to supply FL3XX credentials", expanded=True):
             st.markdown(
                 "- Add a `[fl3xx_api]` section to Streamlit secrets with `api_token` or `auth_header`.\n"
