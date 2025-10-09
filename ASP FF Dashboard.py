@@ -366,6 +366,18 @@ def _read_streamlit_secret(key: str) -> Any | None:
         value = None
 
     try:
+        if isinstance(secrets_obj, Mapping):
+            normalized = str(key).lower()
+            for existing_key in secrets_obj:
+                try:
+                    if str(existing_key).lower() == normalized:
+                        return secrets_obj[existing_key]
+                except Exception:
+                    continue
+    except Exception:
+        value = None
+
+    try:
         value = secrets_obj[key]  # type: ignore[index]
     except Exception:
         value = None
@@ -396,6 +408,17 @@ def _mapping_get(mapping: Any, key: str) -> Any | None:
     try:
         if key in mapping:
             return mapping[key]
+    except Exception:
+        pass
+
+    try:
+        normalized = str(key).lower()
+        for existing_key in mapping:
+            try:
+                if str(existing_key).lower() == normalized:
+                    return mapping[existing_key]
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -903,6 +926,18 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
                 value = None
 
             try:
+                if isinstance(secrets_obj, _Mapping):
+                    normalized = str(key).lower()
+                    for existing_key in secrets_obj:
+                        try:
+                            if str(existing_key).lower() == normalized:
+                                return secrets_obj[existing_key]
+                        except Exception:
+                            continue
+            except Exception:
+                value = None
+
+            try:
                 value = secrets_obj[key]  # type: ignore[index]
             except Exception:
                 value = None
@@ -936,6 +971,17 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
             try:
                 if key in mapping:
                     return mapping[key]
+            except Exception:
+                pass
+
+            try:
+                normalized = str(key).lower()
+                for existing_key in mapping:
+                    try:
+                        if str(existing_key).lower() == normalized:
+                            return mapping[existing_key]
+                    except Exception:
+                        continue
             except Exception:
                 pass
 
