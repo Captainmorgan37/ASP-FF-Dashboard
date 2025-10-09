@@ -15,9 +15,8 @@ run:
   pre-run:
     - python3 -m pip install --upgrade pip setuptools wheel
     - python3 -m pip install --no-cache-dir -r requirements.txt
-    # write the injected TOML to the file Streamlit expects
     - mkdir -p .streamlit
-    - printenv SECRETS_TOML > .streamlit/secrets.toml
+    - printf '%s' "$SECRETS_TOML" > .streamlit/secrets.toml
   secrets:
     - name: SECRETS_TOML
       value-from: arn:aws:secretsmanager:us-east-2:650210024710:secret:asp/streamlit_secrets-AfRHA8
