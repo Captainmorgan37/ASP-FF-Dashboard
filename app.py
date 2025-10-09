@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import runpy
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -24,6 +25,8 @@ def _find_dashboard_script(start: Path) -> Path:
         "Dashboard.py', 'asp_ff_dashboard.py', 'asp ff dashboard.py')."
     )
 
+
+os.environ.setdefault("STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION", "false")
 
 SCRIPT_PATH = _find_dashboard_script(Path(__file__))
 
