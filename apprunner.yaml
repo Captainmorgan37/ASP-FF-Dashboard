@@ -20,5 +20,5 @@ run:
     - printenv SECRETS_TOML > .streamlit/secrets.toml
   secrets:
     - name: SECRETS_TOML
-      value-from: arn:aws:secretsmanager:us-east-1:650210024710:secret:asp/streamlit_secrets-ELcOfJ
+      value-from: arn:aws:secretsmanager:us-east-2:650210024710:secret:asp/streamlit_secrets-AfRHA8
   command: python3 -m streamlit run asp_ff_dashboard.py --server.port 8080 --server.address 0.0.0.0
