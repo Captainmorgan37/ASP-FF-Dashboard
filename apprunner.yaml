@@ -2,11 +2,8 @@ version: 1.0
 runtime: python3
 build:
   commands:
-    pre-build:
-      - python -m pip install --upgrade pip setuptools wheel
-    build:
-      - python -m pip install --no-cache-dir -r requirements.txt
+    - python -m pip install --upgrade pip setuptools wheel
+    - python -m pip install --no-cache-dir -r requirements.txt
 run:
-  command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
-  network:
-    port: 8501
+  runtime-version: 3.11
+  command: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
