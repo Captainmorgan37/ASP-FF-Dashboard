@@ -1,25 +1,23 @@
 version: 1.0
 runtime: python311
 
-build:
-  commands:
-    pre-build:
-      - echo "no-op prebuild"
-    build:
-      - echo "no-op build"
-    post-build:
-      - echo "no-op postbuild"
-
 run:
   runtime-version: 3.11
   pre-run:
     - python3 -m pip install --upgrade pip setuptools wheel
     - python3 -m pip install --no-cache-dir -r requirements.txt
     - mkdir -p .streamlit
+    # write your TOML secrets
     - printf '%s' "$SECRETS_TOML" > .streamlit/secrets.toml
-    - printf '%s\n' '[server]' 'headless=true' 'enableCORS=false' 'enableXsrfProtection=false' 'enableWebsocketCompression=false' 'address="0.0.0.0"' 'port=8080' > .streamlit/config.toml
-
+    # write Streamlit config (split into simple, safe lines)
+    - printf '[server]\n' > .streamlit/config.toml
+    - printf 'headless=true\n' >> .streamlit/config.toml
+    - printf 'enableCORS=false\n' >> .streamlit/config.toml
+    - printf 'enableXsrfProtection=false\n' >> .streamlit/config.toml
+    - printf 'enableWebsocketCompression=false\n' >> .streamlit/config.toml
+    - printf 'address="0.0.0.0"\n' >> .streamlit/config.toml
+    - printf 'port=8080\n' >> .streamlit/config.toml
   secrets:
     - name: SECRETS_TOML
       value-from: arn:aws:secretsmanager:us-east-2:650210024710:secret:asp/streamlit_secrets-AfRHA8
-  command: python3 -m streamlit run asp_ff_dashboard.py --server.port 8080 --server.address 0.0.0.0
+  command: python3 -m streamlit run asp_ff_dashboard.py --server.port 8080 --server.address 0.0.0.0 --logger.level=debug
