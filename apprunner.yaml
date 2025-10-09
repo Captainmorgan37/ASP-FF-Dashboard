@@ -15,4 +15,4 @@ run:
   pre-run:
     - python3 -m pip install --upgrade pip setuptools wheel
     - python3 -m pip install --no-cache-dir -r requirements.txt
-  command: bash -lc "streamlit run ASP\ FF\ Dashboard.py --server.port $PORT --server.address 0.0.0.0 --logger.level=debug"
+  command: bash -lc streamlit\ run\ asp_ff_dashboard.py\ --server.port\ \$PORT\ --server.address\ 0.0.0.0\ --logger.level=debug
