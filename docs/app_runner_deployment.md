@@ -49,4 +49,5 @@ When **Automatic** deployment is enabled, App Runner will rebuild and redeploy t
 * Confirm that all required secrets are defined as environment variables. A missing secret is a common cause of runtime errors.
 * If the build fails, double-check that the Dockerfile installs system dependencies (such as `build-essential`) required by Python packages.
 * If outbound requests to FlightAware or email servers fail, ensure the App Runner service has the necessary egress (public internet or VPC routing) and IAM permissions.
+* If you see the browser console report `WebSocket connection to 'wss://<app>.awsapprunner.com/_stcore/stream' failed`, double-check that the container disables Streamlit's WebSocket compression (App Runner's ALB does not support it). The repository now includes a `.streamlit/config.toml` with `enableWebsocketCompression = false`; make sure custom images or overrides keep that setting.
 
