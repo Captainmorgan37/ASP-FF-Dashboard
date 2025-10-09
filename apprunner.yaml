@@ -1,13 +1,15 @@
 version: 1.0
-runtime: python3
+runtime: python311
 
 build:
   commands:
-    pre-build:
-      - python -m pip install --upgrade pip setuptools wheel
+    # Nothing heavy here for Python 3.11 (revised build)
     build:
-      - python -m pip install --no-cache-dir -r requirements.txt
+      - echo "Build step (no dependency installs)"
 
 run:
   runtime-version: 3.11
+  pre-run:
+    - python3 -m pip install --upgrade pip setuptools wheel
+    - python3 -m pip install --no-cache-dir -r requirements.txt
   command: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
