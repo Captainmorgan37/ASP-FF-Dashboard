@@ -363,7 +363,6 @@ ui.run(
     host="0.0.0.0",
     port=_port(),
     show=False,
-    proxy_headers=True,             # <—
-    forwarded_allow_ips="*",        # <—
-    socket_io_cors_allowed_origins=["*"],  # be permissive behind proxy
+    proxy_headers=True,          # keep these two
+    forwarded_allow_ips="*",
 )
