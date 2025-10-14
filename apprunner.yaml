@@ -17,12 +17,29 @@ run:
     - python3 -m pip install --no-cache-dir -r requirements.txt
     - mkdir -p .streamlit
     - printf '%s' "$SECRETS_TOML" > .streamlit/secrets.toml
+    - |
+      cat <<EOF > .streamlit/config.toml
+      [server]
+      headless = true
+      enableCORS = false
+      enableXsrfProtection = false
+      enableWebsocketCompression = false
+      address = "0.0.0.0"
+      port = 8080
 
+      [browser]
+      serverAddress = "${PUBLIC_HOST}"
+      serverPort = 443
+      gatherUsageStats = false
+      EOF
   secrets:
     - name: SECRETS_TOML
       value-from: arn:aws:secretsmanager:us-east-2:650210024710:secret:asp/streamlit_secrets-AfRHA8
+  env:
+    - name: PUBLIC_HOST
+      value: "ftda8i7tpr.us-east-2.awsapprunner.com"
   command: >-
     python3 -m streamlit run asp_ff_dashboard.py
-    --server.port 8080
-    --server.address 0.0.0.0
-    --server.enableWebsocketCompression false
+    --server.port=8080
+    --server.address=0.0.0.0
+    --server.enableWebsocketCompression=false
