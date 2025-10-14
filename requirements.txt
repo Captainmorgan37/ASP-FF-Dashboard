@@ -7,3 +7,4 @@ timezonefinder
 requests
 boto3
 nicegui
+fastapi
