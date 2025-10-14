@@ -6,3 +6,4 @@ tzlocal
 timezonefinder
 requests
 boto3
+nicegui
