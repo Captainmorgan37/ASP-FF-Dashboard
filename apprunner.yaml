@@ -17,7 +17,8 @@ build:
 
 run:
   env:
-    PYTHONPATH: vendor
+    - name: PYTHONPATH
+      value: vendor
   command: python3 app.py
   network:
     port: 8080
