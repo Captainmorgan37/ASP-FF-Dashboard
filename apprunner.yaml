@@ -19,6 +19,8 @@ run:
   env:
     - name: PYTHONPATH
       value: vendor
+    - name: FORWARDED_ALLOW_IPS
+      value: "*"
   command: python3 app.py
   network:
     port: 8080
