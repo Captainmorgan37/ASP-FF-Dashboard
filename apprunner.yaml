@@ -1,8 +1,7 @@
 version: 1.0
 runtime: python3
 build:
-  commands:
-    - pip install --no-cache-dir -r requirements.txt
+  command: pip install --no-cache-dir -r requirements.txt
 run:
   command: python app.py
   network:
