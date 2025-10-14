@@ -7,50 +7,53 @@ Streamlit constraints that caused problems on App Runner.
 """
 
 from __future__ import annotations
-
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable
 
+# --- pandas guard (keeps service alive even if pandas missing) ---
 try:
     import pandas as pd
     PANDAS_ERROR = None
 except Exception as e:
     pd = None  # type: ignore
     PANDAS_ERROR = e
-from nicegui import app as nicegui_app
-from nicegui import ui
-from nicegui.events import UploadEventArguments
 
-
-
-# NEW: try/except around data_sources import
+# --- nicegui guard with fallback server if missing ---
+NICEGUI_ERROR = None
 try:
-    from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+    from nicegui import app as nicegui_app
+    from nicegui import ui
+    from nicegui.events import UploadEventArguments
 except Exception as e:
-    FL3XX_SCHEDULE_COLUMNS = [
-        "Booking", "Off-Block (Sched)", "On-Block (Sched)",
-        "From (ICAO)", "To (ICAO)", "Flight time (Est)",
-        "PIC", "SIC", "Account", "Aircraft", "Aircraft Type", "Workflow",
-    ]
-    class ScheduleData:  # minimal shim so the UI can boot
-        def __init__(self, frame, source, raw_bytes=None, metadata=None):
-            self.frame = frame
-            self.source = source
-            self.raw_bytes = raw_bytes
-            self.metadata = metadata or {}
-    def load_schedule(*args, **kwargs):
-        raise RuntimeError(f"data_sources not available: {e!r}")
+    NICEGUI_ERROR = e
+    # Minimal fallback HTTP server so App Runner health checks pass
+    from http.server import BaseHTTPRequestHandler, HTTPServer
 
-    IMPORT_ERROR = e
-else:
-    IMPORT_ERROR = None
+    def _port() -> int:
+        try:
+            return int(os.getenv("PORT", "8080"))
+        except ValueError:
+            return 8080
 
-if PANDAS_ERROR:
-    with ui.message_bar():
-        ui.icon('warning')
-        ui.label(f"pandas not available: {PANDAS_ERROR}. Demo features limited.")
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = (
+                "<h1>App Runner is up</h1>"
+                "<p>NiceGUI failed to import: <code>%s</code></p>"
+                "<p>Check requirements.txt and build logs for 'nicegui OK'.</p>" % (NICEGUI_ERROR,)
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    if __name__ == "__main__":
+        HTTPServer(("0.0.0.0", _port()), Handler).serve_forever()
+    # Important: stop executing the rest of this file when NiceGUI is missing
+    raise SystemExit(0)
 
 
 
@@ -218,6 +221,12 @@ if IMPORT_ERROR:
     with ui.message_bar():
         ui.icon('warning')
         ui.label(f"data_sources import failed: {IMPORT_ERROR}. Using fallback columns.")
+
+if PANDAS_ERROR:
+    with ui.message_bar():
+        ui.icon('warning')
+        ui.label(f"pandas not available: {PANDAS_ERROR}. Demo features limited.")
+
 
 
 with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
