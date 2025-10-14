@@ -133,6 +133,9 @@ schedule_state = SimpleNamespace(data=None)  # type: ignore[attr-defined]
 table_component: ui.table | None = None
 status_label: ui.label | None = None
 notification_log: ui.log | None = None
+# secrets UI state
+secret_state = SimpleNamespace(sections=[])
+
 
 
 def _refresh_table() -> None:
@@ -146,6 +149,13 @@ def _refresh_status() -> None:
     if status_label is None:
         return
     status_label.text = _format_metadata(schedule_state.data)
+
+# First render of secrets diagnostics
+try:
+    secret_state.sections = collect_secret_diagnostics()
+except Exception as _e:  # defensive: don’t crash UI if diagnostics fail
+    secret_state.sections = []
+
 
 def _render_secret_sections(container: ui.column, sections: list[SecretSection]) -> None:
     container.clear()
