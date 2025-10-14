@@ -5,6 +5,8 @@ NiceGUI.  It keeps the data loading utilities from the existing code base and
 adds inline notification controls so the application can evolve beyond the
 Streamlit constraints that caused problems on App Runner.
 """
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
 
 from __future__ import annotations
 import os
