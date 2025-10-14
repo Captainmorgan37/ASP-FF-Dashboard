@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable
+from secrets_diagnostics import SecretSection, collect_secret_diagnostics
+
 
 # --- pandas guard (never crash the process if it’s missing) ---
 try:
@@ -144,6 +146,45 @@ def _refresh_status() -> None:
     if status_label is None:
         return
     status_label.text = _format_metadata(schedule_state.data)
+
+def _render_secret_sections(container: ui.column, sections: list[SecretSection]) -> None:
+    container.clear()
+
+    if not sections:
+        with container:
+            ui.label(
+                "No secret-driven integrations detected."
+            ).classes("text-sm text-gray-600")
+        return
+
+    columns = [
+        {"name": "item", "label": "Item", "field": "item", "align": "left"},
+        {"name": "status", "label": "Status", "field": "status", "align": "left"},
+        {"name": "source", "label": "Source", "field": "source", "align": "left"},
+        {"name": "detail", "label": "Details", "field": "detail", "align": "left"},
+    ]
+
+    for section in sections:
+        with container:
+            with ui.expansion(section.title, value=section.has_warning).classes("w-full"):
+                rows = [
+                    {
+                        "item": row.item,
+                        "status": row.status,
+                        "source": row.source,
+                        "detail": row.detail,
+                    }
+                    for row in section.rows
+                ]
+                table = ui.table(columns=columns, rows=rows).classes("w-full")
+                table.props("dense flat bordered")
+
+
+def refresh_secret_diagnostics() -> None:
+    secret_state.sections = collect_secret_diagnostics()
+    if secret_sections_container is not None:
+        _render_secret_sections(secret_sections_container, secret_state.sections)
+    ui.notify("Secrets diagnostics refreshed", type="positive")
 
 
 def _handle_schedule_loaded(schedule: ScheduleData, success_message: str) -> None:
@@ -286,6 +327,15 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
             row_key="Booking",
         ).classes("w-full")
         table_component.props("dense flat bordered")
+
+    with ui.card().classes("w-full"):
+        with ui.row().classes("items-center justify-between w-full"):
+            ui.label("Secrets diagnostics").classes("text-base font-medium")
+            ui.button("Refresh", on_click=refresh_secret_diagnostics).props("outline")
+
+        container = ui.column().classes("w-full gap-2 mt-2")
+        secret_sections_container = container  # type: ignore[assignment]
+        _render_secret_sections(container, secret_state.sections)
 
 
 # ---------------------------------------------------------------------------
