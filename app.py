@@ -18,7 +18,28 @@ from nicegui import app as nicegui_app
 from nicegui import ui
 from nicegui.events import UploadEventArguments
 
-from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+# NEW: try/except around data_sources import
+try:
+    from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+except Exception as e:
+    FL3XX_SCHEDULE_COLUMNS = [
+        "Booking", "Off-Block (Sched)", "On-Block (Sched)",
+        "From (ICAO)", "To (ICAO)", "Flight time (Est)",
+        "PIC", "SIC", "Account", "Aircraft", "Aircraft Type", "Workflow",
+    ]
+    class ScheduleData:  # minimal shim so the UI can boot
+        def __init__(self, frame, source, raw_bytes=None, metadata=None):
+            self.frame = frame
+            self.source = source
+            self.raw_bytes = raw_bytes
+            self.metadata = metadata or {}
+    def load_schedule(*args, **kwargs):
+        raise RuntimeError(f"data_sources not available: {e!r}")
+
+    IMPORT_ERROR = e
+else:
+    IMPORT_ERROR = None
+
 
 
 # ---------------------------------------------------------------------------
