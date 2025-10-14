@@ -4,16 +4,19 @@ build:
   commands:
     pre-build:
       - python3 --version
-      - pip3 --version
-      - pwd
+      - python3 -m pip --version
       - ls -la
       - echo "---- requirements.txt ----"
       - cat requirements.txt
     build:
-      - pip3 install --upgrade pip
-      - pip3 install --no-cache-dir -r requirements.txt
-      - python3 -c "import pandas; import nicegui; print('pandas OK', pandas.__version__); print('nicegui OK', nicegui.__version__)"
+      # install to a local folder inside your repo (part of the image)
+      - mkdir -p vendor
+      - python3 -m pip install --upgrade pip
+      - python3 -m pip install --no-cache-dir -r requirements.txt --target ./vendor
+      # prove both import in the build image **from vendor**
+      - python3 -c "import sys; sys.path.insert(0,'vendor'); import pandas, nicegui; print('pandas OK', pandas.__version__); print('nicegui OK', nicegui.__version__)"
 run:
-  command: python3 app.py
+  # add vendor to PYTHONPATH so runtime sees it
+  command: bash -lc 'export PYTHONPATH=vendor:$PYTHONPATH; python3 app.py'
   network:
     port: 8080
