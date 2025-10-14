@@ -18,6 +18,14 @@ from nicegui import app as nicegui_app
 from nicegui import ui
 from nicegui.events import UploadEventArguments
 
+# ... imports above ...
+try:
+    import pandas as pd
+    PANDAS_ERROR = None
+except Exception as e:
+    pd = None  # type: ignore
+    PANDAS_ERROR = e
+
 # NEW: try/except around data_sources import
 try:
     from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
@@ -39,6 +47,12 @@ except Exception as e:
     IMPORT_ERROR = e
 else:
     IMPORT_ERROR = None
+
+if PANDAS_ERROR:
+    with ui.message_bar():
+        ui.icon('warning')
+        ui.label(f"pandas not available: {PANDAS_ERROR}. Demo features limited.")
+
 
 
 
@@ -133,7 +147,9 @@ def load_schedule_from_upload(event: UploadEventArguments) -> None:
 
 
 def simulate_fetch_from_fl3xx() -> None:
-    """Demonstrate loading flights from the FL3XX API path.
+    if pd is None:
+        ui.notify("pandas is required for this demo action", type="warning")
+        return    """Demonstrate loading flights from the FL3XX API path.
 
     The production implementation would call ``fetch_flights`` from
     ``fl3xx_client``.  For now we build a tiny dataframe to show how the
