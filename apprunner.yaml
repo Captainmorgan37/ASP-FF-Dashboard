@@ -10,7 +10,6 @@ build:
       - cat requirements.txt
     build:
       - pip3 install --no-cache-dir -r requirements.txt
-      - python3 -c "import pandas; print('pandas OK', pandas.__version__)"
 run:
   command: python3 app.py
   network:
