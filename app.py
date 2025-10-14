@@ -162,47 +162,63 @@ def load_schedule_from_upload(event: UploadEventArguments) -> None:
         return
 
     metadata = {"filename": event.name, "uploaded_at": _utc_timestamp()}
-    schedule = load_schedule("csv_upload", csv_bytes=content, metadata=metadata)
-    _handle_schedule_loaded(schedule, f"Loaded {len(schedule.frame)} flights from {event.name}")
+
+    try:
+        schedule = load_schedule("csv_upload", csv_bytes=content, metadata=metadata)
+    except Exception as exc:  # pragma: no cover - defensive guard for runtime issues
+        ui.notify(f"Unable to parse {event.name}: {exc}", type="negative")
+        print(f"CSV upload failed for {event.name}: {exc}")
+        return
+
+    _handle_schedule_loaded(
+        schedule,
+        f"Loaded {len(schedule.frame)} flights from {event.name}",
+    )
+
+
+_SAMPLE_FLIGHT = {
+    "bookingIdentifier": "FLX-001",
+    "blockOffEstUTC": "2024-03-01T15:00:00Z",
+    "blockOnEstUTC": "2024-03-01T18:15:00Z",
+    "airportFrom": "CYUL",
+    "airportTo": "KBOS",
+    "picName": "Doe",
+    "sicName": "Roe",
+    "accountName": "Demo",
+    "registrationNumber": "C-GXYZ",
+    "aircraftCategory": "CL35",
+    "workflowCustomName": "Confirmed",
+}
 
 
 def simulate_fetch_from_fl3xx() -> None:
-    if pd is None:
-        ui.notify("pandas is required for this demo action", type="warning")
-        return    """Demonstrate loading flights from the FL3XX API path.
+    """Demonstrate populating the schedule via the FL3XX normalization path."""
 
-    The production implementation would call ``fetch_flights`` from
-    ``fl3xx_client``.  For now we build a tiny dataframe to show how the
-    schedule table updates without requiring external credentials.
-    """
+    if IMPORT_ERROR:
+        ui.notify(
+            "FL3XX helpers are unavailable in this build; upload a CSV instead.",
+            type="warning",
+        )
+        print(f"Sample flight skipped because data_sources import failed: {IMPORT_ERROR}")
+        return
 
-    sample_rows = pd.DataFrame(
-        [
-            {
-                "Booking": "FLX-001",
-                "Off-Block (Sched)": "01.03.2024 15:00",
-                "On-Block (Sched)": "01.03.2024 18:15",
-                "From (ICAO)": "CYUL",
-                "To (ICAO)": "KBOS",
-                "Flight time (Est)": "03:15",
-                "PIC": "Doe",
-                "SIC": "Roe",
-                "Account": "Demo",
-                "Aircraft": "C-GXYZ",
-                "Aircraft Type": "CL35",
-                "Workflow": "Confirmed",
-            },
-        ],
-        columns=FL3XX_SCHEDULE_COLUMNS,
+    metadata = {
+        "flights": [_SAMPLE_FLIGHT],
+        "updated_at": _utc_timestamp(),
+        "sample": True,
+    }
+
+    try:
+        schedule = load_schedule("fl3xx_api", metadata=metadata)
+    except Exception as exc:  # pragma: no cover - runtime safety net
+        ui.notify(f"Unable to load sample flight: {exc}", type="negative")
+        print(f"Sample FL3XX load failed: {exc}")
+        return
+
+    _handle_schedule_loaded(
+        schedule,
+        "Loaded sample flight using the FL3XX API formatter",
     )
-
-    schedule = ScheduleData(
-        frame=sample_rows,
-        source="fl3xx_api",
-        raw_bytes=None,
-        metadata={"updated_at": _utc_timestamp(), "flight_count": 1},
-    )
-    _handle_schedule_loaded(schedule, "Loaded sample flight from FL3XX API")
 
 
 def send_notification(message_box: ui.textarea) -> None:
@@ -277,16 +293,10 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
 # ---------------------------------------------------------------------------
 
 
-def _port() -> int:
-    try:
-        return int(os.getenv("PORT", "8080"))
-    except ValueError:
-        return 8080
-
-
-ui.run(
-    host="0.0.0.0",
-    port=_port(),
-    show=False,
-)
+if __name__ == "__main__":
+    ui.run(
+        host="0.0.0.0",
+        port=_port(),
+        show=False,
+    )
 
