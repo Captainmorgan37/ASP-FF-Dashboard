@@ -1,7 +1,7 @@
 # secrets_diagnostics.py
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Iterable, List, Optional
 import os
 import json
 
@@ -51,19 +51,43 @@ def _read_secret(name: str) -> Optional[str]:
     except (BotoCoreError, ClientError, Exception):
         return None
 
-def _row(label: str, env_key: str, secret_key: Optional[str] = None) -> SecretRow:
-    env_v = _read_env(env_key)
-    sec_v = _read_secret(secret_key) if secret_key else None
+def _coerce_keys(keys: str | Iterable[str] | None) -> tuple[str, ...]:
+    if not keys:
+        return ()
+    if isinstance(keys, str):
+        return (keys,)
+    return tuple(keys)
 
-    if env_v:
-        return SecretRow(item=label, status="OK", source=f"ENV:{env_key}", detail="set")
-    if sec_v:
-        return SecretRow(item=label, status="OK", source=f"SM:{secret_key}", detail="set")
-    return SecretRow(item=label, status="MISSING", source="-", detail="not found")
+
+def _row(
+    label: str,
+    env_keys: str | Iterable[str],
+    secret_keys: Optional[str | Iterable[str]] = None,
+) -> SecretRow:
+    for key in _coerce_keys(env_keys):
+        env_v = _read_env(key)
+        if env_v:
+            return SecretRow(item=label, status="OK", source=f"ENV:{key}", detail="set")
+
+    for key in _coerce_keys(secret_keys):
+        sec_v = _read_secret(key)
+        if sec_v:
+            return SecretRow(item=label, status="OK", source=f"SM:{key}", detail="set")
+
+    checked = [f"ENV:{key}" for key in _coerce_keys(env_keys)]
+    checked.extend(f"SM:{key}" for key in _coerce_keys(secret_keys))
+    detail = "not found"
+    if checked:
+        detail = f"not found ({', '.join(checked)})"
+    return SecretRow(item=label, status="MISSING", source="-", detail=detail)
 
 def collect_secret_diagnostics() -> List[SecretSection]:
     rows = [
-        _row("FL3XX token", "FL3XX_TOKEN", "FL3XX_TOKEN"),
+        _row(
+            "FL3XX token",
+            ("FL3XX_TOKEN", "FL3XX_API_TOKEN"),
+            ("FL3XX_TOKEN", "FL3XX_API_TOKEN"),
+        ),
         _row("FL3XX base URL", "FL3XX_BASE_URL", "FL3XX_BASE_URL"),
         _row("Admin token", "ADMIN_TOKEN", "ADMIN_TOKEN"),
         _row("Self base URL", "SELF_BASE_URL", "SELF_BASE_URL"),
