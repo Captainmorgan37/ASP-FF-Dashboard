@@ -1,7 +1,7 @@
 """NiceGUI entrypoint for running the dashboard on AWS App Runner."""
-from __future__ import annotations  # <-- keep ONLY if you really want it (optional on 3.11)
+from __future__ import annotations  # optional on Python 3.11
 
-# vendor path must come AFTER the future import
+# --- make local vendor/ available before any imports ---
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
 
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable
 
-# pandas guard
+# --- pandas guard (never crash the process if it’s missing) ---
 try:
     import pandas as pd
     PANDAS_ERROR = None
@@ -17,37 +17,41 @@ except Exception as e:
     pd = None  # type: ignore
     PANDAS_ERROR = e
 
-# nicegui guard (with your existing fallback server block below if desired)
-from nicegui import app as nicegui_app
-from nicegui import ui
-from nicegui.events import UploadEventArguments
+# --- NiceGUI guard; start a tiny HTTP server if NiceGUI is missing ---
+NICEGUI_ERROR = None
+try:
+    from nicegui import app as nicegui_app
+    from nicegui import ui
+    from nicegui.events import UploadEventArguments
+except Exception as e:
+    NICEGUI_ERROR = e
 
-    # Minimal fallback HTTP server so App Runner health checks pass
+def _port() -> int:
+    try:
+        return int(os.getenv("PORT", "8080"))
+    except ValueError:
+        return 8080
+
+if NICEGUI_ERROR:
     from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    def _port() -> int:
-        try:
-            return int(os.getenv("PORT", "8080"))
-        except ValueError:
-            return 8080
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = (
+            msg = (
                 "<h1>App Runner is up</h1>"
-                "<p>NiceGUI failed to import: <code>%s</code></p>"
-                "<p>Check requirements.txt and build logs for 'nicegui OK'.</p>" % (NICEGUI_ERROR,)
+                f"<p>NiceGUI failed to import: <code>{NICEGUI_ERROR}</code></p>"
+                "<p>Check requirements.txt and build logs for 'nicegui OK'.</p>"
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(msg)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(msg)
 
     if __name__ == "__main__":
         HTTPServer(("0.0.0.0", _port()), Handler).serve_forever()
-    # Important: stop executing the rest of this file when NiceGUI is missing
     raise SystemExit(0)
+
 
 
 
