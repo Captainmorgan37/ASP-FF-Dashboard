@@ -1,13 +1,6 @@
 version: 1.0
 runtime: python311
-build:
-  commands:
-    pre-build:
-      - echo "no-op prebuild"
-    build:
-      - echo "no-op build"
-    post-build:
-      - echo "no-op postbuild"
+
 run:
   runtime-version: 3.11
   pre-run:
