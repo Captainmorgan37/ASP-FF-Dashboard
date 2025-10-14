@@ -1,20 +1,15 @@
-"""NiceGUI entrypoint for running the dashboard on AWS App Runner.
+"""NiceGUI entrypoint for running the dashboard on AWS App Runner."""
+from __future__ import annotations  # <-- keep ONLY if you really want it (optional on 3.11)
 
-This module provides a lightweight, Streamlit-free interface built with
-NiceGUI.  It keeps the data loading utilities from the existing code base and
-adds inline notification controls so the application can evolve beyond the
-Streamlit constraints that caused problems on App Runner.
-"""
+# vendor path must come AFTER the future import
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
 
-from __future__ import annotations
-import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable
 
-# --- pandas guard (keeps service alive even if pandas missing) ---
+# pandas guard
 try:
     import pandas as pd
     PANDAS_ERROR = None
@@ -22,14 +17,11 @@ except Exception as e:
     pd = None  # type: ignore
     PANDAS_ERROR = e
 
-# --- nicegui guard with fallback server if missing ---
-NICEGUI_ERROR = None
-try:
-    from nicegui import app as nicegui_app
-    from nicegui import ui
-    from nicegui.events import UploadEventArguments
-except Exception as e:
-    NICEGUI_ERROR = e
+# nicegui guard (with your existing fallback server block below if desired)
+from nicegui import app as nicegui_app
+from nicegui import ui
+from nicegui.events import UploadEventArguments
+
     # Minimal fallback HTTP server so App Runner health checks pass
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
