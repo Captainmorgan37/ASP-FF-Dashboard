@@ -3,12 +3,8 @@ runtime: python311
 
 build:
   commands:
-    pre-build:
-      - echo "no-op prebuild"
     build:
-      - echo "no-op build"
-    post-build:
-      - echo "no-op postbuild"
+      - /bin/true    # always succeeds
 
 run:
   runtime-version: 3.11
@@ -17,7 +13,6 @@ run:
     - python3 -m pip install --no-cache-dir -r requirements.txt
     - mkdir -p .streamlit
     - printf '%s' "$SECRETS_TOML" > .streamlit/secrets.toml
-    # write .streamlit/config.toml without heredoc
     - printf '[server]\n' > .streamlit/config.toml
     - printf 'headless=true\n' >> .streamlit/config.toml
     - printf 'enableCORS=false\n' >> .streamlit/config.toml
