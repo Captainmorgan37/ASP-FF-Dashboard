@@ -5,7 +5,7 @@ This guide explains how to connect the GitHub repository to an App Runner servic
 ## 1. Prepare the repository
 
 1. **Add a production configuration file** (if you have not already) that describes the App Runner secrets. Store the values in App Runner rather than committing them to the repo.
-2. **Ensure the repository contains a Dockerfile**. App Runner will build the container image from the Dockerfile at the root of the repo. The Dockerfile should install the packages in `requirements.txt` and expose port 8501 for Streamlit.
+2. **Include the `apprunner.yaml` file at the repository root.** This file tells App Runner to use the managed Python 3.11 runtime, install the dependencies from `requirements.txt`, and run Streamlit with the correct flags (including disabling WebSocket compression). Make sure any updates to runtime behaviour are reflected in this file.
 
 ## 2. Authorize GitHub in App Runner
 
@@ -22,10 +22,8 @@ This guide explains how to connect the GitHub repository to an App Runner servic
 
 ## 4. Configure the build & runtime
 
-1. In **Build configuration**, leave the defaults (App Runner uses the Dockerfile).
-2. In **Runtime configuration**, set:
-   * **Port**: `8501`
-   * **Start command**: `streamlit run "ASP FF Dashboard.py" --server.port 8501 --server.address 0.0.0.0 --server.enableWebsocketCompression false`
+1. In **Build configuration**, choose **Use a configuration file** and keep the default path `apprunner.yaml` (or point to the location if you moved it). App Runner will read the build and run commands from this file instead of requiring a Dockerfile.
+2. In **Runtime configuration**, leave the defaults—the start command, port, and environment variables are supplied by `apprunner.yaml`. You can override values here if you need to temporarily test a change.
 3. Add environment variables that map to the secrets the app expects. A common pattern is to keep secret values in AWS Secrets Manager and inject them via environment variables.
 
 ## 5. Networking and IAM
@@ -36,18 +34,17 @@ This guide explains how to connect the GitHub repository to an App Runner servic
 ## 6. First deployment
 
 1. Review the summary and create the service.
-2. App Runner will clone the repository, build the Docker image, and deploy it.
+2. App Runner will clone the repository, run the build commands from `apprunner.yaml`, and deploy the managed runtime.
 3. Once the service status becomes **Running**, open the default domain shown in the console to verify that Streamlit loads.
 
 ## 7. Ongoing deployments
 
-When **Automatic** deployment is enabled, App Runner will rebuild and redeploy the container whenever commits are pushed to the configured branch. You can also trigger a manual deployment from the console or via the AWS CLI if you need to redeploy without a new commit.
+When **Automatic** deployment is enabled, App Runner will repeat the steps defined in `apprunner.yaml` whenever commits are pushed to the configured branch. You can also trigger a manual deployment from the console or via the AWS CLI if you need to redeploy without a new commit.
 
 ## Troubleshooting tips
 
-* Use the **Logs** tab in the App Runner console to read the container build and runtime logs. Streamlit logs appear in the runtime logs.
+* Use the **Logs** tab in the App Runner console to read the build and runtime logs. Streamlit logs appear in the runtime logs.
 * Confirm that all required secrets are defined as environment variables. A missing secret is a common cause of runtime errors.
-* If the build fails, double-check that the Dockerfile installs system dependencies (such as `build-essential`) required by Python packages.
+* If the build fails, double-check that the dependencies listed in `requirements.txt` (and any system packages they rely on) are installed correctly. You can add extra `pip install` or `apt-get` commands to the `apprunner.yaml` build step when needed.
 * If outbound requests to FlightAware or email servers fail, ensure the App Runner service has the necessary egress (public internet or VPC routing) and IAM permissions.
-* If you see the browser console report `WebSocket connection to 'wss://<app>.awsapprunner.com/_stcore/stream' failed`, double-check that the container disables Streamlit's WebSocket compression (App Runner's ALB does not support it). The repository now includes a `.streamlit/config.toml` with `enableWebsocketCompression = false` **and** runs Streamlit with `--server.enableWebsocketCompression=false`; make sure custom images, Dockerfiles, or overrides keep those settings.
-
+* If you see the browser console report `WebSocket connection to 'wss://<app>.awsapprunner.com/_stcore/stream' failed`, double-check that the repository's `.streamlit/config.toml` and the Streamlit CLI arguments both keep `enableWebsocketCompression` set to `false`.
