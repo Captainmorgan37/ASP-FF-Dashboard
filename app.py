@@ -52,6 +52,26 @@ if NICEGUI_ERROR:
         HTTPServer(("0.0.0.0", _port()), Handler).serve_forever()
     raise SystemExit(0)
 
+# --- data_sources guard (ensures IMPORT_ERROR is always defined) ---
+IMPORT_ERROR = None
+try:
+    from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+except Exception as e:
+    IMPORT_ERROR = e
+    # Fallbacks so the app can still run
+    FL3XX_SCHEDULE_COLUMNS = [
+        "Booking", "Off-Block (Sched)", "On-Block (Sched)",
+        "From (ICAO)", "To (ICAO)", "Flight time (Est)",
+        "PIC", "SIC", "Account", "Aircraft", "Aircraft Type", "Workflow",
+    ]
+    class ScheduleData:  # minimal shim
+        def __init__(self, frame, source, raw_bytes=None, metadata=None):
+            self.frame = frame
+            self.source = source
+            self.raw_bytes = raw_bytes
+            self.metadata = metadata or {}
+    def load_schedule(*args, **kwargs):
+        raise RuntimeError(f"data_sources not available: {e!r}")
 
 
 
