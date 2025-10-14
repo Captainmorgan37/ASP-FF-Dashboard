@@ -1,11 +1,13 @@
 version: 1.0
 runtime: python311
-
 build:
   commands:
+    pre-build:
+      - echo "no-op prebuild"
     build:
-      - /bin/true    # always succeeds
-
+      - echo "no-op build"
+    post-build:
+      - echo "no-op postbuild"
 run:
   runtime-version: 3.11
   pre-run:
@@ -13,13 +15,14 @@ run:
     - python3 -m pip install --no-cache-dir -r requirements.txt
     - mkdir -p .streamlit
     - printf '%s' "$SECRETS_TOML" > .streamlit/secrets.toml
+    # write .streamlit/config.toml without heredoc
     - printf '[server]\n' > .streamlit/config.toml
     - printf 'headless=true\n' >> .streamlit/config.toml
     - printf 'enableCORS=false\n' >> .streamlit/config.toml
     - printf 'enableXsrfProtection=false\n' >> .streamlit/config.toml
     - printf 'enableWebsocketCompression=false\n' >> .streamlit/config.toml
     - printf 'address="0.0.0.0"\n' >> .streamlit/config.toml
-    - printf 'port=8080\n' >> .streamlit/config.toml
+    - printf 'port=%s\n' "$PORT" >> .streamlit/config.toml
     - printf '[browser]\n' >> .streamlit/config.toml
     - printf 'serverAddress="%s"\n' "$PUBLIC_HOST" >> .streamlit/config.toml
     - printf 'serverPort=443\n' >> .streamlit/config.toml
@@ -30,4 +33,4 @@ run:
   env:
     - name: PUBLIC_HOST
       value: "ftda8i7tpr.us-east-2.awsapprunner.com"
-  command: python3 -m streamlit run asp_ff_dashboard.py --server.port=8080 --server.address=0.0.0.0 --server.enableWebsocketCompression=false
+  command: python3 -m streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.enableWebsocketCompression=false
