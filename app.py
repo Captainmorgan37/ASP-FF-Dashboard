@@ -359,10 +359,11 @@ def _port() -> int:
     except ValueError:
         return 8080
 
-# 👇 DO NOT wrap this in a plain __name__ == "__main__" guard
-if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(host="0.0.0.0", port=_port(), show=False)
-else:
-    # also start when imported by uvicorn / multiprocessing workers
-    ui.run(host="0.0.0.0", port=_port(), show=False)
-
+ui.run(
+    host="0.0.0.0",
+    port=_port(),
+    show=False,
+    proxy_headers=True,             # <—
+    forwarded_allow_ips="*",        # <—
+    socket_io_cors_allowed_origins=["*"],  # be permissive behind proxy
+)
