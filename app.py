@@ -13,18 +13,17 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable
 
-import pandas as pd
-from nicegui import app as nicegui_app
-from nicegui import ui
-from nicegui.events import UploadEventArguments
-
-# ... imports above ...
 try:
     import pandas as pd
     PANDAS_ERROR = None
 except Exception as e:
     pd = None  # type: ignore
     PANDAS_ERROR = e
+from nicegui import app as nicegui_app
+from nicegui import ui
+from nicegui.events import UploadEventArguments
+
+
 
 # NEW: try/except around data_sources import
 try:
