@@ -6,5 +6,5 @@ tzlocal
 timezonefinder
 requests
 boto3
-nicegui
+nicegui>=2.0.0
 fastapi
