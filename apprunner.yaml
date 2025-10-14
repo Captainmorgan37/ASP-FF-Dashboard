@@ -1,8 +1,9 @@
 version: 1.0
-runtime: python3
+runtime: python311   # or "python3" on older services; 3.11 is the current managed runtime
 build:
   commands:
-    - pip install --no-cache-dir -r requirements.txt
+    build:
+      - pip install --no-cache-dir -r requirements.txt
 run:
   command: python app.py
   network:
