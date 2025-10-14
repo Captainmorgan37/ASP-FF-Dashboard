@@ -1,5 +1,5 @@
 streamlit
-pandas==2.2.*
+pandas==2.2.2
 streamlit-autorefresh
 python-dateutil
 tzlocal
