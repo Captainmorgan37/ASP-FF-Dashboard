@@ -491,24 +491,56 @@ def _fl3xx_secret_diagnostics_rows() -> list[dict[str, str]]:
             "Value provided" if auth_header else "Missing or blank value",
         )
 
-    explicit_token = _normalize_secret_value(
-        _read_streamlit_secret("FL3XX_API_TOKEN"), allow_blank=True
-    )
-    if explicit_token is not None:
+    for secret_key in ("FL3XX_TOKEN", "FL3XX_API_TOKEN"):
+        secret_value = _normalize_secret_value(
+            _read_streamlit_secret(secret_key), allow_blank=True
+        )
+        if secret_value is not None:
+            _add_row(
+                f"st.secrets['{secret_key}']",
+                bool(secret_value),
+                "Value provided" if secret_value else "Value present but blank",
+            )
+        else:
+            _add_row(f"st.secrets['{secret_key}']", False, "Secret not defined")
+
+    for env_key in ("FL3XX_TOKEN", "FL3XX_API_TOKEN"):
+        env_token = _normalize_secret_value(os.getenv(env_key), allow_blank=True)
         _add_row(
-            "st.secrets['FL3XX_API_TOKEN']",
-            bool(explicit_token),
-            "Value provided" if explicit_token else "Value present but blank",
+            f"env:{env_key}",
+            bool(env_token),
+            "Environment variable set" if env_token else "Environment variable not set",
+        )
+
+    base_url_secret = _normalize_secret_value(
+        _read_streamlit_secret("FL3XX_BASE_URL"), allow_blank=True
+    )
+    if base_url_secret:
+        _add_row(
+            "st.secrets['FL3XX_BASE_URL']",
+            True,
+            "Custom base URL set",
         )
     else:
-        _add_row("st.secrets['FL3XX_API_TOKEN']", False, "Secret not defined")
+        _add_row(
+            "st.secrets['FL3XX_BASE_URL']",
+            True,
+            f"Not set; defaulting to {DEFAULT_FL3XX_BASE_URL}",
+        )
 
-    env_token = _normalize_secret_value(os.getenv("FL3XX_API_TOKEN"), allow_blank=True)
-    _add_row(
-        "env:FL3XX_API_TOKEN",
-        bool(env_token),
-        "Environment variable set" if env_token else "Environment variable not set",
-    )
+    base_url_env = _normalize_secret_value(os.getenv("FL3XX_BASE_URL"), allow_blank=True)
+    if base_url_env:
+        _add_row(
+            "env:FL3XX_BASE_URL",
+            True,
+            "Custom base URL set",
+        )
+    else:
+        _add_row(
+            "env:FL3XX_BASE_URL",
+            True,
+            f"Not set; defaulting to {DEFAULT_FL3XX_BASE_URL}",
+        )
 
     auth_header_name = _normalize_secret_value(
         _read_streamlit_secret("FL3XX_AUTH_HEADER_NAME") or os.getenv("FL3XX_AUTH_HEADER_NAME"),
@@ -1193,10 +1225,18 @@ def _build_fl3xx_config_from_secrets() -> Fl3xxApiConfig:
         if value:
             merged.update(dict(value))
 
-    base_url = str(merged.get("base_url") or DEFAULT_FL3XX_BASE_URL)
+    base_url_value = (
+        merged.get("base_url")
+        or read_streamlit_secret("FL3XX_BASE_URL")
+        or os.getenv("FL3XX_BASE_URL")
+        or DEFAULT_FL3XX_BASE_URL
+    )
+    base_url = str(base_url_value)
 
     api_token = (
         merged.get("api_token")
+        or read_streamlit_secret("FL3XX_TOKEN")
+        or os.getenv("FL3XX_TOKEN")
         or read_streamlit_secret("FL3XX_API_TOKEN")
         or os.getenv("FL3XX_API_TOKEN")
     )

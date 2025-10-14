@@ -26,10 +26,14 @@ front-ends aligned.
 
 ### FL3XX API credentials
 
-* Define an App Runner secret named `FL3XX_API_TOKEN` or add a structured
-  `[fl3xx_api]` block (with `api_token` or `auth_header`) via the console. The
-  Streamlit helpers look for the same keys inside `_build_fl3xx_config_from_secrets()`【F:ASP FF Dashboard.py†L1027-L1100】
-  and refuse to call the API when no auth material is provided.【F:ASP FF Dashboard.py†L1267-L1289】
+* Define an App Runner secret named `FL3XX_TOKEN` (the legacy `FL3XX_API_TOKEN`
+  is still accepted) or add a structured `[fl3xx_api]` block with `api_token` or
+  `auth_header` via the console. The Streamlit helpers look for the same keys
+  inside `_build_fl3xx_config_from_secrets()`【F:ASP FF Dashboard.py†L1188-L1255】
+  and refuse to call the API when no auth material is provided.【F:ASP FF Dashboard.py†L1299-L1321】
+* Optionally set `FL3XX_BASE_URL` when the deployment should talk to a regional
+  endpoint instead of the default US URL. The diagnostics surface which source
+  supplied the active base URL so both front-ends stay aligned.【F:ASP FF Dashboard.py†L468-L520】
 * If the production environment uses a custom header name, also set
   `FL3XX_AUTH_HEADER_NAME`—the existing `Fl3xxApiConfig` object honours that at
   request time.【F:fl3xx_client.py†L14-L184】
