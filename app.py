@@ -186,13 +186,24 @@ def send_notification(message_box: ui.textarea) -> None:
 # ---------------------------------------------------------------------------
 
 
-nicegui_app.add_static_files("/static", os.path.join(os.path.dirname(__file__), "docs"))
+# CHANGED: only register /static if folder exists
+docs_dir = os.path.join(os.path.dirname(__file__), "docs")
+if os.path.isdir(docs_dir):
+    nicegui_app.add_static_files("/static", docs_dir)
+
 
 ui.page_title("FF Dashboard (NiceGUI)")
 
 with ui.header().classes("items-center justify-between"):
     ui.label("FF Dashboard (App Runner)").classes("text-lg font-medium")
     ui.button("Load sample flight", on_click=simulate_fetch_from_fl3xx).props("color=primary")
+
+# NEW: visible warning if import failed
+if IMPORT_ERROR:
+    with ui.message_bar():
+        ui.icon('warning')
+        ui.label(f"data_sources import failed: {IMPORT_ERROR}. Using fallback columns.")
+
 
 with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
     with ui.card().classes("w-full"):
