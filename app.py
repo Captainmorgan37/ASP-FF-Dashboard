@@ -292,11 +292,17 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
 # Application entrypoint
 # ---------------------------------------------------------------------------
 
+def _port() -> int:
+    import os
+    try:
+        return int(os.getenv("PORT", "8080"))
+    except ValueError:
+        return 8080
 
-if __name__ == "__main__":
-    ui.run(
-        host="0.0.0.0",
-        port=_port(),
-        show=False,
-    )
+# 👇 DO NOT wrap this in a plain __name__ == "__main__" guard
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(host="0.0.0.0", port=_port(), show=False)
+else:
+    # also start when imported by uvicorn / multiprocessing workers
+    ui.run(host="0.0.0.0", port=_port(), show=False)
 
