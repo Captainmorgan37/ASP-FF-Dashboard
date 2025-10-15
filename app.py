@@ -384,6 +384,11 @@ ui.run(
     show=False,
     proxy_headers=True,
     forwarded_allow_ips="*",
+    http="h11",          # <- prefer h11 (HTTP/1.1) behind App Runner
+    ws="wsproto",        # <- use wsproto WS implementation (more tolerant behind proxies)
+    uvicorn_logging_level="debug",
+)
+
     uvicorn_logging_level="debug",  # <— see handshake & 4xx in logs
 )
 
