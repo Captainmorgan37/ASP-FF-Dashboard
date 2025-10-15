@@ -21,9 +21,8 @@ run:
       value: vendor
     - name: FORWARDED_ALLOW_IPS
       value: "*"
-    # Optional: temporarily force polling while you verify everything
-    # - name: NICEGUI_DISABLE_WEBSOCKETS
-    #   value: "1"
+    - name: NICEGUI_DISABLE_WEBSOCKETS
+      value: "1"           # ⬅️ force polling instead of websockets
   command: python3 app.py
   network:
     port: 8080
