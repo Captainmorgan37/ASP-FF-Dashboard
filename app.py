@@ -54,6 +54,16 @@ if NICEGUI_ERROR:
         HTTPServer(("0.0.0.0", _port()), Handler).serve_forever()
     raise SystemExit(0)
 
+# Tell python-socketio/engineio to ping frequently (helps proxies)
+import socketio
+import engineio
+try:
+    # These attributes exist in recent versions; guarded to be safe
+    engineio.async_drivers.gevent  # no-op reference to ensure engineio is loaded
+except Exception:
+    pass
+
+
 # --- data_sources guard (ensures IMPORT_ERROR is always defined) ---
 IMPORT_ERROR = None
 try:
@@ -359,10 +369,21 @@ def _port() -> int:
     except ValueError:
         return 8080
 
+try:
+    # NiceGUI exposes the socket.io server via ui.run options in newer versions;
+    # when not available, this is safe to skip.
+    ui.config.socket_io_ping_interval = 20   # seconds
+    ui.config.socket_io_ping_timeout = 30    # seconds
+except Exception:
+    pass
+
+
 ui.run(
     host="0.0.0.0",
     port=_port(),
     show=False,
-    proxy_headers=True,          # keep these two
+    proxy_headers=True,
     forwarded_allow_ips="*",
+    uvicorn_logging_level="debug",  # <— see handshake & 4xx in logs
 )
+
