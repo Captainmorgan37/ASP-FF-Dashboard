@@ -388,7 +388,3 @@ ui.run(
     ws="wsproto",        # <- use wsproto WS implementation (more tolerant behind proxies)
     uvicorn_logging_level="debug",
 )
-
-    uvicorn_logging_level="debug",  # <— see handshake & 4xx in logs
-)
-
