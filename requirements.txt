@@ -2,7 +2,8 @@ streamlit
 pandas==2.2.2
 streamlit-autorefresh
 python-dateutil
-tzlocal
+tzlocal>=5.2
+pytz>=2024.1
 timezonefinder
 requests
 boto3
