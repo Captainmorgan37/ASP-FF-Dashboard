@@ -68,7 +68,9 @@ ar1, ar2 = st.columns([1, 1])
 with ar1:
     auto_refresh = st.checkbox("Auto-refresh", value=True, help="Re-run the app so countdowns update.")
 with ar2:
-    refresh_sec = st.number_input("Refresh every (sec)", min_value=5, max_value=120, value=60, step=5)
+    refresh_sec = st.number_input(
+        "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
+    )
 
 if auto_refresh:
     try:
@@ -2914,37 +2916,6 @@ DATA_SOURCE_OPTIONS = {
     "fl3xx_api": "FL3XX API (automatic)",
     "csv_upload": "Upload CSV",
 }
-
-# ============================
-# Configuration diagnostics
-# ============================
-secret_sections = _collect_secret_diagnostics()
-has_secret_warnings = any(
-    row.get("Detected") == "⚠️"
-    for _, section_rows in secret_sections
-    for row in section_rows
-)
-
-st.subheader("Configuration diagnostics")
-st.caption(
-    "The dashboard can still run with manual CSV uploads even when API secrets are missing. "
-    "Use the panel below to review which credentials are currently visible to the app."
-)
-
-with st.expander("Secrets diagnostics", expanded=has_secret_warnings):
-    st.caption(
-        "Checks Streamlit secrets and environment variables for known integrations "
-        "(FL3XX API, FlightAware, IMAP, etc.)."
-    )
-    any_rows_rendered = False
-    for title, rows in secret_sections:
-        if not rows:
-            continue
-        any_rows_rendered = True
-        st.markdown(f"**{title}**")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-    if not any_rows_rendered:
-        st.caption("No secret-driven integrations detected.")
 
 with st.sidebar:
     st.subheader("Schedule data source")
