@@ -5,6 +5,16 @@ from __future__ import annotations  # optional on Python 3.11
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
 
+
+# --- Streamlit compatibility shim -------------------------------------------------
+if os.getenv("STREAMLIT_SERVER_PORT") or os.getenv("STREAMLIT_RUNTIME"):
+    """When invoked via ``streamlit run app.py`` delegate to the original app."""
+    import runpy
+    from pathlib import Path
+
+    runpy.run_path(str(Path(__file__).with_name("asp_ff_dashboard.py")), run_name="__main__")
+    raise SystemExit(0)
+
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable
