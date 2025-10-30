@@ -9,10 +9,12 @@ build:
       - ls -la
       - echo "---- requirements.txt ----"
       - cat requirements.txt
+      - echo "---- requirements-apprunner.txt ----"
+      - cat requirements-apprunner.txt
     build:
       - mkdir -p vendor
       - python3 -m pip install --upgrade pip
-      - python3 -m pip install --no-cache-dir --target ./vendor -r requirements.txt
+      - python3 -m pip install --no-cache-dir --target ./vendor -r requirements-apprunner.txt
       - python3 -c "import sys; sys.path.insert(0,'vendor'); import pandas, nicegui; print('pandas OK', pandas.__version__); print('nicegui OK', nicegui.__version__)"
 
 run:
