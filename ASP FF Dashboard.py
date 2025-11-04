@@ -5,6 +5,7 @@ import re
 import json
 import sqlite3
 import imaplib, email
+from collections import defaultdict
 from collections.abc import Mapping
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
@@ -1317,6 +1318,77 @@ def _has_fl3xx_credentials_configured() -> bool:
     return bool(config.auth_header or config.api_token)
 
 
+def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
+    """Normalize FL3XX real block times and persist them as status events."""
+
+    def _first_value(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+        for key in keys:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+            elif isinstance(value, datetime):
+                iso_val = _to_iso8601_z(value)
+                if iso_val:
+                    return iso_val
+            else:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+
+    for flight in flights:
+        if not isinstance(flight, dict):
+            continue
+
+        off_raw = _first_value(
+            flight,
+            (
+                "_OffBlock_UTC",
+                "realDateOUT",
+                "realDateOut",
+                "realDateOutUTC",
+                "blockOffActualUTC",
+            ),
+        )
+        on_raw = _first_value(
+            flight,
+            (
+                "_OnBlock_UTC",
+                "realDateIN",
+                "realDateIn",
+                "realDateInUTC",
+                "blockOnActualUTC",
+            ),
+        )
+
+        off_dt = parse_iso_to_utc(off_raw) if off_raw else None
+        on_dt = parse_iso_to_utc(on_raw) if on_raw else None
+
+        flight["_OffBlock_UTC"] = _to_iso8601_z(off_dt) if off_dt else None
+        flight["_OnBlock_UTC"] = _to_iso8601_z(on_dt) if on_dt else None
+        flight["_FlightStatus"] = (flight.get("flightStatus") or "").strip()
+
+        booking_key = (
+            flight.get("bookingIdentifier")
+            or flight.get("bookingReference")
+            or flight.get("quoteId")
+        )
+        if not booking_key:
+            continue
+
+        booking_str = str(booking_key)
+        if off_dt:
+            upsert_status(booking_str, "OffBlock", "Off Block", _to_iso8601_z(off_dt), None)
+        if on_dt:
+            upsert_status(booking_str, "OnBlock", "On Block", _to_iso8601_z(on_dt), None)
+
+
 def _get_fl3xx_schedule(
     config: Fl3xxApiConfig | None = None,
     now: datetime | None = None,
@@ -1341,6 +1413,7 @@ def _get_fl3xx_schedule(
         flights, metadata = fetch_flights(config, now=current_time)
         crew_summary = enrich_flights_with_crew(config, flights, force=True)
         digest = compute_flights_digest(flights)
+        _ingest_fl3xx_actuals(flights)
         changed = cache_entry is None or cache_entry.get("hash") != digest
         save_fl3xx_cache(
             flights,
@@ -1370,6 +1443,7 @@ def _get_fl3xx_schedule(
         flights, metadata = fetch_flights(config, now=current_time)
         crew_summary = enrich_flights_with_crew(config, flights, force=True)
         digest = compute_flights_digest(flights)
+        _ingest_fl3xx_actuals(flights)
         save_fl3xx_cache(
             flights,
             digest=digest,
@@ -1396,6 +1470,7 @@ def _get_fl3xx_schedule(
         return flights, metadata
 
     flights = cache_entry.get("flights", [])
+    _ingest_fl3xx_actuals(flights)
     crew_summary = enrich_flights_with_crew(config, flights, force=False)
     digest = compute_flights_digest(flights) if flights else cache_entry.get("hash") or ""
 
@@ -2949,6 +3024,7 @@ with btn_cols[0]:
 
 schedule_payload = None
 schedule_metadata: dict[str, Any] = {}
+fl3xx_flights_payload: list[dict[str, Any]] | None = None
 
 if selected_source == "csv_upload":
     uploaded = st.file_uploader(
@@ -3074,6 +3150,7 @@ elif selected_source == "fl3xx_api":
                     st.write(error)
     try:
         flights, api_metadata = _get_fl3xx_schedule(config=config)
+        fl3xx_flights_payload = flights
         schedule_metadata = api_metadata
         schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
         _render_fl3xx_status(api_metadata)
@@ -3107,6 +3184,7 @@ elif selected_source == "fl3xx_api":
                 "crew_updated": False,
             }
             flights = cache_entry.get("flights", [])
+            fl3xx_flights_payload = flights
             schedule_metadata = fallback_metadata
             schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
             _render_fl3xx_status(fallback_metadata)
@@ -3150,6 +3228,9 @@ if missing:
 df = df_raw.copy()
 df["Booking"] = df["Booking"].fillna("").astype(str).str.strip()
 df["Aircraft"] = df["Aircraft"].fillna("").astype(str).str.strip()
+df["_OffBlock_UTC"] = pd.NaT
+df["_OnBlock_UTC"] = pd.NaT
+df["_FlightStatusRaw"] = ""
 _tail_override_map = load_tail_overrides()
 if _tail_override_map:
     df["Aircraft"] = [
@@ -3193,8 +3274,66 @@ if not df.empty:
             df["Booking"], booking_order, booking_sizes, df.index
         )
     ]
+
+    if fl3xx_flights_payload:
+        actual_map: dict[str, list[dict[str, str | None]]] = defaultdict(list)
+        for flight in fl3xx_flights_payload:
+            if not isinstance(flight, dict):
+                continue
+            booking_key = (
+                flight.get("bookingIdentifier")
+                or flight.get("bookingReference")
+                or flight.get("quoteId")
+                or ""
+            )
+            booking_str = str(booking_key)
+            off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
+            on_iso = flight.get("_OnBlock_UTC") or flight.get("realDateIN") or flight.get("realDateIn")
+            status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
+            actual_map[booking_str].append({
+                "off": off_iso,
+                "on": on_iso,
+                "status": status_val,
+            })
+
+        booking_seq = defaultdict(int)
+        off_vals: list[str | None] = []
+        on_vals: list[str | None] = []
+        status_vals: list[str] = []
+
+        for booking in df["Booking"]:
+            seq_idx = booking_seq[booking]
+            booking_seq[booking] += 1
+            entries = actual_map.get(booking, [])
+            off_iso = None
+            on_iso = None
+            status_val = ""
+            if seq_idx < len(entries):
+                payload = entries[seq_idx]
+                off_iso = payload.get("off")
+                on_iso = payload.get("on")
+                status_val = (payload.get("status") or "").strip()
+            off_vals.append(off_iso)
+            on_vals.append(on_iso)
+            status_vals.append(status_val)
+
+        df["_OffBlock_UTC"] = pd.to_datetime(off_vals, utc=True, errors="coerce")
+        df["_OnBlock_UTC"] = pd.to_datetime(on_vals, utc=True, errors="coerce")
+        df["_FlightStatusRaw"] = status_vals
 else:
     df["_LegKey"] = pd.Series(dtype=str, index=df.index)
+
+if "_OffBlock_UTC" in df.columns:
+    df["_OffBlock_UTC"] = pd.to_datetime(df["_OffBlock_UTC"], utc=True, errors="coerce")
+else:
+    df["_OffBlock_UTC"] = pd.to_datetime(pd.Series(pd.NaT, index=df.index), utc=True, errors="coerce")
+
+if "_OnBlock_UTC" in df.columns:
+    df["_OnBlock_UTC"] = pd.to_datetime(df["_OnBlock_UTC"], utc=True, errors="coerce")
+else:
+    df["_OnBlock_UTC"] = pd.to_datetime(pd.Series(pd.NaT, index=df.index), utc=True, errors="coerce")
+
+df["_FlightStatusRaw"] = df.get("_FlightStatusRaw", pd.Series("", index=df.index)).fillna("").astype(str)
 
 if _tail_override_map and not df.empty:
     df["Aircraft"] = [
@@ -3791,6 +3930,7 @@ if delayed_view:
 # ---- Build a view that keeps REAL datetimes for sorting, but shows time-only ----
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
+    "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
     "Off-Block (Sched)", "Takeoff (FA)", "ETA (FA)",
     "On-Block (Sched)", "Landing (FA)",
     "Departs In", "Arrives In", "Turn Time",
@@ -3855,6 +3995,25 @@ def _landing_display(row):
 
 view_df["Takeoff (FA)"] = view_df.apply(_takeoff_display, axis=1)
 view_df["Landing (FA)"] = view_df.apply(_landing_display, axis=1)
+
+view_df["Off Block (UTC)"] = view_df["_OffBlock_UTC"]
+view_df["Takeoff (UTC)"]   = view_df["_DepActual_ts"]
+view_df["Landing (UTC)"]   = view_df["_ArrActual_ts"]
+view_df["On Block (UTC)"]  = view_df["_OnBlock_UTC"]
+
+def _stage_badge(row):
+    badges: list[str] = []
+    if pd.notna(row.get("_OffBlock_UTC")):
+        badges.append("🟡 Off")
+    if pd.notna(row.get("_DepActual_ts")):
+        badges.append("🟢 Airborne")
+    if pd.notna(row.get("_ArrActual_ts")):
+        badges.append("🟢 Landed")
+    if pd.notna(row.get("_OnBlock_UTC")):
+        badges.append("🟣 On")
+    return " → ".join(badges) if badges else "—"
+
+view_df["Stage Progress"] = view_df.apply(_stage_badge, axis=1)
 
 df_display = view_df[display_cols].copy()
 
@@ -4119,6 +4278,10 @@ fmt_map = {
     "On-Block (Sched)":  lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "Landing (FA)":      lambda v: v if isinstance(v, str) else (v.strftime("%H:%MZ") if pd.notna(v) else "—"),
+    "Off Block (UTC)":   lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "Takeoff (UTC)":     lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "Landing (UTC)":     lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "On Block (UTC)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
 
