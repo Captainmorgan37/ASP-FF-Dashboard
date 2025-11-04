@@ -274,7 +274,7 @@ init_db()
 # ============================
 # Helpers
 # ============================
-FL3XX_REFRESH_MINUTES = 10
+FL3XX_REFRESH_MINUTES = 5
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
