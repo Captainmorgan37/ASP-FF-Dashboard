@@ -106,5 +106,5 @@ AgGrid(
     allow_unsafe_jscode=True,   # 🔥 absolutely required for JS renderers
     enable_enterprise_modules=False,
     height=400,
-    theme="streamlit",
+    theme="balham",
 )
