@@ -21,21 +21,22 @@ data = [
 df = pd.DataFrame(data)
 
 # -------------------------------------------------------------------
-# JavaScript renderers
+# JS Renderers
 # -------------------------------------------------------------------
 
-# ✅ Aircraft clickable hyperlink using innerRenderer (renders as real HTML)
+# ✅ Clickable Aircraft link (community-safe)
 link_renderer = JsCode("""
 function(params) {
     if (!params.value) return '';
     const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
-    return '<a href="' + url + '" target="_blank" ' +
-           'style="color:#4da6ff;text-decoration:none;font-weight:500;">' +
-           params.value + '</a>';
+    // Return innerHTML directly; AgGrid community will render as real link
+    return `<a href="${url}" target="_blank"
+              style="color:#4da6ff;text-decoration:none;font-weight:500;">
+              ${params.value}</a>`;
 }
 """)
 
-# ✅ Status cell coloring
+# ✅ Status color rules
 status_style = JsCode("""
 function(params){
   if (['Delayed','Late','ATC Delay'].includes(params.value))
@@ -46,7 +47,7 @@ function(params){
 }
 """)
 
-# ✅ Conditional Post button renderer
+# ✅ Conditional TELUS button
 button_renderer = JsCode("""
 class BtnCellRenderer {
   init(params){
@@ -75,17 +76,7 @@ class BtnCellRenderer {
 # Grid configuration
 # -------------------------------------------------------------------
 gb = GridOptionsBuilder.from_dataframe(df)
-
-# 👇 Use agGroupCellRenderer so innerRenderer can safely inject HTML
-gb.configure_column(
-    "Aircraft",
-    headerName="Aircraft",
-    cellRenderer="agGroupCellRenderer",
-    cellRendererParams={"innerRenderer": link_renderer},
-    autoHeight=True,
-    wrapText=False,
-)
-
+gb.configure_column("Aircraft", cellRenderer=link_renderer)
 gb.configure_column("Δ (min)", width=90, type=["numericColumn"])
 gb.configure_column("Status", cellStyle=status_style)
 gb.configure_column("Action", cellRenderer=button_renderer,
@@ -105,6 +96,6 @@ AgGrid(
     allow_unsafe_jscode=True,
     enable_enterprise_modules=False,
     fit_columns_on_grid_load=True,
-    theme="balham",   # Use theme that allows HTML rendering
+    theme="balham",
     height=400,
 )
