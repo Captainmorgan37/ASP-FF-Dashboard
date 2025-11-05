@@ -5,7 +5,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 st.set_page_config(layout="wide")
 
 # -------------------------------------------------------------------
-# Mock flight data (replace with your live FL3XX / FlightAware merge)
+# Mock flight data (replace with live FL3XX / FlightAware merge)
 # -------------------------------------------------------------------
 data = [
     {"Aircraft": "C-FSNY", "From": "CYEG", "To": "CYYC",
@@ -21,25 +21,25 @@ data = [
 df = pd.DataFrame(data)
 
 # -------------------------------------------------------------------
-# JavaScript renderers for clickable links and button column
+# JavaScript renderers
 # -------------------------------------------------------------------
 
-# Aircraft → FlightAware link
+# Aircraft → FlightAware hyperlink
 link_renderer = JsCode("""
 function(params) {
-    if (!params.value) return '';
-    const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
-    return `<a href="${url}" target="_blank" style="color:#4da6ff;text-decoration:none;">${params.value}</a>`;
+  if (!params.value) return '';
+  const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
+  return `<a href="${url}" target="_blank"
+             style="color:#4da6ff;text-decoration:none;">${params.value}</a>`;
 }
 """)
-
 
 # Status coloring
 status_style = JsCode("""
 function(params){
-  if (params.value == 'Delayed' || params.value == 'Late' || params.value == 'ATC Delay')
+  if (['Delayed','Late','ATC Delay'].includes(params.value))
       return {'color':'#fff','backgroundColor':'#b33a3a'};
-  if (params.value == 'On Time')
+  if (params.value === 'On Time')
       return {'color':'#fff','backgroundColor':'#2d8031'};
   return {'color':'#ddd','backgroundColor':'#444'};
 }
@@ -52,12 +52,10 @@ class BtnCellRenderer {
     this.params = params;
     this.eGui = document.createElement('button');
     this.eGui.innerText = '📣 Post to TELUS';
-    this.eGui.style.background = '#444';
-    this.eGui.style.color = 'white';
-    this.eGui.style.border = 'none';
-    this.eGui.style.borderRadius = '4px';
-    this.eGui.style.cursor = 'pointer';
-    this.eGui.style.padding = '2px 8px';
+    Object.assign(this.eGui.style,{
+      background:'#444',color:'white',border:'none',borderRadius:'4px',
+      cursor:'pointer',padding:'2px 8px'
+    });
     this.eGui.addEventListener('click', () => {
       const event = new CustomEvent('TELUS_CLICK', { detail: params.data });
       window.dispatchEvent(event);
@@ -68,40 +66,42 @@ class BtnCellRenderer {
 """)
 
 # -------------------------------------------------------------------
-# Build grid options
+# Grid configuration
 # -------------------------------------------------------------------
 gb = GridOptionsBuilder.from_dataframe(df)
-gb.configure_column("Aircraft", cellRenderer=link_renderer)
+
+# Here’s the key part: we must explicitly set 'cellRenderer' and 'cellRendererParams'!
+gb.configure_column(
+    "Aircraft",
+    headerName="Aircraft",
+    cellRenderer=link_renderer,
+    autoHeight=True,
+    wrapText=False,
+    tooltipField="Aircraft",
+)
+
 gb.configure_column("Δ (min)", width=90, type=["numericColumn"])
 gb.configure_column("Status", cellStyle=status_style)
-gb.configure_column("Action", cellRenderer=button_renderer, 
+gb.configure_column("Action", cellRenderer=button_renderer,
                     maxWidth=160, editable=False, sortable=False)
+
+# ensure all columns allow JS rendering
 gb.configure_default_column(resizable=True, wrapText=True, autoHeight=True)
+
 grid_options = gb.build()
 
+# -------------------------------------------------------------------
+# Grid render
+# -------------------------------------------------------------------
 st.markdown("### ✈️ Flight-Following Dashboard — AgGrid Interactive View")
 
-grid_response = AgGrid(
+AgGrid(
     df,
     gridOptions=grid_options,
     update_mode=GridUpdateMode.NO_UPDATE,
+    allow_unsafe_jscode=True,   # <- required for JS renderers
+    enable_enterprise_modules=False,
     fit_columns_on_grid_load=True,
-    allow_unsafe_jscode=True,   # enable JS renderers
     height=400,
     theme="streamlit",
 )
-
-# -------------------------------------------------------------------
-# Handle JS button click events (TELUS posting)
-# -------------------------------------------------------------------
-event = st.session_state.get("telus_event")
-# In production you'd attach a Streamlit-JS bridge or poll via grid_response, 
-# but for simplicity here just illustrate the idea:
-st.info("Click a 📣 button in the grid — the JS event can trigger your webhook.")
-
-# Example placeholder webhook logic
-# if event:
-#     flight = event['data']
-#     notify_delay_chat(team="FF", tail=flight['Aircraft'], booking=flight['Booking'],
-#                       minutes_delta=flight['Δ (min)'], new_eta_hhmm=flight['ETA (UTC)'])
-#     st.success(f"Posted {flight['Aircraft']} to TELUS")
