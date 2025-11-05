@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
-st.markdown("### ✈️ Flight-Following Dashboard – Interactive View")
+st.set_page_config(layout="wide")
 
 # -------------------------------------------------------------------
-# Mock flight data – replace with your actual dashboard dataframe
+# Mock flight data (replace with your live FL3XX / FlightAware merge)
 # -------------------------------------------------------------------
 data = [
     {"Aircraft": "C-FSNY", "From": "CYEG", "To": "CYYC",
@@ -17,51 +18,89 @@ data = [
      "ETA (UTC)": "2025-11-05 23:45", "Δ (min)": 9,
      "Status": "Late", "Booking": "ERQYP"},
 ]
-frame = pd.DataFrame(data)
+df = pd.DataFrame(data)
 
 # -------------------------------------------------------------------
-# Function to make FlightAware hyperlinks
+# JavaScript renderers for clickable links and button column
 # -------------------------------------------------------------------
-def make_fa_link(ac):
-    if not ac or ac == "—":
-        return ac
-    return f"[{ac}](https://www.flightaware.com/live/flight/{ac.replace('-', '')})"
+
+# Aircraft → FlightAware link
+link_renderer = JsCode("""
+function(params) {
+  if (!params.value) return '';
+  const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
+  return `<a href="${url}" target="_blank" style="color:#4da6ff;text-decoration:none;">${params.value}</a>`;
+}
+""")
+
+# Status coloring
+status_style = JsCode("""
+function(params){
+  if (params.value == 'Delayed' || params.value == 'Late' || params.value == 'ATC Delay')
+      return {'color':'#fff','backgroundColor':'#b33a3a'};
+  if (params.value == 'On Time')
+      return {'color':'#fff','backgroundColor':'#2d8031'};
+  return {'color':'#ddd','backgroundColor':'#444'};
+}
+""")
+
+# Action button
+button_renderer = JsCode("""
+class BtnCellRenderer {
+  init(params){
+    this.params = params;
+    this.eGui = document.createElement('button');
+    this.eGui.innerText = '📣 Post to TELUS';
+    this.eGui.style.background = '#444';
+    this.eGui.style.color = 'white';
+    this.eGui.style.border = 'none';
+    this.eGui.style.borderRadius = '4px';
+    this.eGui.style.cursor = 'pointer';
+    this.eGui.style.padding = '2px 8px';
+    this.eGui.addEventListener('click', () => {
+      const event = new CustomEvent('TELUS_CLICK', { detail: params.data });
+      window.dispatchEvent(event);
+    });
+  }
+  getGui(){ return this.eGui; }
+}
+""")
 
 # -------------------------------------------------------------------
-# Header row
+# Build grid options
 # -------------------------------------------------------------------
-header = st.columns([1.3, 1, 1, 1.3, 0.8, 1.4])
-for h, col in zip(
-    ["Aircraft", "From", "To", "ETA (UTC)", "Δ (min)", "Status / Action"], header
-):
-    col.markdown(f"**{h}**", unsafe_allow_html=True)
+gb = GridOptionsBuilder.from_dataframe(df)
+gb.configure_column("Aircraft", cellRenderer=link_renderer)
+gb.configure_column("Δ (min)", width=90, type=["numericColumn"])
+gb.configure_column("Status", cellStyle=status_style)
+gb.configure_column("Action", cellRenderer=button_renderer, 
+                    maxWidth=160, editable=False, sortable=False)
+gb.configure_default_column(resizable=True, wrapText=True, autoHeight=True)
+grid_options = gb.build()
 
-st.markdown("<hr style='margin:4px 0;'>", unsafe_allow_html=True)
+st.markdown("### ✈️ Flight-Following Dashboard — AgGrid Interactive View")
+
+grid_response = AgGrid(
+    df,
+    gridOptions=grid_options,
+    update_mode=GridUpdateMode.NO_UPDATE,
+    fit_columns_on_grid_load=True,
+    allow_unsafe_jscode=True,   # enable JS renderers
+    height=400,
+    theme="streamlit",
+)
 
 # -------------------------------------------------------------------
-# Loop rows
+# Handle JS button click events (TELUS posting)
 # -------------------------------------------------------------------
-for idx, row in frame.iterrows():
-    cols = st.columns([1.3, 1, 1, 1.3, 0.8, 1.4])
-    # clickable aircraft link
-    cols[0].markdown(make_fa_link(row["Aircraft"]), unsafe_allow_html=True)
-    cols[1].markdown(row["From"])
-    cols[2].markdown(row["To"])
-    cols[3].markdown(row["ETA (UTC)"])
-    cols[4].markdown(str(row["Δ (min)"]))
+event = st.session_state.get("telus_event")
+# In production you'd attach a Streamlit-JS bridge or poll via grid_response, 
+# but for simplicity here just illustrate the idea:
+st.info("Click a 📣 button in the grid — the JS event can trigger your webhook.")
 
-    status = str(row["Status"]).lower()
-    if status in ("delayed", "late", "atc delay"):
-        with cols[5].form(f"delay_form_{idx}", clear_on_submit=True):
-            reason = st.text_input("", placeholder="Reason (optional)",
-                                   key=f"reason_{idx}")
-            send = st.form_submit_button("📣 Post to TELUS")
-            if send:
-                reason_to_send = reason.strip() or "Unknown"
-                # 🔗 call your webhook here
-                # notify_delay_chat(team="FF", tail=row["Aircraft"], ...)
-                st.success(f"Posted: {row['Aircraft']} ({reason_to_send})")
-    else:
-        cols[5].markdown(row["Status"])
-
-    st.markdown("<hr style='margin:2px 0;'>", unsafe_allow_html=True)
+# Example placeholder webhook logic
+# if event:
+#     flight = event['data']
+#     notify_delay_chat(team="FF", tail=flight['Aircraft'], booking=flight['Booking'],
+#                       minutes_delta=flight['Δ (min)'], new_eta_hhmm=flight['ETA (UTC)'])
+#     st.success(f"Posted {flight['Aircraft']} to TELUS")
