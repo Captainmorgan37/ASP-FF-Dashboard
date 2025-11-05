@@ -5,7 +5,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 st.set_page_config(layout="wide")
 
 # -------------------------------------------------------------------
-# Mock data – replace with your real FL3XX / FlightAware dataframe
+# Mock data
 # -------------------------------------------------------------------
 data = [
     {"Aircraft": "C-FSNY", "From": "CYEG", "To": "CYYC",
@@ -24,17 +24,18 @@ df = pd.DataFrame(data)
 # JavaScript renderers
 # -------------------------------------------------------------------
 
-# ✅ FlightAware clickable link renderer
+# ✅ Aircraft clickable hyperlink using innerRenderer (renders as real HTML)
 link_renderer = JsCode("""
 function(params) {
-  if (!params.value) return '';
-  const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
-  return '<span><a href="' + url + '" target="_blank" style="color:#4da6ff;text-decoration:none;">' 
-         + params.value + '</a></span>';
+    if (!params.value) return '';
+    const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
+    return '<a href="' + url + '" target="_blank" ' +
+           'style="color:#4da6ff;text-decoration:none;font-weight:500;">' +
+           params.value + '</a>';
 }
 """)
 
-# ✅ Conditional coloring for Status column
+# ✅ Status cell coloring
 status_style = JsCode("""
 function(params){
   if (['Delayed','Late','ATC Delay'].includes(params.value))
@@ -45,7 +46,7 @@ function(params){
 }
 """)
 
-# ✅ Button renderer (only appears for delayed-type rows)
+# ✅ Conditional Post button renderer
 button_renderer = JsCode("""
 class BtnCellRenderer {
   init(params){
@@ -55,19 +56,15 @@ class BtnCellRenderer {
     if (['Delayed','Late','ATC Delay'].includes(st)) {
         const b = document.createElement('button');
         b.innerText = '📣 Post to TELUS';
-        b.style.background = '#444';
-        b.style.color = 'white';
-        b.style.border = 'none';
-        b.style.borderRadius = '4px';
-        b.style.cursor = 'pointer';
-        b.style.padding = '2px 8px';
+        Object.assign(b.style,{
+            background:'#444',color:'white',border:'none',borderRadius:'4px',
+            cursor:'pointer',padding:'2px 8px'
+        });
         b.addEventListener('click', () => {
-          const event = new CustomEvent('TELUS_CLICK', { detail: params.data });
-          window.dispatchEvent(event);
+            const event = new CustomEvent('TELUS_CLICK', { detail: params.data });
+            window.dispatchEvent(event);
         });
         this.eGui.appendChild(b);
-    } else {
-        this.eGui.innerHTML = ''; // no button for on-time flights
     }
   }
   getGui(){ return this.eGui; }
@@ -75,17 +72,20 @@ class BtnCellRenderer {
 """)
 
 # -------------------------------------------------------------------
-# Build grid options
+# Grid configuration
 # -------------------------------------------------------------------
 gb = GridOptionsBuilder.from_dataframe(df)
 
+# 👇 Use agGroupCellRenderer so innerRenderer can safely inject HTML
 gb.configure_column(
     "Aircraft",
     headerName="Aircraft",
-    cellRenderer=link_renderer,
+    cellRenderer="agGroupCellRenderer",
+    cellRendererParams={"innerRenderer": link_renderer},
     autoHeight=True,
     wrapText=False,
 )
+
 gb.configure_column("Δ (min)", width=90, type=["numericColumn"])
 gb.configure_column("Status", cellStyle=status_style)
 gb.configure_column("Action", cellRenderer=button_renderer,
@@ -94,7 +94,7 @@ gb.configure_default_column(resizable=True, wrapText=True, autoHeight=True)
 grid_options = gb.build()
 
 # -------------------------------------------------------------------
-# Render grid
+# Render
 # -------------------------------------------------------------------
 st.markdown("### ✈️ Flight-Following Dashboard — AgGrid Interactive View")
 
@@ -102,9 +102,9 @@ AgGrid(
     df,
     gridOptions=grid_options,
     update_mode=GridUpdateMode.NO_UPDATE,
-    fit_columns_on_grid_load=True,
-    allow_unsafe_jscode=True,   # 🔥 absolutely required for JS renderers
+    allow_unsafe_jscode=True,
     enable_enterprise_modules=False,
+    fit_columns_on_grid_load=True,
+    theme="balham",   # Use theme that allows HTML rendering
     height=400,
-    theme="alpine",
 )
