@@ -27,11 +27,12 @@ df = pd.DataFrame(data)
 # Aircraft → FlightAware link
 link_renderer = JsCode("""
 function(params) {
-  if (!params.value) return '';
-  const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
-  return `<a href="${url}" target="_blank" style="color:#4da6ff;text-decoration:none;">${params.value}</a>`;
+    if (!params.value) return '';
+    const url = 'https://www.flightaware.com/live/flight/' + params.value.replace('-', '');
+    return `<a href="${url}" target="_blank" style="color:#4da6ff;text-decoration:none;">${params.value}</a>`;
 }
 """)
+
 
 # Status coloring
 status_style = JsCode("""
