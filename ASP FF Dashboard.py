@@ -2,6 +2,7 @@
 
 import os
 import re
+import html
 import json
 import sqlite3
 import imaplib, email
@@ -4285,6 +4286,32 @@ fmt_map = {
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
 
+def render_flightaware_link(tail) -> str:
+    """Return a FlightAware anchor tag for real tails, else the raw tail text."""
+
+    if tail is None:
+        return ""
+
+    try:
+        if pd.isna(tail):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    tail_text = str(tail).strip()
+    if not tail_text or tail_text.lower() == "nan":
+        return ""
+
+    if not is_real_tail(tail_text):
+        return html.escape(tail_text)
+
+    normalized = re.sub(r"-", "", tail_text).upper()
+    href = f"https://www.flightaware.com/live/flight/{normalized}"
+    anchor_text = html.escape(tail_text.upper())
+    return (
+        f'<a href="{href}" target="_blank" rel="noopener noreferrer">{anchor_text}</a>'
+    )
+
 # Helpers for inline editing (data_editor expects naive datetimes)
 def _format_editor_datetime(ts):
     """Return a pre-filled string for the inline editor (UTC, minute precision)."""
@@ -4552,8 +4579,38 @@ else:
     styler = styler.hide(axis="index")
 
 try:
-    styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(styler, use_container_width=True)
+    styler = (
+        styler.apply(_style_ops, axis=None)
+        .format(fmt_map)
+        .format({"Aircraft": render_flightaware_link}, escape=None)
+    )
+    try:
+        if "_schedule_table_css" not in st.session_state:
+            st.markdown(
+                """
+                <style>
+                .schedule-table-container {
+                    overflow-x: auto;
+                    width: 100%;
+                }
+                .schedule-table-container table {
+                    width: 100%;
+                }
+                .schedule-table-container th,
+                .schedule-table-container td {
+                    white-space: nowrap;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.session_state["_schedule_table_css"] = True
+        st.markdown(
+            f"<div class='schedule-table-container'>{styler.to_html()}</div>",
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        st.dataframe(styler, use_container_width=True)
 except Exception:
     st.warning("Styling disabled (env compatibility). Showing plain table.")
     tmp = df_display.copy()
