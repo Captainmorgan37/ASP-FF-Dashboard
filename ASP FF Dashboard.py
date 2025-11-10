@@ -3935,8 +3935,8 @@ if delayed_view:
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
     "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
-    "Off-Block (Sched)", "Takeoff (FA)", "ETA (FA)",
-    "On-Block (Sched)", "Landing (FA)",
+    "Off-Block (Sched)", "ETA (FA)",
+    "On-Block (Sched)",
     "Departs In", "Arrives In", "Turn Time",
     "PIC", "SIC", "Workflow", "Status"
 ]
@@ -4006,8 +4006,14 @@ view_df["Landing (UTC)"]   = view_df["_ArrActual_ts"]
 view_df["On Block (UTC)"]  = view_df["_OnBlock_UTC"]
 
 def _stage_badge(row):
+    off_block = row.get("_OffBlock_UTC")
+    if pd.isna(off_block):
+        edct_ts = row.get("_EDCT_ts")
+        if pd.notna(edct_ts):
+            return "🟪 EDCT · " + edct_ts.strftime("%H:%MZ")
+
     badges: list[str] = []
-    if pd.notna(row.get("_OffBlock_UTC")):
+    if pd.notna(off_block):
         badges.append("🟡 Off")
     if pd.notna(row.get("_DepActual_ts")):
         badges.append("🟢 Airborne")
@@ -4231,15 +4237,17 @@ def _style_ops(x: pd.DataFrame):
                 styles.loc[mask_stage, "Landing (FA)"].fillna("") + stage_css
             )
 
-    styles.loc[mask_dep, "Takeoff (FA)"] = (
-        styles.loc[mask_dep, "Takeoff (FA)"].fillna("") + cell_css
-    )
+    if "Takeoff (FA)" in x.columns:
+        styles.loc[mask_dep, "Takeoff (FA)"] = (
+            styles.loc[mask_dep, "Takeoff (FA)"].fillna("") + cell_css
+        )
     styles.loc[mask_eta, "ETA (FA)"] = (
         styles.loc[mask_eta, "ETA (FA)"].fillna("") + cell_css
     )
-    styles.loc[mask_arr, "Landing (FA)"] = (
-        styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
-    )
+    if "Landing (FA)" in x.columns:
+        styles.loc[mask_arr, "Landing (FA)"] = (
+            styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
+        )
 
     if "Status" in x.columns:
         delay_statuses = {
@@ -4255,9 +4263,10 @@ def _style_ops(x: pd.DataFrame):
     # 5) EDCT purple on Takeoff (FA) (applied last so it wins for that cell)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
     mask_edct = idx_edct.reindex(x.index, fill_value=False)
-    styles.loc[mask_edct, "Takeoff (FA)"] = (
-        styles.loc[mask_edct, "Takeoff (FA)"].fillna("") + cell_edct_css
-    )
+    if "Takeoff (FA)" in x.columns:
+        styles.loc[mask_edct, "Takeoff (FA)"] = (
+            styles.loc[mask_edct, "Takeoff (FA)"].fillna("") + cell_edct_css
+        )
 
     if "Turn Time" in x.columns:
         turn_css = "background-color: rgba(255, 82, 82, 0.2); font-weight: 600;"
