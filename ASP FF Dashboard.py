@@ -694,9 +694,13 @@ def _imap_secret_diagnostics_rows() -> list[dict[str, str]]:
             "Sender filter provided" if sender else "Sender filter not set",
         )
 
-    edct_only = _normalize_secret_value(_resolve_secret("IMAP_EDCT_ONLY"), allow_blank=True)
-    if edct_only is not None:
-        _add_row("IMAP_EDCT_ONLY", True, f"EDCT-only mode = {edct_only}")
+    rows.append(
+        {
+            "Source": "IMAP processing mode",
+            "Detected": "✅",
+            "Details": "EDCT-only processing is enabled",
+        }
+    )
 
     return rows
 
@@ -4754,11 +4758,8 @@ IMAP_USER = _resolve_secret("IMAP_USER")
 IMAP_PASS = _resolve_secret("IMAP_PASS")
 IMAP_FOLDER = _resolve_secret("IMAP_FOLDER", default="INBOX") or "INBOX"
 IMAP_SENDER = _resolve_secret("IMAP_SENDER")  # e.g., alerts@flightaware.com
-IMAP_EDCT_ONLY_DEFAULT = _secret_bool(_resolve_secret("IMAP_EDCT_ONLY"), default=False)
-
-
 # 2) Define the polling function BEFORE the UI uses it
-def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: bool = False) -> int:
+def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: bool = True) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
 
@@ -5051,8 +5052,10 @@ else:
 enable_poll = st.checkbox(
     "Enable IMAP polling",
     value=False,
-    help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
+    help="Poll the mailbox for EDCT-specific messages and auto-apply updates.",
 )
+
+st.caption("IMAP polling processes EDCT notifications only; FlightAware alerts are handled via webhook integration.")
 
 if enable_poll:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
@@ -5068,22 +5071,15 @@ if enable_poll:
                 set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
                 st.success("IMAP cursor reset to 0 (statuses preserved).")
 
-        imap_edct_only = st.checkbox(
-            "Only process EDCT emails",
-            value=IMAP_EDCT_ONLY_DEFAULT,
-            key="imap_edct_only",
-            help="Ignore Departure/Arrival alerts and only process EDCT-specific messages.",
-        )
-
         max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
 
         if st.button("Poll now", key="poll_now"):
-            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll, edct_only=imap_edct_only)
+            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
             st.success(f"Applied {applied} update(s) from mailbox.")
 
         if poll_on_refresh:
             try:
-                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll, edct_only=imap_edct_only)
+                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
                 if applied:
                     st.info(f"Auto-poll applied {applied} update(s).")
             except Exception as e:
