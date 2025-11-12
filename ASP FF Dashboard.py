@@ -3917,6 +3917,9 @@ with head_toggle_col:
 with head_title_col:
     st.subheader("Schedule")
 
+# Placeholder so the Enhanced Flight Following section renders ahead of the main table
+enhanced_ff_container = st.container()
+
 # Compute a delay priority (2 = red, 1 = yellow, 0 = normal)
 delay_priority = (row_red.astype(int) * 2 + row_yellow.astype(int))
 df["_DelayPriority"] = delay_priority
@@ -4297,6 +4300,87 @@ fmt_map = {
     "On Block (UTC)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
+
+with enhanced_ff_container:
+    st.markdown("#### Enhanced Flight Following")
+
+    enhanced_toggle_key = "enhanced_ff_enabled"
+    enhanced_selected_key = "enhanced_ff_selected"
+
+    initial_toggle = st.session_state.get(enhanced_toggle_key, False)
+    enhanced_enabled = st.checkbox(
+        "Enhanced Flight Following Requested",
+        value=initial_toggle,
+        key=enhanced_toggle_key,
+        help="Track a subset of flights that need enhanced monitoring.",
+    )
+
+    working_df = df.copy()
+    if "Booking" in working_df.columns:
+        working_df["Booking"] = (
+            working_df["Booking"].astype(str).str.strip()
+        )
+        working_df = working_df[working_df["Booking"] != ""]
+    else:
+        working_df = working_df.assign(Booking="")
+
+    if working_df.empty:
+        if st.session_state.get(enhanced_selected_key):
+            st.session_state[enhanced_selected_key] = []
+        st.caption("Load a schedule to select flights for Enhanced Flight Following.")
+    elif not enhanced_enabled:
+        if st.session_state.get(enhanced_selected_key):
+            st.session_state[enhanced_selected_key] = []
+        st.caption("Enhanced Flight Following is turned off.")
+    else:
+        booking_labels: dict[str, str] = {}
+        for _, row in working_df.iterrows():
+            booking = row.get("Booking", "")
+            if not booking or booking in booking_labels:
+                continue
+            route = str(row.get("Route", "")).strip()
+            if not route:
+                origin = str(row.get("From", "")).strip()
+                destination = str(row.get("To", "")).strip()
+                if origin or destination:
+                    route = f"{origin or '???'} → {destination or '???'}"
+            label = f"{booking} · {route}" if route else booking
+            booking_labels[str(booking)] = label
+
+        options = list(booking_labels.keys())
+
+        valid_defaults = [
+            val for val in st.session_state.get(enhanced_selected_key, []) if val in options
+        ]
+        if st.session_state.get(enhanced_selected_key) != valid_defaults:
+            st.session_state[enhanced_selected_key] = valid_defaults
+
+        selected = st.multiselect(
+            "Select flights",
+            options=options,
+            key=enhanced_selected_key,
+            format_func=lambda val: booking_labels.get(val, val),
+            help="Choose one or more flights that require Enhanced Flight Following.",
+        )
+
+        if not selected:
+            st.caption("No flights selected for Enhanced Flight Following yet.")
+        else:
+            selected_df = df_display[df_display["Booking"].astype(str).isin(selected)].copy()
+            if selected_df.empty:
+                st.caption("Selected flights are no longer present in the current schedule.")
+            else:
+                st.caption("Enhanced Flight Following flights")
+                selected_styler = selected_df.style
+                if hasattr(selected_styler, "hide_index"):
+                    selected_styler = selected_styler.hide_index()
+                else:  # pragma: no cover - Streamlit < 1.25 fallback
+                    selected_styler = selected_styler.hide(axis="index")
+                try:
+                    selected_styler = selected_styler.apply(_style_ops, axis=None).format(fmt_map)
+                    st.dataframe(selected_styler, use_container_width=True)
+                except Exception:
+                    st.dataframe(selected_df, use_container_width=True)
 
 # Helpers for inline editing (data_editor expects naive datetimes)
 def _format_editor_datetime(ts):
