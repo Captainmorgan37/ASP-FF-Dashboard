@@ -5060,7 +5060,7 @@ else:
 
 enable_poll = st.checkbox(
     "Enable IMAP polling",
-    value=False,
+    value=True,
     help="Poll the mailbox for EDCT-specific messages and auto-apply updates.",
 )
 
