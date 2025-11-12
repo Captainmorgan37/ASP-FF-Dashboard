@@ -65,23 +65,18 @@ if "inline_edit_toast" in st.session_state:
 # ============================
 # Auto-refresh controls (no page reload fallback)
 # ============================
-ar1, ar2 = st.columns([1, 1])
-with ar1:
-    auto_refresh = st.checkbox("Auto-refresh", value=True, help="Re-run the app so countdowns update.")
-with ar2:
-    refresh_sec = st.number_input(
-        "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
-    )
+refresh_sec = st.number_input(
+    "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
+)
 
-if auto_refresh:
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
-    except Exception:
-        st.warning(
-            "Auto-refresh requires the 'streamlit-autorefresh' package. "
-            "Add `streamlit-autorefresh` to requirements.txt (or disable Auto-refresh)."
-        )
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
+except Exception:
+    st.warning(
+        "Auto-refresh requires the 'streamlit-autorefresh' package. "
+        "Add `streamlit-autorefresh` to requirements.txt."
+    )
 
 # ============================
 # SQLite persistence (statuses + CSV)
@@ -2642,14 +2637,6 @@ def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: da
 # ============================
 # Controls
 # ============================
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    show_only_upcoming = st.checkbox("Show only upcoming departures", value=False)
-with c2:
-    limit_next_hours = st.checkbox("Limit to next X hours", value=False)
-with c3:
-    next_hours = st.number_input("X hours (for filter above)", min_value=1, max_value=48, value=6)
-
 delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
 
 # --- ASP Callsign ↔ Tail mapping -------------------------------------------
@@ -2659,7 +2646,7 @@ delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, 
 #   ASP503: CFASW
 #   ... (etc)
 #
-# If not in secrets, we display a text area to paste/edit the list at runtime.
+# If not in secrets, we fall back to the bundled defaults defined below.
 
 DEFAULT_ASP_MAP_TEXT = """\
 C-GASL\tASP816
@@ -2723,13 +2710,7 @@ _secrets_map = _read_streamlit_secret("ASP_MAP")
 if isinstance(_secrets_map, dict) and _secrets_map:
     ASP_MAP = {k.upper(): v.upper() for k, v in _secrets_map.items()}
 else:
-    with st.expander("Callsign ↔ Tail mapping (ASP → Tail)", expanded=False):
-        map_text = st.text_area(
-            "Paste mapping (Tail then ASP, separated by tab/space, one pair per line):",
-            value=DEFAULT_ASP_MAP_TEXT,
-            height=200,
-        )
-    ASP_MAP = _parse_asp_map_text(map_text)
+    ASP_MAP = _parse_asp_map_text(DEFAULT_ASP_MAP_TEXT)
 
 def tail_from_asp(text: str) -> list[str]:
     """
@@ -3377,40 +3358,7 @@ else:
         f"FlightAware webhook integration unavailable: {webhook_diag_msg}"
     )
 
-default_use_webhook = st.session_state.get("use_flightaware_webhook")
-if default_use_webhook is None:
-    default_use_webhook = bool(webhook_config)
-
-webhook_debug_default = st.session_state.get("show_webhook_debug")
-if webhook_debug_default is None:
-    webhook_debug_default = False
-
-use_webhook_alerts = st.checkbox(
-    "Use FlightAware webhook alerts (DynamoDB)",
-    value=bool(default_use_webhook),
-    help=(
-        "Apply recent OOOI webhook events stored in DynamoDB. "
-        "Configure AWS credentials and the DynamoDB table in Streamlit secrets."
-    ),
-)
-st.session_state["use_flightaware_webhook"] = use_webhook_alerts
-
-show_webhook_debug = st.checkbox(
-    "Show FlightAware webhook diagnostics",
-    value=bool(webhook_debug_default),
-    help=(
-        "Display connection status, record counts, and recent webhook payloads "
-        "returned from DynamoDB."
-    ),
-)
-st.session_state["show_webhook_debug"] = show_webhook_debug
-
-if use_webhook_alerts and not webhook_config:
-    message = webhook_diag_msg or "Missing DynamoDB configuration for webhook alerts."
-    webhook_status_placeholder.error(
-        "FlightAware webhook integration is not configured: "
-        f"{message}"
-    )
+use_webhook_alerts = bool(webhook_config)
 
 # ============================
 # Email-driven status + enrich FA/EDCT times
@@ -3422,24 +3370,17 @@ if st.session_state.get("status_updates"):
         events_map.setdefault(key, {})[et] = upd
 
 webhook_records: list[dict[str, Any]] = []
-webhook_fetch_error: str | None = None
-webhook_cache_entry: Mapping[str, Any] | None = None
 applied_webhook = 0
 
-should_fetch_webhook = bool(webhook_config) and (use_webhook_alerts or show_webhook_debug)
+should_fetch_webhook = use_webhook_alerts
 if should_fetch_webhook:
     webhook_idents = collect_active_webhook_idents(df_clean)
     if webhook_idents:
         try:
             webhook_records = fetch_flightaware_webhook_events(webhook_idents, webhook_config)
-            cache_dict = st.session_state.get("_webhook_alert_cache")
-            if isinstance(cache_dict, Mapping):
-                cache_key = (tuple(sorted(webhook_idents)), webhook_config.get("table_name"))
-                webhook_cache_entry = cache_dict.get(cache_key)
             if use_webhook_alerts:
                 applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
         except Exception as exc:
-            webhook_fetch_error = str(exc)
             if use_webhook_alerts:
                 webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
         else:
@@ -3456,47 +3397,6 @@ if should_fetch_webhook:
         if use_webhook_alerts:
             webhook_status_placeholder.caption(
                 "FlightAware webhook has no mapped ASP callsigns for the current schedule."
-            )
-
-if show_webhook_debug:
-    debug_container = st.container()
-    if webhook_fetch_error:
-        debug_container.error(f"Webhook diagnostics error: {webhook_fetch_error}")
-    elif not should_fetch_webhook:
-        debug_container.info("Enable webhook alerts to run diagnostics.")
-    else:
-        fetched_at_display = None
-        if webhook_cache_entry and isinstance(webhook_cache_entry, Mapping):
-            fetched_at = webhook_cache_entry.get("fetched_at")
-            if isinstance(fetched_at, datetime):
-                fetched_at_display = fetched_at.astimezone(timezone.utc).isoformat()
-
-        if fetched_at_display:
-            debug_container.caption(f"Last fetch (UTC): {fetched_at_display}")
-
-        if webhook_records:
-            per_ident: dict[str, int] = {}
-            for record in webhook_records:
-                ident = str(record.get("ident") or "").strip() or "(missing ident)"
-                per_ident[ident] = per_ident.get(ident, 0) + 1
-
-            summary_rows = sorted(per_ident.items(), key=lambda item: item[0])
-            debug_container.write(
-                {
-                    "records_returned": len(webhook_records),
-                    "idents_covered": summary_rows,
-                }
-            )
-
-            debug_frame = pd.DataFrame(webhook_records)
-            if not debug_frame.empty:
-                for col in ("_event_dt", "received_at", "event_time", "event_ts", "source_ts"):
-                    if col in debug_frame.columns:
-                        debug_frame[col] = pd.to_datetime(debug_frame[col], errors="coerce")
-                debug_container.dataframe(debug_frame.head(25))
-        else:
-            debug_container.info(
-                "DynamoDB returned zero webhook records for the current schedule/filter criteria."
             )
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
@@ -3811,43 +3711,24 @@ if airports_sel:
 if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
-# Limit to upcoming legs / next-hour window if requested
-if show_only_upcoming or limit_next_hours:
-    etd_series = pd.to_datetime(df["ETD_UTC"], errors="coerce", utc=True)
-    df["ETD_UTC"] = etd_series
-
-    visibility_mask = pd.Series(True, index=df.index)
-
-    if show_only_upcoming:
-        has_dep_for_filter = has_dep_series.reindex(df.index).fillna(False)
-        visibility_mask &= ~has_dep_for_filter
-
-    if limit_next_hours:
-        window_start = datetime.now(timezone.utc)
-        window_end = window_start + timedelta(hours=int(next_hours))
-        window_mask = etd_series.notna() & etd_series.between(window_start, window_end)
-        if not show_only_upcoming:
-            # Keep legs without an ETD only when we're not forcing "upcoming" only
-            window_mask = window_mask | etd_series.isna()
-        visibility_mask &= window_mask
-
-    df = df[visibility_mask].copy()
-
 # ============================
 # Post-arrival visibility controls
 # ============================
 v1, v2 = st.columns([1, 1])
 with v1:
-    highlight_landed_legs = st.checkbox("Highlight landed legs", value=True)
+    # highlight toggle removed; green overlay always applied
+    auto_hide_on_block = st.checkbox("Auto-hide on block", value=True)
 with v2:
-    auto_hide_landed = st.checkbox("Auto-hide landed", value=True)
-hide_hours = st.number_input("Hide landed after (hours)", min_value=1, max_value=24, value=1, step=1)
+    hide_hours = st.number_input(
+        "Hide on block after (hours)", min_value=1, max_value=24, value=1, step=1
+    )
 
-# Hide legs that landed more than N hours ago (if enabled)
+# Hide legs that have been on block more than N hours ago (if enabled)
 now_utc = datetime.now(timezone.utc)
-if auto_hide_landed:
+if auto_hide_on_block:
     cutoff_hide = now_utc - pd.Timedelta(hours=int(hide_hours))
-    df = df[~(df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] < cutoff_hide))].copy()
+    on_block_series = pd.to_datetime(df.get("_OnBlock_UTC"), errors="coerce", utc=True)
+    df = df[~(on_block_series.notna() & (on_block_series < cutoff_hide))].copy()
 
 # (Re)compute these after filtering so masks align cleanly
 has_dep_series, has_arr_series = _compute_event_presence(df)
@@ -4202,9 +4083,8 @@ def _style_ops(x: pd.DataFrame):
     styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css
 
     # 2) GREEN overlay for landed legs (applied after Y/R so it wins at row level)
-    if 'highlight_landed_legs' in globals() and highlight_landed_legs:
-        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
-        styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
+    row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
+    styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
 
     # 3) Pink overlay for planned inactivity gaps
     if "_GapRow" in _base.columns:
