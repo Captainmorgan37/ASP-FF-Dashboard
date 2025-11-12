@@ -155,14 +155,28 @@ status_label: ui.label | None = None
 notification_log: ui.log | None = None
 # secrets UI state
 secret_state = SimpleNamespace(sections=[])
+secret_sections_container: ui.column | None = None
+
+# enhanced flight following UI state
+enhanced_ff_state = SimpleNamespace(
+    enabled=False,
+    selected=[],
+    options=[],
+    select_component=None,
+    controls_container=None,
+    table=None,
+    message_label=None,
+)
 
 
 
 def _refresh_table() -> None:
     if table_component is None:
         return
-    table_component.rows = _rows_from_schedule(schedule_state.data)
+    rows = _rows_from_schedule(schedule_state.data)
+    table_component.rows = rows
     table_component.update()
+    _update_enhanced_ff_views(rows)
 
 
 def _refresh_status() -> None:
@@ -304,6 +318,142 @@ def send_notification(message_box: ui.textarea) -> None:
         notification_log.push(f"{timestamp} · {message}")
 
 
+def _build_enhanced_ff_options(rows: list[dict[str, object]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    options: list[dict[str, str]] = []
+
+    for row in rows:
+        booking = str(row.get("Booking") or row.get("bookingIdentifier") or "").strip()
+        if not booking or booking in seen:
+            continue
+
+        origin = str(row.get("From (ICAO)") or row.get("airportFrom") or "").strip()
+        destination = str(row.get("To (ICAO)") or row.get("airportTo") or "").strip()
+
+        label = booking
+        if origin or destination:
+            label = f"{booking} · {origin or '???'} → {destination or '???'}"
+
+        options.append({"label": label, "value": booking})
+        seen.add(booking)
+
+    return options
+
+
+def _sync_enhanced_ff_options(rows: list[dict[str, object]]) -> None:
+    options = _build_enhanced_ff_options(rows)
+    enhanced_ff_state.options = options
+
+    valid_selected = [
+        value for value in enhanced_ff_state.selected if any(opt["value"] == value for opt in options)
+    ]
+    if valid_selected != enhanced_ff_state.selected:
+        enhanced_ff_state.selected = valid_selected
+
+    select = enhanced_ff_state.select_component
+    if select is not None:
+        select.options = options
+        select.value = enhanced_ff_state.selected
+        select.update()
+
+
+def _refresh_enhanced_ff_table(rows: list[dict[str, object]] | None = None) -> None:
+    table = enhanced_ff_state.table
+    message_label = enhanced_ff_state.message_label
+
+    if table is None:
+        return
+
+    if rows is None:
+        rows = _rows_from_schedule(schedule_state.data)
+
+    if not enhanced_ff_state.enabled:
+        table.rows = []
+        table.update()
+        if message_label is not None:
+            message_label.text = "Enhanced Flight Following is turned off."
+        return
+
+    if not enhanced_ff_state.selected:
+        table.rows = []
+        table.update()
+        if message_label is not None:
+            message_label.text = "No flights selected for Enhanced Flight Following yet."
+        return
+
+    selected_set = set(enhanced_ff_state.selected)
+    selected_rows = [row for row in rows if str(row.get("Booking") or "").strip() in selected_set]
+    table.rows = selected_rows
+    table.update()
+    if message_label is not None:
+        message_label.text = "" if selected_rows else "Selected flights are no longer present in the schedule."
+
+
+def _render_enhanced_ff_controls(
+    container: ui.column, rows: list[dict[str, object]] | None = None
+) -> None:
+    container.clear()
+    enhanced_ff_state.select_component = None
+
+    if rows is None:
+        rows = _rows_from_schedule(schedule_state.data)
+
+    if not enhanced_ff_state.enabled:
+        with container:
+            ui.label(
+                "Turn on Enhanced Flight Following to select specific flights."
+            ).classes("text-sm text-gray-600")
+        return
+
+    if not rows:
+        with container:
+            ui.label(
+                "Load a schedule to choose flights for Enhanced Flight Following."
+            ).classes("text-sm text-gray-600")
+        return
+
+    select = ui.select(
+        options=enhanced_ff_state.options,
+        label="Select flights for Enhanced Flight Following",
+        value=enhanced_ff_state.selected,
+        on_change=_on_enhanced_ff_selection_change,
+    )
+    select.props("multiple use-chips emit-value map-options dense")
+    select.classes("w-full")
+    enhanced_ff_state.select_component = select
+
+
+def _update_enhanced_ff_views(rows: list[dict[str, object]] | None = None) -> None:
+    if rows is None:
+        rows = _rows_from_schedule(schedule_state.data)
+
+    _sync_enhanced_ff_options(rows)
+
+    container = enhanced_ff_state.controls_container
+    if container is not None:
+        _render_enhanced_ff_controls(container, rows)
+
+    _refresh_enhanced_ff_table(rows)
+
+
+def _on_enhanced_ff_toggle(event) -> None:
+    enhanced_ff_state.enabled = bool(getattr(event, "value", False))
+    if not enhanced_ff_state.enabled:
+        enhanced_ff_state.selected = []
+    _update_enhanced_ff_views()
+
+
+def _on_enhanced_ff_selection_change(event) -> None:
+    value = getattr(event, "value", None)
+    if isinstance(value, list):
+        enhanced_ff_state.selected = value
+    elif value is None:
+        enhanced_ff_state.selected = []
+    else:
+        enhanced_ff_state.selected = [value]
+    _refresh_enhanced_ff_table()
+
+
 # ---------------------------------------------------------------------------
 # Page layout
 # ---------------------------------------------------------------------------
@@ -350,6 +500,26 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
             notification_log = ui.log(max_lines=50).classes("h-40")
 
     with ui.card().classes("w-full"):
+        with ui.row().classes("items-center justify-between w-full"):
+            ui.label("Enhanced Flight Following").classes("text-base font-medium")
+            ui.switch(
+                "Enhanced Flight Following Requested",
+                value=enhanced_ff_state.enabled,
+                on_change=_on_enhanced_ff_toggle,
+            )
+
+        enhanced_ff_state.controls_container = ui.column().classes("w-full gap-3 mt-2")
+
+        enhanced_ff_state.message_label = ui.label("").classes("text-sm text-gray-600")
+
+        enhanced_ff_state.table = ui.table(
+            columns=_table_columns(FL3XX_SCHEDULE_COLUMNS),
+            rows=[],
+            row_key="Booking",
+        ).classes("w-full mt-2")
+        enhanced_ff_state.table.props("dense flat bordered")
+
+    with ui.card().classes("w-full"):
         ui.label("Schedule").classes("text-base font-medium mb-2")
         table_component = ui.table(
             columns=_table_columns(FL3XX_SCHEDULE_COLUMNS),
@@ -366,6 +536,9 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
         container = ui.column().classes("w-full gap-2 mt-2")
         secret_sections_container = container  # type: ignore[assignment]
         _render_secret_sections(container, secret_state.sections)
+
+
+_update_enhanced_ff_views()
 
 
 # ---------------------------------------------------------------------------
