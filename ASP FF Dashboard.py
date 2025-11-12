@@ -2637,7 +2637,18 @@ def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: da
 # ============================
 # Controls
 # ============================
-delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
+_delay_threshold_secret = _resolve_secret("DELAY_THRESHOLD_MIN", "DELAY_THRESHOLD_MINUTES")
+delay_threshold_min = 15
+if _delay_threshold_secret not in (None, ""):
+    try:
+        candidate = int(_delay_threshold_secret)
+    except (TypeError, ValueError):
+        st.warning("Invalid DELAY_THRESHOLD_MIN value; defaulting to 15 minutes.")
+    else:
+        if 1 <= candidate <= 120:
+            delay_threshold_min = candidate
+        else:
+            st.warning("DELAY_THRESHOLD_MIN must be between 1 and 120 minutes; defaulting to 15 minutes.")
 
 # --- ASP Callsign ↔ Tail mapping -------------------------------------------
 # You can optionally put this in Streamlit secrets as:
@@ -4743,12 +4754,12 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
             M.login(IMAP_USER, IMAP_PASS)
         except imaplib.IMAP4.error as e:
             st.error(f"IMAP login failed: {e}")
-            return 0
+            return -1
 
         typ, _ = M.select(IMAP_FOLDER)
         if typ != "OK":
             st.error(f"Could not open folder {IMAP_FOLDER}")
-            return 0
+            return -1
 
         # --- search new UIDs
         last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
@@ -4763,7 +4774,7 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
 
         if typ != "OK":
             st.error("IMAP search failed")
-            return 0
+            return -1
 
         uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
         if not uids:
@@ -5015,45 +5026,44 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
             pass
 
 
-# 3) Now the UI that uses the function
+# 3) Now the indicator that reflects the polling status
 st.markdown("### Mailbox Polling")
 if IMAP_SENDER:
     st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
 else:
     st.caption("IMAP filter: **From = ALL senders**")
 
-enable_poll = st.checkbox(
-    "Enable IMAP polling",
-    value=True,
-    help="Poll the mailbox for EDCT-specific messages and auto-apply updates.",
-)
+imap_poll_enabled = _secret_bool(_resolve_secret("IMAP_POLL_ENABLED"), default=True)
+imap_debug = _secret_bool(_resolve_secret("IMAP_DEBUG"), default=False)
+
+_max_per_poll_secret = _resolve_secret("IMAP_MAX_PER_POLL")
+max_per_poll = 200
+if _max_per_poll_secret not in (None, ""):
+    try:
+        max_candidate = int(_max_per_poll_secret)
+    except (TypeError, ValueError):
+        st.warning("Invalid IMAP_MAX_PER_POLL value; defaulting to 200 emails per poll.")
+    else:
+        if 10 <= max_candidate <= 1000:
+            max_per_poll = max_candidate
+        else:
+            st.warning("IMAP_MAX_PER_POLL must be between 10 and 1000; defaulting to 200 emails per poll.")
 
 st.caption("IMAP polling processes EDCT notifications only; FlightAware alerts are handled via webhook integration.")
 
-if enable_poll:
-    if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
-        st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
+    st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+elif not imap_poll_enabled:
+    st.info("IMAP polling is disabled via the IMAP_POLL_ENABLED setting.")
+else:
+    try:
+        applied = imap_poll_once(max_to_process=int(max_per_poll), debug=imap_debug)
+    except Exception as e:
+        st.error(f"IMAP polling error: {e}")
     else:
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            debug_poll = st.checkbox("Debug IMAP (verbose)", value=False)
-        with c2:
-            poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
-        with c3:
-            if st.button("Reset IMAP cursor only", key="reset_imap_cursor", help="Sets the last processed UID to 0; saved statuses remain."):
-                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
-                st.success("IMAP cursor reset to 0 (statuses preserved).")
-
-        max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
-
-        if st.button("Poll now", key="poll_now"):
-            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
-            st.success(f"Applied {applied} update(s) from mailbox.")
-
-        if poll_on_refresh:
-            try:
-                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll)
-                if applied:
-                    st.info(f"Auto-poll applied {applied} update(s).")
-            except Exception as e:
-                st.error(f"Auto-poll error: {e}")
+        if applied < 0:
+            st.error("IMAP polling encountered an error. See messages above for details.")
+        elif applied == 0:
+            st.success("IMAP polling operational (no new emails detected on this refresh).")
+        else:
+            st.success(f"IMAP polling operational – applied {applied} update(s) this refresh.")
