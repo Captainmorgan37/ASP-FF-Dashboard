@@ -52,10 +52,10 @@ class FakeSession:
         pass
 
 
-def test_compute_fetch_dates_uses_today_and_two_days_later():
+def test_compute_fetch_dates_overlap_previous_day_and_following_day():
     reference = datetime(2025, 10, 2, 12, 0, tzinfo=timezone.utc)
     start, end = compute_fetch_dates(reference)
-    assert start.isoformat() == "2025-10-02"
+    assert start.isoformat() == "2025-10-01"
     assert end.isoformat() == "2025-10-04"
 
 
@@ -70,7 +70,7 @@ def test_fetch_flights_builds_expected_request_parameters():
     flights, metadata = fetch_flights(config, session=session, now=now)
 
     assert flights == [{"bookingIdentifier": "TEST"}]
-    assert metadata["from_date"] == "2025-10-02"
+    assert metadata["from_date"] == "2025-10-01"
     assert metadata["to_date"] == "2025-10-04"
     assert metadata["time_zone"] == "UTC"
     assert metadata["value"] == "ALL"
@@ -80,7 +80,7 @@ def test_fetch_flights_builds_expected_request_parameters():
     assert len(session.calls) == 1
     call = session.calls[0]
     assert call["url"] == config.base_url
-    assert call["params"]["from"] == "2025-10-02"
+    assert call["params"]["from"] == "2025-10-01"
     assert call["params"]["to"] == "2025-10-04"
     assert call["params"]["timeZone"] == "UTC"
     assert call["params"]["value"] == "ALL"

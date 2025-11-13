@@ -48,15 +48,16 @@ class Fl3xxApiConfig:
 def compute_fetch_dates(now: Optional[datetime] = None) -> Tuple[date, date]:
     """Return the inclusive date range that should be requested from the API.
 
-    The requirement is to load flights starting today and including the
-    following day. Because the FL3XX API treats the ``to`` parameter as
-    exclusive, we advance it by two days so that flights that depart on the
-    following day are included.
+    To avoid dropping flights that are still active at midnight, we start the
+    range one day prior to ``now``. Because the FL3XX API treats the ``to``
+    parameter as exclusive, we advance it by two days from ``now`` so that
+    flights that depart on the following day are included.
     """
 
     current = now or datetime.now(timezone.utc)
-    start = current.date()
-    end = start + timedelta(days=2)
+    today = current.date()
+    start = today - timedelta(days=1)
+    end = today + timedelta(days=2)
     return start, end
 
 
