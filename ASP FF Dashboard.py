@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - optional dependency
     boto3 = None
     Key = None
 
-from data_sources import ScheduleSource, load_schedule
+from data_sources import ScheduleData, ScheduleSource, load_schedule
 from fl3xx_client import (
     DEFAULT_FL3XX_BASE_URL,
     Fl3xxApiConfig,
