@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - optional dependency
     boto3 = None
     Key = None
 
-from data_sources import ScheduleSource, load_schedule
+from data_sources import ScheduleData, ScheduleSource, load_schedule
 from fl3xx_client import (
     DEFAULT_FL3XX_BASE_URL,
     Fl3xxApiConfig,
@@ -2987,28 +2987,6 @@ def apply_flightaware_webhook_updates(
 # ============================
 # Schedule data source selection
 # ============================
-DATA_SOURCE_OPTIONS = {
-    "fl3xx_api": "FL3XX API (automatic)",
-    "csv_upload": "Upload CSV",
-}
-
-with st.sidebar:
-    st.subheader("Schedule data source")
-    option_keys = list(DATA_SOURCE_OPTIONS.keys())
-    default_source = st.session_state.get("schedule_source_choice")
-    if default_source not in option_keys:
-        default_source = "fl3xx_api" if _has_fl3xx_credentials_configured() else "csv_upload"
-    if default_source not in option_keys:
-        default_source = option_keys[0]
-    default_index = option_keys.index(default_source)
-    selected_source: ScheduleSource = st.radio(
-        "Select source",
-        options=option_keys,
-        index=default_index,
-        format_func=lambda key: DATA_SOURCE_OPTIONS[key],
-        key="schedule_source_choice",
-    )
-
 btn_cols = st.columns([1, 3, 1])
 with btn_cols[0]:
     if st.button("Reset data & clear cache"):
@@ -3022,179 +3000,119 @@ with btn_cols[0]:
             conn.execute("DELETE FROM fl3xx_cache")
         st.rerun()
 
-schedule_payload = None
+schedule_payload: ScheduleData | None = None
 schedule_metadata: dict[str, Any] = {}
 fl3xx_flights_payload: list[dict[str, Any]] | None = None
 
-if selected_source == "csv_upload":
-    uploaded = st.file_uploader(
-        "Upload your daily flights CSV (FL3XX export)",
-        type=["csv"],
-        key="flights_csv",
+config = _build_fl3xx_config_from_secrets()
+if not config.auth_header and not config.api_token:
+    st.error(
+        "FL3XX API credentials are not configured. Provide an API token or a pre-built "
+        "authorization header to load the automatic schedule."
     )
-
-    # Priority order: upload → session → DB
-    csv_bytes: bytes | None = None
-    csv_name: str | None = None
-    csv_uploaded_at: str | None = None
-    if uploaded is not None:
-        csv_bytes = uploaded.getvalue()
-        csv_name = uploaded.name
-        csv_uploaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-        st.session_state["csv_bytes"] = csv_bytes
-        st.session_state["csv_name"] = csv_name
-        st.session_state["csv_uploaded_at"] = csv_uploaded_at
-        save_csv_to_db(csv_name, csv_bytes)
-    elif "csv_bytes" in st.session_state:
-        csv_bytes = st.session_state["csv_bytes"]
-        csv_name = st.session_state.get("csv_name", "flights.csv")
-        csv_uploaded_at = st.session_state.get("csv_uploaded_at", "")
-        st.caption(
-            f"Using cached CSV: **{csv_name}** (uploaded {csv_uploaded_at})"
+    st.info("Open the **Secrets diagnostics** panel above for a breakdown of detected FL3XX credentials.")
+    with st.expander("How to supply FL3XX credentials", expanded=True):
+        st.markdown(
+            "- Add a `[fl3xx_api]` section to Streamlit secrets with `api_token` or `auth_header`.\n"
+            "- Alternatively, set the `FL3XX_API_TOKEN` environment variable (App Runner secret).\n"
+            "- Optional: set `FL3XX_AUTH_HEADER_NAME` when the API expects a different header name."
         )
-    else:
-        name, content, uploaded_at = load_csv_from_db()
-        if content is not None:
-            csv_bytes = content
-            csv_name = name or "flights.csv"
-            csv_uploaded_at = uploaded_at or ""
-            st.session_state["csv_bytes"] = csv_bytes
-            st.session_state["csv_name"] = csv_name
-            st.session_state["csv_uploaded_at"] = csv_uploaded_at
-            st.caption(
-                f"Loaded CSV from storage: **{csv_name}** (uploaded {csv_uploaded_at})"
-            )
+        diag_rows = _fl3xx_secret_diagnostics_rows()
+        if diag_rows:
+            st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
         else:
-            st.info("Upload today’s FL3XX flights CSV to begin.")
-            st.stop()
-
-    if csv_bytes is None:
-        st.error("CSV data unavailable. Upload a file to continue.")
-        st.stop()
-
-    schedule_metadata = {
-        "filename": csv_name,
-        "uploaded_at": csv_uploaded_at,
-    }
-    schedule_payload = load_schedule(
-        "csv_upload",
-        csv_bytes=csv_bytes,
-        metadata=schedule_metadata,
-    )
-
-elif selected_source == "fl3xx_api":
-    config = _build_fl3xx_config_from_secrets()
-    if not config.auth_header and not config.api_token:
-        st.error(
-            "FL3XX API credentials are not configured. Provide an API token or a pre-built "
-            "authorization header before selecting the automatic schedule source."
-        )
-        st.info("Open the **Secrets diagnostics** panel above for a breakdown of detected FL3XX credentials.")
-        with st.expander("How to supply FL3XX credentials", expanded=True):
-            st.markdown(
-                "- Add a `[fl3xx_api]` section to Streamlit secrets with `api_token` or `auth_header`.\n"
-                "- Alternatively, set the `FL3XX_API_TOKEN` environment variable (App Runner secret).\n"
-                "- Optional: set `FL3XX_AUTH_HEADER_NAME` when the API expects a different header name."
-            )
-            diag_rows = _fl3xx_secret_diagnostics_rows()
-            if diag_rows:
-                st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
-            else:
-                st.caption("No FL3XX credential hints detected in secrets or environment variables.")
-        st.stop()
-
-    cache_entry = load_fl3xx_cache()
-
-    def _render_fl3xx_status(metadata: dict) -> None:
-        status_bits = [
-            "FL3XX flights fetched at",
-            (metadata.get("fetched_at") or "unknown time"),
-            "UTC.",
-        ]
-        if metadata.get("used_cache"):
-            status_bits.append("Using cached schedule data.")
-        else:
-            status_bits.append("Latest API response loaded.")
-        if metadata.get("changed"):
-            status_bits.append("Changes detected since previous fetch.")
-        else:
-            status_bits.append("No schedule changes detected.")
-        next_refresh = metadata.get("next_refresh_after")
-        if next_refresh:
-            status_bits.append(f"Next refresh after {next_refresh}.")
-
-        crew_fetch_count = metadata.get("crew_fetch_count")
-        if crew_fetch_count is not None:
-            status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
-
-        crew_updated = metadata.get("crew_updated")
-        if crew_updated is True:
-            status_bits.append("Crew roster updated.")
-        elif crew_updated is False:
-            status_bits.append("Crew roster unchanged.")
-
-        crew_errors = metadata.get("crew_fetch_errors")
-        if crew_errors:
-            status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
-        elif crew_errors is not None:
-            status_bits.append("No crew fetch errors.")
-
-        st.caption(" ".join(status_bits))
-
-        if crew_errors:
-            st.warning(
-                "One or more crew fetch errors occurred while refreshing crew data."
-            )
-            with st.expander("Crew fetch error details", expanded=False):
-                for error in crew_errors:
-                    st.write(error)
-    try:
-        flights, api_metadata = _get_fl3xx_schedule(config=config)
-        fl3xx_flights_payload = flights
-        schedule_metadata = api_metadata
-        schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
-        _render_fl3xx_status(api_metadata)
-    except Exception as exc:
-        if cache_entry:
-            st.warning(
-                "Unable to refresh FL3XX flights. Using cached data fetched at "
-                f"{cache_entry.get('fetched_at') or 'unknown time'} UTC.\n{exc}"
-            )
-            fallback_metadata = {
-                "from_date": cache_entry.get("from_date"),
-                "to_date": cache_entry.get("to_date"),
-                "time_zone": "UTC",
-                "value": "ALL",
-                "fetched_at": cache_entry.get("fetched_at"),
-                "hash": cache_entry.get("hash"),
-                "used_cache": True,
-                "changed": False,
-                "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
-                "next_refresh_after": None,
-                "request_url": config.base_url,
-                "request_params": {
-                    "from": cache_entry.get("from_date"),
-                    "to": cache_entry.get("to_date"),
-                    "timeZone": "UTC",
-                    "value": "ALL",
-                    **config.extra_params,
-                },
-                "crew_fetch_count": 0,
-                "crew_fetch_errors": [],
-                "crew_updated": False,
-            }
-            flights = cache_entry.get("flights", [])
-            fl3xx_flights_payload = flights
-            schedule_metadata = fallback_metadata
-            schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
-            _render_fl3xx_status(fallback_metadata)
-        else:
-            st.error(f"Unable to load FL3XX flights: {exc}")
-            st.stop()
-
-else:
-    st.error(f"Unsupported schedule source: {selected_source}")
+            st.caption("No FL3XX credential hints detected in secrets or environment variables.")
     st.stop()
+
+cache_entry = load_fl3xx_cache()
+
+def _render_fl3xx_status(metadata: dict) -> None:
+    status_bits = [
+        "FL3XX flights fetched at",
+        (metadata.get("fetched_at") or "unknown time"),
+        "UTC.",
+    ]
+    if metadata.get("used_cache"):
+        status_bits.append("Using cached schedule data.")
+    else:
+        status_bits.append("Latest API response loaded.")
+    if metadata.get("changed"):
+        status_bits.append("Changes detected since previous fetch.")
+    else:
+        status_bits.append("No schedule changes detected.")
+    next_refresh = metadata.get("next_refresh_after")
+    if next_refresh:
+        status_bits.append(f"Next refresh after {next_refresh}.")
+
+    crew_fetch_count = metadata.get("crew_fetch_count")
+    if crew_fetch_count is not None:
+        status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
+
+    crew_updated = metadata.get("crew_updated")
+    if crew_updated is True:
+        status_bits.append("Crew roster updated.")
+    elif crew_updated is False:
+        status_bits.append("Crew roster unchanged.")
+
+    crew_errors = metadata.get("crew_fetch_errors")
+    if crew_errors:
+        status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
+    elif crew_errors is not None:
+        status_bits.append("No crew fetch errors.")
+
+    st.caption(" ".join(status_bits))
+
+    if crew_errors:
+        st.warning(
+            "One or more crew fetch errors occurred while refreshing crew data."
+        )
+        with st.expander("Crew fetch error details", expanded=False):
+            for error in crew_errors:
+                st.write(error)
+
+try:
+    flights, api_metadata = _get_fl3xx_schedule(config=config)
+    fl3xx_flights_payload = flights
+    schedule_metadata = api_metadata
+    schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
+    _render_fl3xx_status(api_metadata)
+except Exception as exc:
+    if cache_entry:
+        st.warning(
+            "Unable to refresh FL3XX flights. Using cached data fetched at "
+            f"{cache_entry.get('fetched_at') or 'unknown time'} UTC.\n{exc}"
+        )
+        fallback_metadata = {
+            "from_date": cache_entry.get("from_date"),
+            "to_date": cache_entry.get("to_date"),
+            "time_zone": "UTC",
+            "value": "ALL",
+            "fetched_at": cache_entry.get("fetched_at"),
+            "hash": cache_entry.get("hash"),
+            "used_cache": True,
+            "changed": False,
+            "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+            "next_refresh_after": None,
+            "request_url": config.base_url,
+            "request_params": {
+                "from": cache_entry.get("from_date"),
+                "to": cache_entry.get("to_date"),
+                "timeZone": "UTC",
+                "value": "ALL",
+                **config.extra_params,
+            },
+            "crew_fetch_count": 0,
+            "crew_fetch_errors": [],
+            "crew_updated": False,
+        }
+        flights = cache_entry.get("flights", [])
+        fl3xx_flights_payload = flights
+        schedule_metadata = fallback_metadata
+        schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
+        _render_fl3xx_status(fallback_metadata)
+    else:
+        st.error(f"Unable to load FL3XX flights: {exc}")
+        st.stop()
 
 if schedule_payload is None:
     st.error("Schedule data unavailable.")
@@ -3731,7 +3649,7 @@ window_hours = st.slider(
     "Show flights departing within the next (hours)",
     min_value=1,
     max_value=48,
-    value=18,
+    value=3,
     step=1,
 )
 
@@ -3772,7 +3690,6 @@ df.loc[has_arr_series, "Arrives In"] = "—"
 # ============================
 # Keep your default chronological sort first
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
-df["_orig_order"] = range(len(df))  # for stable ordering when Delayed View is off
 
 delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))   # e.g., 15m
 row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # ≥30m
@@ -3807,27 +3724,26 @@ cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
 cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
-# ---- New: Delayed View controls next to the title ----
-head_toggle_col, head_title_col = st.columns([1.6, 8.4])
-with head_toggle_col:
-    delayed_view = st.checkbox("Delayed View", value=False, help="Show RED (≥30m) first, then YELLOW (15–29m).")
+st.subheader("Schedule")
+option_cols = st.columns([1, 1, 1])
+with option_cols[0]:
     show_account_column = st.checkbox(
         "Show Account column",
         value=False,
-        help="Display the Account value from the uploaded CSV in the schedule table.",
+        help="Display the Account value from the active schedule in the table.",
     )
+with option_cols[1]:
     show_sic_column = st.checkbox(
         "Show SIC column",
         value=False,
-        help="Display the SIC value from the uploaded CSV in the schedule table.",
+        help="Display the SIC value from the active schedule in the table.",
     )
+with option_cols[2]:
     show_workflow_column = st.checkbox(
         "Show Workflow column",
         value=False,
-        help="Display the Workflow value from the uploaded CSV in the schedule table.",
+        help="Display the Workflow value from the active schedule in the table.",
     )
-with head_title_col:
-    st.subheader("Schedule")
 
 # Placeholder so the Enhanced Flight Following section renders ahead of the main table
 enhanced_ff_container = st.container()
@@ -3835,16 +3751,6 @@ enhanced_ff_container = st.container()
 # Compute a delay priority (2 = red, 1 = yellow, 0 = normal)
 delay_priority = (row_red.astype(int) * 2 + row_yellow.astype(int))
 df["_DelayPriority"] = delay_priority
-
-# If Delayed View is on: optionally filter, then sort by priority
-df_view = df.copy()
-if delayed_view:
-    df_view = df_view[df_view["_DelayPriority"] > 0].copy()
-    # Keep chronological order within each priority by using the earlier sort's order
-    df_view = df_view.sort_values(
-        by=["_DelayPriority", "_orig_order"],
-        ascending=[False, True]
-    )
 
 # ---- Build a view that keeps REAL datetimes for sorting, but shows time-only ----
 display_cols = [
@@ -3869,16 +3775,13 @@ if not show_sic_column:
 if not show_workflow_column:
     display_cols = [c for c in display_cols if c != "Workflow"]
 
-view_df = (df_view if delayed_view else df).copy()
+view_df = df.copy()
 
 if show_account_column and "Account" in view_df.columns:
     view_df["Account"] = view_df["Account"].map(format_account_value)
 
 view_df["_GapRow"] = False
-if not delayed_view:
-    view_df = insert_gap_notice_rows(view_df)
-else:
-    view_df = view_df.reset_index(drop=True)
+view_df = insert_gap_notice_rows(view_df)
 
 # Ensure gap flag remains boolean after any transforms
 if "_GapRow" in view_df.columns:
@@ -4661,7 +4564,7 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
         _apply_inline_editor_updates(inline_original, edited_inline, editable_source)
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
-_show = (df_view if delayed_view else df)  # NOTE: keep original index; do NOT reset here
+_show = df  # NOTE: keep original index; do NOT reset here
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
@@ -4710,7 +4613,7 @@ def _top_reason(idx) -> tuple[str, int]:
         return (f"🔴 **FlightAware takeoff** was {m} {_min_word(m)} later than **scheduled**.", m)
     return ("Delay detected by rules, details not classifiable.", 0)
 
-with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_delayed) > 0)):
+with st.expander("Quick Notify (cell-level delays only)", expanded=False):
     if _delayed.empty:
         st.caption("No triggered cell-level delays right now 🎉")
     else:
@@ -4755,14 +4658,11 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
 
 
 
-if delayed_view:
-    st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
-else:
-    st.caption(
-        "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
-        "Cell accents: red = variance (Takeoff (FA)>Off-Block Sched, ETA(FA)>On-Block Sched, Landing (FA)>On-Block Sched). "
-        "EDCT shows in purple in Takeoff (FA) until a Departure email is received."
-    )
+st.caption(
+    "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
+    "Cell accents: red = variance (Takeoff (FA)>Off-Block Sched, ETA(FA)>On-Block Sched, Landing (FA)>On-Block Sched). "
+    "EDCT shows in purple in Takeoff (FA) until a Departure email is received."
+)
 
 # ----------------- end schedule render -----------------
 
