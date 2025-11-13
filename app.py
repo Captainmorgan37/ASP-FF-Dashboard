@@ -17,7 +17,7 @@ if os.getenv("STREAMLIT_SERVER_PORT") or os.getenv("STREAMLIT_RUNTIME"):
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Iterable, Mapping
 from secrets_diagnostics import SecretSection, collect_secret_diagnostics
 
 
@@ -77,7 +77,8 @@ except Exception:
 # --- data_sources guard (ensures IMPORT_ERROR is always defined) ---
 IMPORT_ERROR = None
 try:
-    from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+from schedule_phases import SCHEDULE_PHASES, categorize_rows_by_phase
 except Exception as e:
     IMPORT_ERROR = e
     # Fallbacks so the app can still run
@@ -150,7 +151,7 @@ def _utc_timestamp() -> str:
 
 
 schedule_state = SimpleNamespace(data=None)  # type: ignore[attr-defined]
-table_component: ui.table | None = None
+schedule_tables: dict[str, ui.table] = {}
 status_label: ui.label | None = None
 notification_log: ui.log | None = None
 # secrets UI state
@@ -171,11 +172,12 @@ enhanced_ff_state = SimpleNamespace(
 
 
 def _refresh_table() -> None:
-    if table_component is None:
-        return
     rows = _rows_from_schedule(schedule_state.data)
-    table_component.rows = rows
-    table_component.update()
+    if schedule_tables:
+        buckets = categorize_rows_by_phase(rows)
+        for phase, table in schedule_tables.items():
+            table.rows = buckets.get(phase, [])
+            table.update()
     _update_enhanced_ff_views(rows)
 
 
@@ -521,12 +523,19 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
 
     with ui.card().classes("w-full"):
         ui.label("Schedule").classes("text-base font-medium mb-2")
-        table_component = ui.table(
-            columns=_table_columns(FL3XX_SCHEDULE_COLUMNS),
-            rows=[],
-            row_key="Booking",
-        ).classes("w-full")
-        table_component.props("dense flat bordered")
+        schedule_tables.clear()
+        with ui.column().classes("w-full gap-2"):
+            for phase, title, description, expanded in SCHEDULE_PHASES:
+                with ui.expansion(title, value=expanded).classes("w-full"):
+                    if description:
+                        ui.label(description).classes("text-sm text-gray-600 mb-2")
+                    table = ui.table(
+                        columns=_table_columns(FL3XX_SCHEDULE_COLUMNS),
+                        rows=[],
+                        row_key="Booking",
+                    ).classes("w-full")
+                    table.props("dense flat bordered")
+                    schedule_tables[phase] = table
 
     with ui.card().classes("w-full"):
         with ui.row().classes("items-center justify-between w-full"):

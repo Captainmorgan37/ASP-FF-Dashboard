@@ -6,7 +6,7 @@ import json
 import sqlite3
 import imaplib, email
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -42,6 +42,10 @@ from flightaware_status import (
     build_status_payload,
     derive_event_times,
     fetch_flights_for_ident,
+)
+from schedule_phases import (
+    SCHEDULE_PHASES,
+    categorize_dataframe_by_phase,
 )
 # Global lookup maps populated after loading airport metadata. Define them early so
 # helper functions can reference the names during the initial Streamlit run.
@@ -4208,6 +4212,29 @@ fmt_map = {
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
 
+
+def _render_schedule_table(df_subset: pd.DataFrame) -> None:
+    if df_subset.empty:
+        st.caption("No flights in this phase right now.")
+        return
+
+    styler = df_subset.style
+    if hasattr(styler, "hide_index"):
+        styler = styler.hide_index()
+    else:
+        styler = styler.hide(axis="index")
+
+    try:
+        styler = styler.apply(_style_ops, axis=None).format(fmt_map)
+        st.dataframe(styler, use_container_width=True)
+    except Exception:
+        st.warning("Styling disabled (env compatibility). Showing plain table.")
+        tmp = df_subset.copy()
+        for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
+            if c in tmp.columns:
+                tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
+        st.dataframe(tmp, use_container_width=True)
+
 with enhanced_ff_container:
     st.markdown("#### Enhanced Flight Following")
 
@@ -4549,21 +4576,13 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
 
 # ----------------- Schedule render with inline Notify -----------------
 
-styler = df_display.style
-if hasattr(styler, "hide_index"):
-    styler = styler.hide_index()
-else:
-    styler = styler.hide(axis="index")
+schedule_buckets = categorize_dataframe_by_phase(df_display)
 
-try:
-    styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(styler, use_container_width=True)
-except Exception:
-    st.warning("Styling disabled (env compatibility). Showing plain table.")
-    tmp = df_display.copy()
-    for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
-        tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-    st.dataframe(tmp, use_container_width=True)
+for phase, title, description, expanded in SCHEDULE_PHASES:
+    with st.expander(title, expanded=expanded):
+        if description:
+            st.caption(description)
+        _render_schedule_table(schedule_buckets.get(phase, df_display.iloc[0:0]))
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=False):
