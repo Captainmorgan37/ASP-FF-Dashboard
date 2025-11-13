@@ -3722,6 +3722,22 @@ if airports_sel:
 if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
+st.caption("Limit the view to the operational window while retaining legs that already departed.")
+window_hours = st.slider(
+    "Show flights departing within the next (hours)",
+    min_value=1,
+    max_value=48,
+    value=18,
+    step=1,
+)
+
+if window_hours and not df.empty:
+    etd_series = pd.to_datetime(df.get("ETD_UTC"), errors="coerce", utc=True)
+    cutoff_future = now_utc + pd.Timedelta(hours=int(window_hours))
+    upcoming_mask = etd_series.notna() & (etd_series <= cutoff_future)
+    keep_mask = has_dep_series | upcoming_mask
+    df = df[keep_mask].copy()
+
 # ============================
 # Post-arrival visibility controls
 # ============================
