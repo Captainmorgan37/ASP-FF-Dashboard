@@ -77,7 +77,8 @@ except Exception:
 # --- data_sources guard (ensures IMPORT_ERROR is always defined) ---
 IMPORT_ERROR = None
 try:
-    from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+from schedule_phases import SCHEDULE_PHASES, categorize_rows_by_phase
 except Exception as e:
     IMPORT_ERROR = e
     # Fallbacks so the app can still run
@@ -290,7 +291,7 @@ enhanced_ff_state = SimpleNamespace(
 def _refresh_table() -> None:
     rows = _rows_from_schedule(schedule_state.data)
     if schedule_tables:
-        buckets = _categorize_rows_by_phase(rows)
+        buckets = categorize_rows_by_phase(rows)
         for phase, table in schedule_tables.items():
             table.rows = buckets.get(phase, [])
             table.update()

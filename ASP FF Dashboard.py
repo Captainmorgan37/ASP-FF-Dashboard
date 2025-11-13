@@ -43,6 +43,10 @@ from flightaware_status import (
     derive_event_times,
     fetch_flights_for_ident,
 )
+from schedule_phases import (
+    SCHEDULE_PHASES,
+    categorize_dataframe_by_phase,
+)
 # Global lookup maps populated after loading airport metadata. Define them early so
 # helper functions can reference the names during the initial Streamlit run.
 ICAO_TZ_MAP: dict[str, str] = {}
@@ -4209,132 +4213,6 @@ fmt_map = {
 }
 
 
-# ----------------- Flight phase helpers for collapsible sections -----------------
-SCHEDULE_PHASE_LANDED = "landed"
-SCHEDULE_PHASE_ENROUTE = "enroute"
-SCHEDULE_PHASE_TO_DEPART = "to_depart"
-
-SCHEDULE_PHASES: tuple[tuple[str, str, str, bool], ...] = (
-    (
-        SCHEDULE_PHASE_LANDED,
-        "Landed flights",
-        "Flights that have already landed or parked on the blocks.",
-        False,
-    ),
-    (
-        SCHEDULE_PHASE_ENROUTE,
-        "Enroute flights",
-        "Flights that are airborne or have already gone blocks off.",
-        False,
-    ),
-    (
-        SCHEDULE_PHASE_TO_DEPART,
-        "To depart",
-        "Flights that are waiting to depart.",
-        True,
-    ),
-)
-
-LANDED_VALUE_FIELDS = (
-    "Landing (UTC)",
-    "Landing (FA)",
-    "Landing",
-    "Landing Time",
-    "On Block (UTC)",
-    "On Block",
-    "On-Block (Actual)",
-    "Actual On",
-    "Actual In",
-    "Arrival (UTC)",
-    "Arrival Time",
-    "Arrived",
-)
-
-ENROUTE_VALUE_FIELDS = (
-    "Takeoff (UTC)",
-    "Takeoff (FA)",
-    "Takeoff",
-    "Departure (UTC)",
-    "Departure Time",
-    "Off Block (UTC)",
-    "Off Block",
-    "Blocks Off",
-    "Actual Off",
-    "Actual Out",
-)
-
-STAGE_TEXT_FIELDS = (
-    "Stage Progress",
-    "Status",
-    "Stage",
-    "Flight Status",
-)
-
-LANDED_KEYWORDS = ("landed", "on block", "blocks on", "arrived", "arrival", "on ground")
-ENROUTE_KEYWORDS = (
-    "airborne",
-    "enroute",
-    "en route",
-    "departed",
-    "block off",
-    "blocks off",
-    "off block",
-    "takeoff",
-    "in flight",
-)
-
-
-def _value_is_present(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    try:
-        return bool(pd.notna(value))
-    except Exception:
-        return True
-
-
-def _row_has_values(row: Mapping[str, Any], fields: Iterable[str]) -> bool:
-    for field in fields:
-        if not field:
-            continue
-        if _value_is_present(row.get(field)):
-            return True
-    return False
-
-
-def _row_matches_keywords(row: Mapping[str, Any], keywords: Iterable[str]) -> bool:
-    for field in STAGE_TEXT_FIELDS:
-        value = row.get(field)
-        if not isinstance(value, str):
-            continue
-        text = value.lower()
-        if any(keyword in text for keyword in keywords):
-            return True
-    return False
-
-
-def _row_phase(row: Mapping[str, Any]) -> str:
-    if _row_matches_keywords(row, LANDED_KEYWORDS) or _row_has_values(row, LANDED_VALUE_FIELDS):
-        return SCHEDULE_PHASE_LANDED
-    if _row_matches_keywords(row, ENROUTE_KEYWORDS) or _row_has_values(row, ENROUTE_VALUE_FIELDS):
-        return SCHEDULE_PHASE_ENROUTE
-    return SCHEDULE_PHASE_TO_DEPART
-
-
-def _categorize_schedule(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    if df.empty:
-        return {phase: df.iloc[0:0].copy() for phase, *_ in SCHEDULE_PHASES}
-
-    phase_series = df.apply(_row_phase, axis=1)
-    buckets: dict[str, pd.DataFrame] = {}
-    for phase, *_ in SCHEDULE_PHASES:
-        mask = phase_series == phase
-        buckets[phase] = df[mask].copy()
-    return buckets
-
-
 def _render_schedule_table(df_subset: pd.DataFrame) -> None:
     if df_subset.empty:
         st.caption("No flights in this phase right now.")
@@ -4698,7 +4576,7 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
 
 # ----------------- Schedule render with inline Notify -----------------
 
-schedule_buckets = _categorize_schedule(df_display)
+schedule_buckets = categorize_dataframe_by_phase(df_display)
 
 for phase, title, description, expanded in SCHEDULE_PHASES:
     with st.expander(title, expanded=expanded):
