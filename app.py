@@ -141,6 +141,12 @@ def _table_columns(columns: Iterable[str]) -> list[dict[str, object]]:
     ]
 
 
+def _normalize_column_name(name: str | None) -> str:
+    if not name:
+        return ""
+    return name.strip().lower()
+
+
 SCHEDULE_PHASE_LANDED = "landed"
 SCHEDULE_PHASE_ENROUTE = "enroute"
 SCHEDULE_PHASE_TO_DEPART = "to_depart"
@@ -165,6 +171,48 @@ SCHEDULE_PHASES: tuple[tuple[str, str, str, bool], ...] = (
         True,
     ),
 )
+
+PHASE_COLUMN_EXCLUDES: dict[str, tuple[str, ...]] = {
+    SCHEDULE_PHASE_LANDED: (
+        "Departs In",
+        "Arrives In",
+    ),
+    SCHEDULE_PHASE_ENROUTE: (
+        "Departs In",
+    ),
+    SCHEDULE_PHASE_TO_DEPART: (
+        "ETA",
+        "ETA (FA)",
+        "Arrives In",
+        "Off Block",
+        "Off Block (UTC)",
+        "Off-Block (Sched)",
+        "Off Block (Sched)",
+        "Takeoff",
+        "Takeoff (UTC)",
+        "Takeoff (FA)",
+        "Landing",
+        "Landing (UTC)",
+        "Landing (FA)",
+        "On Block",
+        "On Block (UTC)",
+        "On-Block (Sched)",
+        "On Block (Sched)",
+    ),
+}
+
+PHASE_COLUMN_EXCLUDES_NORMALIZED = {
+    phase: {_normalize_column_name(name) for name in names if name}
+    for phase, names in PHASE_COLUMN_EXCLUDES.items()
+}
+
+
+def _filtered_columns_for_phase(phase: str, columns: Iterable[str]) -> list[str]:
+    excluded = PHASE_COLUMN_EXCLUDES_NORMALIZED.get(phase, set())
+    filtered = [
+        name for name in columns if _normalize_column_name(name) not in excluded
+    ]
+    return filtered or list(columns)
 
 LANDED_VALUE_FIELDS = (
     "Landing (UTC)",
@@ -288,11 +336,31 @@ enhanced_ff_state = SimpleNamespace(
 
 
 
+def _current_schedule_columns() -> list[str]:
+    schedule = schedule_state.data
+    if schedule is None or getattr(schedule, "frame", None) is None:
+        return list(FL3XX_SCHEDULE_COLUMNS)
+    try:
+        columns = list(schedule.frame.columns)
+    except Exception:
+        return list(FL3XX_SCHEDULE_COLUMNS)
+    return columns or list(FL3XX_SCHEDULE_COLUMNS)
+
+
+
+def _schedule_columns_for_phase(phase: str, columns: Iterable[str] | None = None) -> list[str]:
+    source_columns = list(columns) if columns is not None else _current_schedule_columns()
+    return _filtered_columns_for_phase(phase, source_columns)
+
+
+
 def _refresh_table() -> None:
     rows = _rows_from_schedule(schedule_state.data)
     if schedule_tables:
         buckets = categorize_rows_by_phase(rows)
+        available_columns = _current_schedule_columns()
         for phase, table in schedule_tables.items():
+            table.columns = _table_columns(_schedule_columns_for_phase(phase, available_columns))
             table.rows = buckets.get(phase, [])
             table.update()
     _update_enhanced_ff_views(rows)
@@ -647,7 +715,7 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
                     if description:
                         ui.label(description).classes("text-sm text-gray-600 mb-2")
                     table = ui.table(
-                        columns=_table_columns(FL3XX_SCHEDULE_COLUMNS),
+                        columns=_table_columns(_schedule_columns_for_phase(phase)),
                         rows=[],
                         row_key="Booking",
                     ).classes("w-full")
