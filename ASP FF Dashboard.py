@@ -4059,9 +4059,10 @@ def _style_ops(x: pd.DataFrame):
         styles.loc[mask_dep, "Takeoff (FA)"] = (
             styles.loc[mask_dep, "Takeoff (FA)"].fillna("") + cell_css
         )
-    styles.loc[mask_eta, "ETA (FA)"] = (
-        styles.loc[mask_eta, "ETA (FA)"].fillna("") + cell_css
-    )
+    if "ETA (FA)" in x.columns:
+        styles.loc[mask_eta, "ETA (FA)"] = (
+            styles.loc[mask_eta, "ETA (FA)"].fillna("") + cell_css
+        )
     if "Landing (FA)" in x.columns:
         styles.loc[mask_arr, "Landing (FA)"] = (
             styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
