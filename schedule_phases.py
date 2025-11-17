@@ -84,11 +84,67 @@ ENROUTE_KEYWORDS = (
 )
 
 
+PHASE_COLUMN_EXCLUDES: dict[str, tuple[str, ...]] = {
+    SCHEDULE_PHASE_LANDED: (
+        "Departs In",
+        "Arrives In",
+    ),
+    SCHEDULE_PHASE_ENROUTE: (
+        "Departs In",
+        "Landing (UTC)",
+        "Landing (FA)",
+        "On Block (UTC)",
+        "Block On (UTC)",
+    ),
+    SCHEDULE_PHASE_TO_DEPART: (
+        "ETA",
+        "ETA (FA)",
+        "Arrives In",
+        "Off Block",
+        "Off Block (UTC)",
+        "Off-Block (Sched)",
+        "Off Block (Sched)",
+        "Takeoff",
+        "Takeoff (UTC)",
+        "Takeoff (FA)",
+        "Landing",
+        "Landing (UTC)",
+        "Landing (FA)",
+        "On Block",
+        "On Block (UTC)",
+        "On-Block (Sched)",
+        "On Block (Sched)",
+    ),
+}
+
+
+def _normalize_column_name(name: str | None) -> str:
+    if not name:
+        return ""
+    return name.strip().lower()
+
+
+PHASE_COLUMN_EXCLUDES_NORMALIZED = {
+    phase: {_normalize_column_name(col) for col in columns if col}
+    for phase, columns in PHASE_COLUMN_EXCLUDES.items()
+}
+
+
+def filtered_columns_for_phase(phase: str, columns: Iterable[str]) -> list[str]:
+    excluded = PHASE_COLUMN_EXCLUDES_NORMALIZED.get(phase, set())
+    filtered = [
+        column for column in columns if _normalize_column_name(column) not in excluded
+    ]
+    return filtered or list(columns)
+
+
 __all__ = [
     "SCHEDULE_PHASE_LANDED",
     "SCHEDULE_PHASE_ENROUTE",
     "SCHEDULE_PHASE_TO_DEPART",
     "SCHEDULE_PHASES",
+    "PHASE_COLUMN_EXCLUDES",
+    "filtered_columns_for_phase",
     "categorize_dataframe_by_phase",
     "categorize_rows_by_phase",
     "row_phase",
