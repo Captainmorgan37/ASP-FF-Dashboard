@@ -4132,7 +4132,8 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
         styler = styler.hide(axis="index")
 
     try:
-        styler = styler.apply(_style_ops, axis=None).format(fmt_map)
+        active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
+        styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
         st.dataframe(styler, use_container_width=True)
     except Exception:
         st.warning("Styling disabled (env compatibility). Showing plain table.")
