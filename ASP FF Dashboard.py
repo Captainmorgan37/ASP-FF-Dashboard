@@ -46,6 +46,7 @@ from flightaware_status import (
 from schedule_phases import (
     SCHEDULE_PHASES,
     categorize_dataframe_by_phase,
+    filtered_columns_for_phase,
 )
 # Global lookup maps populated after loading airport metadata. Define them early so
 # helper functions can reference the names during the initial Streamlit run.
@@ -4116,23 +4117,27 @@ fmt_map = {
 }
 
 
-def _render_schedule_table(df_subset: pd.DataFrame) -> None:
+def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     if df_subset.empty:
         st.caption("No flights in this phase right now.")
         return
 
-    styler = df_subset.style
+    visible_columns = filtered_columns_for_phase(phase, df_subset.columns)
+    view = df_subset.loc[:, visible_columns]
+
+    styler = view.style
     if hasattr(styler, "hide_index"):
         styler = styler.hide_index()
     else:
         styler = styler.hide(axis="index")
 
     try:
-        styler = styler.apply(_style_ops, axis=None).format(fmt_map)
+        active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
+        styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
         st.dataframe(styler, use_container_width=True)
     except Exception:
         st.warning("Styling disabled (env compatibility). Showing plain table.")
-        tmp = df_subset.copy()
+        tmp = view.copy()
         for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
             if c in tmp.columns:
                 tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
@@ -4485,7 +4490,7 @@ for phase, title, description, expanded in SCHEDULE_PHASES:
     with st.expander(title, expanded=expanded):
         if description:
             st.caption(description)
-        _render_schedule_table(schedule_buckets.get(phase, df_display.iloc[0:0]))
+        _render_schedule_table(schedule_buckets.get(phase, df_display.iloc[0:0]), phase)
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=False):

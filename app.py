@@ -17,7 +17,7 @@ if os.getenv("STREAMLIT_SERVER_PORT") or os.getenv("STREAMLIT_RUNTIME"):
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Iterable, Mapping
+from typing import Iterable
 from secrets_diagnostics import SecretSection, collect_secret_diagnostics
 
 
@@ -77,8 +77,12 @@ except Exception:
 # --- data_sources guard (ensures IMPORT_ERROR is always defined) ---
 IMPORT_ERROR = None
 try:
-from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
-from schedule_phases import SCHEDULE_PHASES, categorize_rows_by_phase
+    from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
+    from schedule_phases import (
+        SCHEDULE_PHASES,
+        categorize_rows_by_phase,
+        filtered_columns_for_phase,
+    )
 except Exception as e:
     IMPORT_ERROR = e
     # Fallbacks so the app can still run
@@ -141,123 +145,6 @@ def _table_columns(columns: Iterable[str]) -> list[dict[str, object]]:
     ]
 
 
-SCHEDULE_PHASE_LANDED = "landed"
-SCHEDULE_PHASE_ENROUTE = "enroute"
-SCHEDULE_PHASE_TO_DEPART = "to_depart"
-
-SCHEDULE_PHASES: tuple[tuple[str, str, str, bool], ...] = (
-    (
-        SCHEDULE_PHASE_LANDED,
-        "Landed flights",
-        "Flights that have already landed or parked on the blocks.",
-        False,
-    ),
-    (
-        SCHEDULE_PHASE_ENROUTE,
-        "Enroute flights",
-        "Flights that are airborne or have already gone blocks off.",
-        False,
-    ),
-    (
-        SCHEDULE_PHASE_TO_DEPART,
-        "To depart",
-        "Flights that are waiting to depart.",
-        True,
-    ),
-)
-
-LANDED_VALUE_FIELDS = (
-    "Landing (UTC)",
-    "Landing (FA)",
-    "Landing",
-    "Landing Time",
-    "On Block (UTC)",
-    "On Block",
-    "On-Block (Actual)",
-    "Actual On",
-    "Actual In",
-    "Arrival (UTC)",
-    "Arrival Time",
-    "Arrived",
-)
-
-ENROUTE_VALUE_FIELDS = (
-    "Takeoff (UTC)",
-    "Takeoff (FA)",
-    "Takeoff",
-    "Departure (UTC)",
-    "Departure Time",
-    "Off Block (UTC)",
-    "Off Block",
-    "Blocks Off",
-    "Actual Off",
-    "Actual Out",
-)
-
-STAGE_TEXT_FIELDS = (
-    "Stage Progress",
-    "Status",
-    "Stage",
-    "Flight Status",
-)
-
-LANDED_KEYWORDS = ("landed", "on block", "blocks on", "arrived", "arrival", "on ground")
-ENROUTE_KEYWORDS = (
-    "airborne",
-    "enroute",
-    "en route",
-    "departed",
-    "block off",
-    "blocks off",
-    "off block",
-    "takeoff",
-    "in flight",
-)
-
-
-def _value_is_present(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    return True
-
-
-def _row_has_values(row: Mapping[str, object], fields: Iterable[str]) -> bool:
-    for field in fields:
-        if field and _value_is_present(row.get(field)):
-            return True
-    return False
-
-
-def _row_matches_keywords(row: Mapping[str, object], keywords: Iterable[str]) -> bool:
-    for field in STAGE_TEXT_FIELDS:
-        value = row.get(field)
-        if not isinstance(value, str):
-            continue
-        text = value.lower()
-        for keyword in keywords:
-            if keyword in text:
-                return True
-    return False
-
-
-def _row_phase(row: Mapping[str, object]) -> str:
-    if _row_matches_keywords(row, LANDED_KEYWORDS) or _row_has_values(row, LANDED_VALUE_FIELDS):
-        return SCHEDULE_PHASE_LANDED
-    if _row_matches_keywords(row, ENROUTE_KEYWORDS) or _row_has_values(row, ENROUTE_VALUE_FIELDS):
-        return SCHEDULE_PHASE_ENROUTE
-    return SCHEDULE_PHASE_TO_DEPART
-
-
-def _categorize_rows_by_phase(rows: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:
-    buckets = {phase: [] for phase, *_ in SCHEDULE_PHASES}
-    for row in rows:
-        phase = _row_phase(row)
-        buckets.setdefault(phase, []).append(row)
-    return buckets
-
-
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -288,11 +175,31 @@ enhanced_ff_state = SimpleNamespace(
 
 
 
+def _current_schedule_columns() -> list[str]:
+    schedule = schedule_state.data
+    if schedule is None or getattr(schedule, "frame", None) is None:
+        return list(FL3XX_SCHEDULE_COLUMNS)
+    try:
+        columns = list(schedule.frame.columns)
+    except Exception:
+        return list(FL3XX_SCHEDULE_COLUMNS)
+    return columns or list(FL3XX_SCHEDULE_COLUMNS)
+
+
+
+def _schedule_columns_for_phase(phase: str, columns: Iterable[str] | None = None) -> list[str]:
+    source_columns = list(columns) if columns is not None else _current_schedule_columns()
+    return filtered_columns_for_phase(phase, source_columns)
+
+
+
 def _refresh_table() -> None:
     rows = _rows_from_schedule(schedule_state.data)
     if schedule_tables:
         buckets = categorize_rows_by_phase(rows)
+        available_columns = _current_schedule_columns()
         for phase, table in schedule_tables.items():
+            table.columns = _table_columns(_schedule_columns_for_phase(phase, available_columns))
             table.rows = buckets.get(phase, [])
             table.update()
     _update_enhanced_ff_views(rows)
@@ -647,7 +554,7 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
                     if description:
                         ui.label(description).classes("text-sm text-gray-600 mb-2")
                     table = ui.table(
-                        columns=_table_columns(FL3XX_SCHEDULE_COLUMNS),
+                        columns=_table_columns(_schedule_columns_for_phase(phase)),
                         rows=[],
                         row_key="Booking",
                     ).classes("w-full")

@@ -17,7 +17,7 @@ Once data is loaded, the status label at the top of the dashboard shows the sour
 
 ## Table layout and flight phases
 
-The main schedule card is split into three expanding tables: **Landed**, **Enroute**, and **To Depart**. Each table reuses the same core columns (booking ID, off/on block times, routing, crew, account, aircraft, type, workflow).【F:app.py†L140-L206】【F:app.py†L624-L666】
+The main schedule card is split into three expanding tables: **Landed**, **Enroute**, and **To Depart**. Each phase still shows the same core identifiers (booking ID, routing, crew, account, aircraft, type, workflow), but columns that are irrelevant to that phase are automatically hidden. For example, departures no longer list ETA or arrival countdown columns, while landed flights suppress the "Departs In" countdown so only useful context remains.【F:app.py†L140-L244】【F:app.py†L624-L676】
 
 Flights move between phases automatically based on both keyword cues (e.g., "Blocks Off" or "Arrived" values) and timestamp fields such as actual off/landing times. If neither landed nor airborne cues are present, the flight stays in "To Depart."【F:app.py†L207-L270】
 
