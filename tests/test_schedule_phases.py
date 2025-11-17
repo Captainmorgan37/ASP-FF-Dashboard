@@ -54,6 +54,18 @@ def test_enroute_columns_hide_departure_countdown():
     assert "Arrives In" in filtered
 
 
+def test_enroute_columns_hide_landing_and_block_on_timestamps():
+    columns = [
+        "Booking",
+        "Landing (UTC)",
+        "Landing (FA)",
+        "On Block (UTC)",
+        "Block On (UTC)",
+    ]
+    filtered = filtered_columns_for_phase(SCHEDULE_PHASE_ENROUTE, columns)
+    assert filtered == ["Booking"]
+
+
 def test_landed_columns_hide_countdowns():
     columns = ["Booking", "Departs In", "Arrives In", "On Block"]
     filtered = filtered_columns_for_phase(SCHEDULE_PHASE_LANDED, columns)

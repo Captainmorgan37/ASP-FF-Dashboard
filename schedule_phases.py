@@ -91,6 +91,10 @@ PHASE_COLUMN_EXCLUDES: dict[str, tuple[str, ...]] = {
     ),
     SCHEDULE_PHASE_ENROUTE: (
         "Departs In",
+        "Landing (UTC)",
+        "Landing (FA)",
+        "On Block (UTC)",
+        "Block On (UTC)",
     ),
     SCHEDULE_PHASE_TO_DEPART: (
         "ETA",
