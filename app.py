@@ -15,7 +15,7 @@ if os.getenv("STREAMLIT_SERVER_PORT") or os.getenv("STREAMLIT_RUNTIME"):
     runpy.run_path(str(Path(__file__).with_name("asp_ff_dashboard.py")), run_name="__main__")
     raise SystemExit(0)
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Iterable
 from secrets_diagnostics import SecretSection, collect_secret_diagnostics
@@ -149,6 +149,231 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+NO_ACTIVITY_GAP_THRESHOLD = timedelta(hours=3)
+DEPARTURE_TIME_FIELDS = (
+    "Off-Block (Sched)",
+    "Off Block (Sched)",
+    "Off Block",
+    "Off Block (UTC)",
+    "ETD_UTC",
+    "Departure (UTC)",
+    "Takeoff (UTC)",
+    "Takeoff (FA)",
+    "Actual Off",
+    "Actual Out",
+)
+ARRIVAL_TIME_FIELDS = (
+    "On-Block (Sched)",
+    "On Block (Sched)",
+    "On Block",
+    "On Block (UTC)",
+    "ETA (UTC)",
+    "ETA (FA)",
+    "Landing (UTC)",
+    "Landing (FA)",
+    "Actual On",
+    "Actual In",
+)
+
+
+def _parse_schedule_timestamp(value: object | None) -> datetime | None:
+    if value in (None, "", "—"):
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+    elif pd is not None:
+        try:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+        except Exception:
+            ts = pd.NaT
+        if isinstance(ts, pd.Series):
+            ts = ts.iloc[0]
+        if isinstance(ts, pd.Timestamp):
+            if pd.isna(ts):
+                return None
+            dt = ts.to_pydatetime()
+        elif isinstance(ts, datetime):
+            dt = ts
+        else:
+            dt = None
+    else:
+        dt = None
+
+    if dt is None:
+        text = str(value).strip()
+        if not text:
+            return None
+        iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            dt = datetime.fromisoformat(iso_text)
+        except ValueError:
+            for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            return None
+
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+
+    return None
+
+
+def _first_timestamp_from_fields(row: dict[str, object], fields: Iterable[str]) -> datetime | None:
+    for field in fields:
+        if not field:
+            continue
+        value = row.get(field)
+        ts = _parse_schedule_timestamp(value)
+        if ts is not None:
+            return ts
+    return None
+
+
+def _flight_windows_from_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    windows: list[dict[str, object]] = []
+    for row in rows:
+        start = _first_timestamp_from_fields(row, DEPARTURE_TIME_FIELDS)
+        end = _first_timestamp_from_fields(row, ARRIVAL_TIME_FIELDS)
+        if start is None and end is None:
+            continue
+        if start is None:
+            start = end
+        if end is None:
+            end = start
+        if start is None or end is None:
+            continue
+        if end < start:
+            start, end = end, start
+        windows.append(
+            {
+                "start": start,
+                "end": end,
+                "booking": str(row.get("Booking") or ""),
+                "aircraft": str(row.get("Aircraft") or ""),
+            }
+        )
+    windows.sort(key=lambda item: item["start"])
+    return windows
+
+
+def _compute_inactivity_windows(
+    windows: list[dict[str, object]], threshold: timedelta = NO_ACTIVITY_GAP_THRESHOLD
+) -> list[dict[str, object]]:
+    if not windows:
+        return []
+
+    inactivity: list[dict[str, object]] = []
+    previous_end = windows[0]["end"]
+    for window in windows[1:]:
+        next_start = window["start"]
+        if previous_end and next_start:
+            gap = next_start - previous_end
+            if gap >= threshold:
+                inactivity.append({"start": previous_end, "end": next_start, "duration": gap})
+        if window["end"] and window["end"] > previous_end:
+            previous_end = window["end"]
+    return inactivity
+
+
+def _format_gap_duration(td: timedelta | None) -> str:
+    if td is None:
+        return ""
+    total_minutes = int(td.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _format_utc_label(value: datetime | None) -> str:
+    if value is None:
+        return "—"
+    return value.strftime("%d %b %H:%MZ")
+
+
+def _render_flight_gap_summary(
+    container: ui.column, rows: list[dict[str, object]] | None
+) -> None:
+    container.clear()
+
+    if not rows:
+        with container:
+            ui.label("Load a schedule to highlight quiet periods.").classes(
+                "text-sm text-gray-600"
+            )
+        return
+
+    windows = _flight_windows_from_rows(rows)
+    if not windows:
+        with container:
+            ui.label("No timing information found for the current schedule.").classes(
+                "text-sm text-gray-600"
+            )
+        return
+
+    first_window = windows[0]
+    last_window = windows[-1]
+
+    with container:
+        with ui.row().classes("gap-4 flex-wrap w-full"):
+            for title, icon, timestamp, extra in (
+                ("First planned movement", "flight_takeoff", first_window["start"], first_window["booking"]),
+                ("Last planned movement", "flight_land", last_window["end"], last_window["booking"]),
+            ):
+                with ui.column().classes(
+                    "px-4 py-3 bg-gray-50 rounded-lg border border-gray-100 flex-1 min-w-[220px]"
+                ):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon(icon).classes("text-gray-500")
+                        ui.label(title).classes(
+                            "text-xs uppercase tracking-wide text-gray-500"
+                        )
+                    ui.label(_format_utc_label(timestamp)).classes("text-base font-medium")
+                    if extra:
+                        ui.label(f"Booking {extra}").classes("text-xs text-gray-500")
+
+        gaps = _compute_inactivity_windows(windows)
+        if not gaps:
+            ui.label(
+                "No flight-free windows longer than 3h between scheduled movements."
+            ).classes("text-sm text-gray-600")
+            return
+
+        ui.label("Flight-free windows (≥3h)").classes("text-xs uppercase text-gray-500 mt-2")
+        for gap in gaps:
+            with ui.row().classes(
+                "items-center gap-3 w-full bg-pink-50 border border-pink-100 rounded-lg p-3"
+            ):
+                ui.icon("pause_circle_filled").classes("text-pink-500")
+                with ui.column().classes("gap-0"):
+                    ui.label(
+                        f"{_format_utc_label(gap['start'])} → {_format_utc_label(gap['end'])}"
+                    ).classes("text-sm font-medium text-pink-700")
+                    ui.label(
+                        f"Idle for {_format_gap_duration(gap['duration'])}"
+                    ).classes("text-xs text-gray-600")
+
+
+def _update_gap_summary(rows: list[dict[str, object]] | None = None) -> None:
+    container = flight_gap_state.container
+    if container is None:
+        return
+    if rows is None:
+        rows = _rows_from_schedule(schedule_state.data)
+    _render_flight_gap_summary(container, rows)
+
+
 # ---------------------------------------------------------------------------
 # UI state and event handlers
 # ---------------------------------------------------------------------------
@@ -172,6 +397,8 @@ enhanced_ff_state = SimpleNamespace(
     table=None,
     message_label=None,
 )
+
+flight_gap_state = SimpleNamespace(container=None)
 
 
 
@@ -203,6 +430,7 @@ def _refresh_table() -> None:
             table.rows = buckets.get(phase, [])
             table.update()
     _update_enhanced_ff_views(rows)
+    _update_gap_summary(rows)
 
 
 def _refresh_status() -> None:
@@ -544,6 +772,11 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
             row_key="Booking",
         ).classes("w-full mt-2")
         enhanced_ff_state.table.props("dense flat bordered")
+
+    with ui.card().classes("w-full"):
+        ui.label("Flight-free summary").classes("text-base font-medium")
+        flight_gap_state.container = ui.column().classes("w-full gap-2 mt-2")
+        _render_flight_gap_summary(flight_gap_state.container, None)
 
     with ui.card().classes("w-full"):
         ui.label("Schedule").classes("text-base font-medium mb-2")
