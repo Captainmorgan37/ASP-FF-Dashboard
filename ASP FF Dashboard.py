@@ -4173,6 +4173,7 @@ with enhanced_ff_container:
 
     enhanced_toggle_key = "enhanced_ff_enabled"
     enhanced_selected_key = "enhanced_ff_selected"
+    enhanced_cache_key = "enhanced_ff_selected_cache"
 
     initial_toggle = st.session_state.get(enhanced_toggle_key, False)
     enhanced_enabled = st.checkbox(
@@ -4216,11 +4217,14 @@ with enhanced_ff_container:
 
         options = list(booking_labels.keys())
 
-        valid_defaults = [
-            val for val in st.session_state.get(enhanced_selected_key, []) if val in options
-        ]
-        if st.session_state.get(enhanced_selected_key) != valid_defaults:
-            st.session_state[enhanced_selected_key] = valid_defaults
+        # Preserve any previously selected flights even if they are filtered out
+        # of the current schedule (e.g., due to auto-hide settings).
+        prior_selected = st.session_state.get(enhanced_selected_key, [])
+        missing_selected = [val for val in prior_selected if val not in options]
+        if missing_selected:
+            for val in missing_selected:
+                booking_labels[val] = f"{val} · not in current schedule"
+            options.extend(missing_selected)
 
         selected = st.multiselect(
             "Select flights",
@@ -4230,12 +4234,32 @@ with enhanced_ff_container:
             help="Choose one or more flights that require Enhanced Flight Following.",
         )
 
+        # Cache last known row data for selected flights so the section stays
+        # populated even if filters temporarily remove them from the live view.
+        cache = st.session_state.get(enhanced_cache_key, {}) or {}
+        for _, row in df_display.iterrows():
+            booking = str(row.get("Booking", "")).strip()
+            if booking in selected and booking:
+                cache[booking] = row.to_dict()
+        cache = {booking: data for booking, data in cache.items() if booking in selected}
+        st.session_state[enhanced_cache_key] = cache
+
         if not selected:
             st.caption("No flights selected for Enhanced Flight Following yet.")
         else:
             selected_df = df_display[df_display["Booking"].astype(str).isin(selected)].copy()
             if selected_df.empty:
-                st.caption("Selected flights are no longer present in the current schedule.")
+                cached_rows = list(cache.values())
+                if cached_rows:
+                    selected_df = pd.DataFrame(cached_rows)
+                    selected_df = selected_df.reindex(columns=df_display.columns, fill_value="")
+                    st.caption(
+                        "Showing last known details for flights missing from the current schedule."
+                    )
+                else:
+                    st.caption(
+                        "Selected flights are no longer present in the current schedule."
+                    )
             else:
                 st.caption("Enhanced Flight Following flights")
                 selected_styler = selected_df.style
