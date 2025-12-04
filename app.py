@@ -391,6 +391,7 @@ secret_sections_container: ui.column | None = None
 enhanced_ff_state = SimpleNamespace(
     enabled=False,
     selected=[],
+    selected_cache={},
     options=[],
     select_component=None,
     controls_container=None,
@@ -572,12 +573,16 @@ def send_notification(message_box: ui.textarea) -> None:
         notification_log.push(f"{timestamp} · {message}")
 
 
+def _booking_value(row: dict[str, object]) -> str:
+    return str(row.get("Booking") or row.get("bookingIdentifier") or "").strip()
+
+
 def _build_enhanced_ff_options(rows: list[dict[str, object]]) -> list[dict[str, str]]:
     seen: set[str] = set()
     options: list[dict[str, str]] = []
 
     for row in rows:
-        booking = str(row.get("Booking") or row.get("bookingIdentifier") or "").strip()
+        booking = _booking_value(row)
         if not booking or booking in seen:
             continue
 
@@ -596,13 +601,17 @@ def _build_enhanced_ff_options(rows: list[dict[str, object]]) -> list[dict[str, 
 
 def _sync_enhanced_ff_options(rows: list[dict[str, object]]) -> None:
     options = _build_enhanced_ff_options(rows)
-    enhanced_ff_state.options = options
 
-    valid_selected = [
-        value for value in enhanced_ff_state.selected if any(opt["value"] == value for opt in options)
+    missing_selected = [
+        value for value in enhanced_ff_state.selected if not any(opt["value"] == value for opt in options)
     ]
-    if valid_selected != enhanced_ff_state.selected:
-        enhanced_ff_state.selected = valid_selected
+    if missing_selected:
+        options += [
+            {"label": f"{value} · not in current schedule", "value": value}
+            for value in missing_selected
+        ]
+
+    enhanced_ff_state.options = options
 
     select = enhanced_ff_state.select_component
     if select is not None:
@@ -635,12 +644,35 @@ def _refresh_enhanced_ff_table(rows: list[dict[str, object]] | None = None) -> N
             message_label.text = "No flights selected for Enhanced Flight Following yet."
         return
 
-    selected_set = set(enhanced_ff_state.selected)
-    selected_rows = [row for row in rows if str(row.get("Booking") or "").strip() in selected_set]
+    selected_rows: list[dict[str, object]] = []
+
+    for selected_booking in enhanced_ff_state.selected:
+        match = next((row for row in rows if _booking_value(row) == selected_booking), None)
+        if match is not None:
+            enhanced_ff_state.selected_cache[selected_booking] = match
+            selected_rows.append(match)
+            continue
+
+        cached = enhanced_ff_state.selected_cache.get(selected_booking)
+        if cached is not None:
+            selected_rows.append(cached)
+
+    # prune cache entries that are no longer selected
+    enhanced_ff_state.selected_cache = {
+        key: value
+        for key, value in enhanced_ff_state.selected_cache.items()
+        if key in enhanced_ff_state.selected
+    }
+
     table.rows = selected_rows
     table.update()
     if message_label is not None:
-        message_label.text = "" if selected_rows else "Selected flights are no longer present in the schedule."
+        if not selected_rows:
+            message_label.text = "Selected flights are no longer present in the schedule."
+        elif len(selected_rows) < len(enhanced_ff_state.selected):
+            message_label.text = "Showing last known details for flights missing from the current schedule."
+        else:
+            message_label.text = ""
 
 
 def _render_enhanced_ff_controls(
@@ -694,6 +726,7 @@ def _on_enhanced_ff_toggle(event) -> None:
     enhanced_ff_state.enabled = bool(getattr(event, "value", False))
     if not enhanced_ff_state.enabled:
         enhanced_ff_state.selected = []
+        enhanced_ff_state.selected_cache = {}
     _update_enhanced_ff_views()
 
 
@@ -705,6 +738,12 @@ def _on_enhanced_ff_selection_change(event) -> None:
         enhanced_ff_state.selected = []
     else:
         enhanced_ff_state.selected = [value]
+
+    enhanced_ff_state.selected_cache = {
+        key: value
+        for key, value in enhanced_ff_state.selected_cache.items()
+        if key in enhanced_ff_state.selected
+    }
     _refresh_enhanced_ff_table()
 
 
