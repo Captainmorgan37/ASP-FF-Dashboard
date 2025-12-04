@@ -596,13 +596,17 @@ def _build_enhanced_ff_options(rows: list[dict[str, object]]) -> list[dict[str, 
 
 def _sync_enhanced_ff_options(rows: list[dict[str, object]]) -> None:
     options = _build_enhanced_ff_options(rows)
-    enhanced_ff_state.options = options
 
-    valid_selected = [
-        value for value in enhanced_ff_state.selected if any(opt["value"] == value for opt in options)
+    missing_selected = [
+        value for value in enhanced_ff_state.selected if not any(opt["value"] == value for opt in options)
     ]
-    if valid_selected != enhanced_ff_state.selected:
-        enhanced_ff_state.selected = valid_selected
+    if missing_selected:
+        options += [
+            {"label": f"{value} · not in current schedule", "value": value}
+            for value in missing_selected
+        ]
+
+    enhanced_ff_state.options = options
 
     select = enhanced_ff_state.select_component
     if select is not None:
@@ -636,7 +640,11 @@ def _refresh_enhanced_ff_table(rows: list[dict[str, object]] | None = None) -> N
         return
 
     selected_set = set(enhanced_ff_state.selected)
-    selected_rows = [row for row in rows if str(row.get("Booking") or "").strip() in selected_set]
+    selected_rows = [
+        row
+        for row in rows
+        if str(row.get("Booking") or row.get("bookingIdentifier") or "").strip() in selected_set
+    ]
     table.rows = selected_rows
     table.update()
     if message_label is not None:
