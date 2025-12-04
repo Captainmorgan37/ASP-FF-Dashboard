@@ -3,3 +3,5 @@ headless = true
 enableCORS = false
 enableXsrfProtection = false
 enableWebsocketCompression = false
+# Disable file watchers to avoid hitting inotify limits; requires manual refresh
+fileWatcherType = "none"
