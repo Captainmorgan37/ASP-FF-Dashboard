@@ -870,6 +870,7 @@ ui.run(
     host="0.0.0.0",
     port=_port(),
     show=False,
+    reload=False,       # <- disable file watchers to avoid inotify limits
     proxy_headers=True,
     forwarded_allow_ips="*",
     http="h11",          # <- prefer h11 (HTTP/1.1) behind App Runner
