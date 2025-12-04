@@ -3044,7 +3044,7 @@ if not config.auth_header and not config.api_token:
         )
         diag_rows = _fl3xx_secret_diagnostics_rows()
         if diag_rows:
-            st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(diag_rows), width="stretch")
         else:
             st.caption("No FL3XX credential hints detected in secrets or environment variables.")
     st.stop()
@@ -4159,14 +4159,14 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     try:
         active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
         styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
-        st.dataframe(styler, use_container_width=True)
+        st.dataframe(styler, width="stretch")
     except Exception:
         st.warning("Styling disabled (env compatibility). Showing plain table.")
         tmp = view.copy()
         for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
             if c in tmp.columns:
                 tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-        st.dataframe(tmp, use_container_width=True)
+        st.dataframe(tmp, width="stretch")
 
 with enhanced_ff_container:
     st.markdown("#### Enhanced Flight Following")
@@ -4269,9 +4269,9 @@ with enhanced_ff_container:
                     selected_styler = selected_styler.hide(axis="index")
                 try:
                     selected_styler = selected_styler.apply(_style_ops, axis=None).format(fmt_map)
-                    st.dataframe(selected_styler, use_container_width=True)
+                    st.dataframe(selected_styler, width="stretch")
                 except Exception:
-                    st.dataframe(selected_df, use_container_width=True)
+                    st.dataframe(selected_df, width="stretch")
 
 # Helpers for inline editing (data_editor expects naive datetimes)
 def _format_editor_datetime(ts):
@@ -4574,7 +4574,7 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
             key="schedule_inline_editor",
             hide_index=True,
             num_rows="fixed",
-            use_container_width=True,
+            width="stretch",
             column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "ETA (FA)", "Landing (FA)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
