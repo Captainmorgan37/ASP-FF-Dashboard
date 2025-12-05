@@ -4190,6 +4190,11 @@ with enhanced_ff_container:
         except TypeError:
             selected_ids_raw = [selected_ids_raw]
     selected_ids = [str(val).strip() for val in selected_ids_raw if str(val).strip()]
+
+    # Normalize the stored selections before any widgets with the same key are instantiated.
+    if selected_ids != selected_ids_raw or enhanced_selected_key not in st.session_state:
+        st.session_state[enhanced_selected_key] = selected_ids
+
     cache = st.session_state.get(enhanced_cache_key, {}) or {}
 
     working_df = df.copy()
@@ -4267,8 +4272,6 @@ with enhanced_ff_container:
             st.caption(
                 "Schedule data is temporarily unavailable; keeping prior Enhanced Flight Following selections."
             )
-
-        st.session_state[enhanced_selected_key] = selected_ids
 
         # Cache last known row data for selected flights so the section stays
         # populated even if filters temporarily remove them from the live view.
