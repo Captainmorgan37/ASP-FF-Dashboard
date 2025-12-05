@@ -4183,7 +4183,13 @@ with enhanced_ff_container:
         help="Track a subset of flights that need enhanced monitoring.",
     )
 
-    selected_ids = st.session_state.get(enhanced_selected_key, [])
+    selected_ids_raw = st.session_state.get(enhanced_selected_key, [])
+    if not isinstance(selected_ids_raw, list):
+        try:
+            selected_ids_raw = list(selected_ids_raw)
+        except TypeError:
+            selected_ids_raw = [selected_ids_raw]
+    selected_ids = [str(val).strip() for val in selected_ids_raw if str(val).strip()]
     cache = st.session_state.get(enhanced_cache_key, {}) or {}
 
     working_df = df.copy()
