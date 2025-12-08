@@ -760,6 +760,14 @@ if os.path.isdir(docs_dir):
 
 ui.page_title("FF Dashboard (NiceGUI)")
 
+# Floating UTC clock that stays visible while scrolling
+clock_label = ui.label(_utc_timestamp()).classes(
+    "text-sm bg-white/90 px-3 py-1 rounded shadow"
+).style(
+    "position: fixed; top: 8px; right: 16px; z-index: 50;"
+)
+ui.timer(1.0, lambda: clock_label.set_text(_utc_timestamp()))
+
 with ui.header().classes("items-center justify-between"):
     ui.label("FF Dashboard (App Runner)").classes("text-lg font-medium")
     ui.button("Load sample flight", on_click=simulate_fetch_from_fl3xx).props("color=primary")
