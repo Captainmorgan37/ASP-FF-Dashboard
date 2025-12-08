@@ -401,6 +401,9 @@ enhanced_ff_state = SimpleNamespace(
 
 flight_gap_state = SimpleNamespace(container=None)
 
+clock_state = SimpleNamespace(visible=True)
+clock_label: ui.label | None = None
+
 
 
 def _current_schedule_columns() -> list[str]:
@@ -747,6 +750,12 @@ def _on_enhanced_ff_selection_change(event) -> None:
     _refresh_enhanced_ff_table()
 
 
+def _on_clock_toggle(event) -> None:
+    clock_state.visible = bool(getattr(event, "value", False))
+    if clock_label is not None:
+        clock_label.visible = clock_state.visible
+
+
 # ---------------------------------------------------------------------------
 # Page layout
 # ---------------------------------------------------------------------------
@@ -762,15 +771,22 @@ ui.page_title("FF Dashboard (NiceGUI)")
 
 # Floating UTC clock that stays visible while scrolling
 clock_label = ui.label(_utc_timestamp()).classes(
-    "text-sm bg-white/90 px-3 py-1 rounded shadow"
+    "text-sm bg-white text-gray-900 px-3 py-1 rounded shadow-md border border-gray-200"
 ).style(
-    "position: fixed; top: 8px; right: 16px; z-index: 50;"
+    "position: fixed; top: 12px; right: 16px; z-index: 2000;"
 )
+clock_label.visible = clock_state.visible
 ui.timer(1.0, lambda: clock_label.set_text(_utc_timestamp()))
 
 with ui.header().classes("items-center justify-between"):
-    ui.label("FF Dashboard (App Runner)").classes("text-lg font-medium")
-    ui.button("Load sample flight", on_click=simulate_fetch_from_fl3xx).props("color=primary")
+    with ui.row().classes("items-center gap-3"):
+        ui.label("FF Dashboard (App Runner)").classes("text-lg font-medium")
+        ui.button("Load sample flight", on_click=simulate_fetch_from_fl3xx).props("color=primary")
+    ui.switch(
+        "Show UTC clock",
+        value=clock_state.visible,
+        on_change=_on_clock_toggle,
+    ).props("dense")
 
 # NEW: visible warning if import failed
 if IMPORT_ERROR:
