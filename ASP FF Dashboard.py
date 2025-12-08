@@ -64,6 +64,20 @@ st.caption(
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
 )
 
+# Shared styles for flashing landed rows awaiting block-on confirmation
+st.markdown(
+    """
+    <style>
+    @keyframes landed-on-alert {
+      0%   { background-color: rgba(255, 193, 7, 0.18); }
+      50%  { background-color: rgba(255, 241, 118, 0.65); }
+      100% { background-color: rgba(255, 193, 7, 0.18); }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 if "inline_edit_toast" in st.session_state:
     st.success(st.session_state.pop("inline_edit_toast"))
 
@@ -4024,6 +4038,13 @@ cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 # Landed-leg green overlay
 row_green = _base["_ArrActual_ts"].notna()
 
+# Flash landed legs that have not yet gone on blocks for 15+ minutes
+landed_overdue = (
+    _base["_ArrActual_ts"].notna()
+    & _base["_OnBlock_UTC"].isna()
+    & ((now_utc - _base["_ArrActual_ts"]) >= pd.Timedelta(minutes=15))
+)
+
 # EDCT purple (until true departure is received)
 idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
 
@@ -4044,6 +4065,10 @@ def _style_ops(x: pd.DataFrame):
     # 2) GREEN overlay for landed legs (applied after Y/R so it wins at row level)
     row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
     styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
+
+    # 2b) FLASHING amber overlay for landed legs missing block-on times
+    flash_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #f59e0b; animation: landed-on-alert 1.15s ease-in-out infinite;"
+    styles.loc[landed_overdue.reindex(x.index, fill_value=False), :] = flash_css
 
     # 3) Pink overlay for planned inactivity gaps
     if "_GapRow" in _base.columns:
