@@ -59,10 +59,51 @@ IATA_TO_ICAO_MAP: dict[str, str] = {}
 # ============================
 st.set_page_config(page_title="Daily Ops Dashboard (Schedule + Status)", layout="wide")
 st.title("Daily Ops Dashboard (Schedule + Status)")
-st.caption(
-    "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
-    "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
-)
+
+if "show_utc_clock" not in st.session_state:
+    st.session_state["show_utc_clock"] = True
+
+_clock_placeholder = st.empty()
+
+
+def _render_floating_clock(enabled: bool) -> None:
+    if enabled:
+        _clock_placeholder.markdown(
+            """
+            <div id="utc-clock" style="position: fixed; top: 10px; right: 16px; z-index: 2000;">
+              <div style="background: rgba(255, 255, 255, 0.94); color: #0f172a; padding: 6px 12px; border-radius: 10px; font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 500; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12); border: 1px solid rgba(15, 23, 42, 0.08);">
+                <span id="utc-clock-label"></span>
+              </div>
+            </div>
+            <script>
+            const utcClockEl = document.getElementById('utc-clock-label');
+            const pad = (n) => String(n).padStart(2, '0');
+            const renderUtcTime = () => {
+              const now = new Date();
+              const ts = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())} ${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())} UTC`;
+              if (utcClockEl) utcClockEl.textContent = ts;
+            };
+            renderUtcTime();
+            if (window.utcClockInterval) { clearInterval(window.utcClockInterval); }
+            window.utcClockInterval = setInterval(renderUtcTime, 1000);
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        _clock_placeholder.empty()
+
+
+caption_col, toggle_col = st.columns([5, 1])
+with caption_col:
+    st.caption(
+        "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
+        "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
+    )
+with toggle_col:
+    st.toggle("Show UTC clock", key="show_utc_clock")
+
+_render_floating_clock(st.session_state.get("show_utc_clock", True))
 
 # Shared styles for flashing landed rows awaiting block-on confirmation
 st.markdown(
