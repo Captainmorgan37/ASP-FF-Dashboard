@@ -2786,6 +2786,7 @@ C-GFSD\tASP655
 C-FSUP\tASP653
 C-FSRY\tASP565
 C-GFSJ\tASP501
+C-GIAS\tASP531
 """
 
 def _parse_asp_map_text(txt: str) -> dict[str, str]:
