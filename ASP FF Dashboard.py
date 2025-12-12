@@ -4234,6 +4234,30 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
                 tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
         st.dataframe(tmp, width="stretch")
 
+def _normalize_booking_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _booking_series(df: pd.DataFrame) -> pd.Series:
+    if "Booking" in df.columns:
+        source = df["Booking"]
+    elif "bookingIdentifier" in df.columns:
+        source = df["bookingIdentifier"]
+    else:
+        return pd.Series([""] * len(df), index=df.index, dtype=str)
+
+    return source.apply(_normalize_booking_value)
+
+
 with enhanced_ff_container:
     st.markdown("#### Enhanced Flight Following")
 
@@ -4255,7 +4279,11 @@ with enhanced_ff_container:
             selected_ids_raw = list(selected_ids_raw)
         except TypeError:
             selected_ids_raw = [selected_ids_raw]
-    selected_ids = [str(val).strip() for val in selected_ids_raw if str(val).strip()]
+    selected_ids = [
+        _normalize_booking_value(val)
+        for val in selected_ids_raw
+        if _normalize_booking_value(val)
+    ]
 
     # Normalize the stored selections before any widgets with the same key are instantiated.
     if selected_ids != selected_ids_raw or enhanced_selected_key not in st.session_state:
@@ -4264,13 +4292,13 @@ with enhanced_ff_container:
     cache = st.session_state.get(enhanced_cache_key, {}) or {}
 
     working_df = df.copy()
-    if "Booking" in working_df.columns:
-        working_df["Booking"] = (
-            working_df["Booking"].astype(str).str.strip()
-        )
-        working_df = working_df[working_df["Booking"] != ""]
-    else:
-        working_df = working_df.assign(Booking="")
+    working_df["Booking"] = _booking_series(working_df)
+    working_df = working_df[working_df["Booking"] != ""]
+
+    # Normalize the booking field used for display so multiselect choices and the
+    # rendered table share the same, trimmed identifier values even after
+    # auto-refresh.
+    display_bookings = _booking_series(df_display)
 
     # Normalize the booking field used for display so multiselect choices and the
     # rendered table share the same, trimmed identifier values even after
