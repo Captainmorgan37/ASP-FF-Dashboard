@@ -4272,6 +4272,11 @@ with enhanced_ff_container:
     else:
         working_df = working_df.assign(Booking="")
 
+    # Normalize the booking field used for display so multiselect choices and the
+    # rendered table share the same, trimmed identifier values even after
+    # auto-refresh.
+    display_bookings = df_display["Booking"].astype(str).str.strip()
+
     if working_df.empty:
         if selected_ids:
             labels = {val: f"{val} · not in current schedule" for val in selected_ids}
@@ -4341,8 +4346,8 @@ with enhanced_ff_container:
 
         # Cache last known row data for selected flights so the section stays
         # populated even if filters temporarily remove them from the live view.
-        for _, row in df_display.iterrows():
-            booking = str(row.get("Booking", "")).strip()
+        for idx, row in df_display.iterrows():
+            booking = display_bookings.iat[idx]
             if booking in selected_ids and booking:
                 cache[booking] = row.to_dict()
         if selected_ids:
@@ -4354,7 +4359,8 @@ with enhanced_ff_container:
         if not selected_ids:
             st.caption("No flights selected for Enhanced Flight Following yet.")
         else:
-            selected_df = df_display[df_display["Booking"].astype(str).isin(selected_ids)].copy()
+            selected_mask = display_bookings.isin(selected_ids)
+            selected_df = df_display.loc[selected_mask].copy()
             if selected_df.empty:
                 cached_rows = list(cache.values())
                 if cached_rows:
