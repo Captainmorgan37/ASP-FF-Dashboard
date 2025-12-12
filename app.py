@@ -735,10 +735,14 @@ def _on_enhanced_ff_toggle(event) -> None:
 
 def _on_enhanced_ff_selection_change(event) -> None:
     value = getattr(event, "value", None)
+    if value is None:
+        # NiceGUI can emit a `None` value while the select widget re-renders;
+        # keep the existing selection instead of clearing it unexpectedly.
+        _refresh_enhanced_ff_table()
+        return
+
     if isinstance(value, list):
         enhanced_ff_state.selected = value
-    elif value is None:
-        enhanced_ff_state.selected = []
     else:
         enhanced_ff_state.selected = [value]
 
