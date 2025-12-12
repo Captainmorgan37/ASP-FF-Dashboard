@@ -79,6 +79,7 @@ IMPORT_ERROR = None
 try:
     from data_sources import FL3XX_SCHEDULE_COLUMNS, ScheduleData, load_schedule
     from schedule_phases import (
+        SCHEDULE_PHASE_ENROUTE,
         SCHEDULE_PHASES,
         categorize_rows_by_phase,
         filtered_columns_for_phase,
@@ -860,6 +861,8 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
                         row_key="Booking",
                     ).classes("w-full")
                     table.props("dense flat bordered")
+                    if phase == SCHEDULE_PHASE_ENROUTE:
+                        table.props("sort-by='Arrives In' sort-order='asc'")
                     schedule_tables[phase] = table
 
     with ui.card().classes("w-full"):
