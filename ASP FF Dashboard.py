@@ -2052,6 +2052,63 @@ def compute_turnaround_windows(df: pd.DataFrame) -> pd.DataFrame:
     result = result.sort_values(["NextETDUTC", "Aircraft", "CurrentBooking"]).reset_index(drop=True)
     return result
 
+
+def _format_turn_timestamp(ts) -> str:
+    if ts is None or pd.isna(ts):
+        return "—"
+    try:
+        return pd.Timestamp(ts).strftime("%H:%MZ")
+    except Exception:
+        return "—"
+
+
+def build_downline_risk_map(
+    turnaround_df: pd.DataFrame, threshold_min: int
+) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+    """Return booking → risk info and a summary grouped by aircraft."""
+
+    if turnaround_df is None or turnaround_df.empty:
+        return {}, []
+
+    risky = turnaround_df[
+        turnaround_df["TurnMinutes"].notna()
+        & (turnaround_df["TurnMinutes"] < threshold_min)
+    ].copy()
+
+    if risky.empty:
+        return {}, []
+
+    risk_map: dict[str, dict[str, object]] = {}
+    summary: list[dict[str, object]] = []
+
+    for tail, group in risky.groupby("Aircraft"):
+        legs: list[dict[str, object]] = []
+        group = group.sort_values("NextETDUTC")
+
+        for _, row in group.iterrows():
+            next_booking = str(row.get("NextBooking") or "").strip()
+            if not next_booking:
+                continue
+
+            info = {
+                "aircraft": tail,
+                "source_booking": str(row.get("CurrentBooking") or "").strip(),
+                "next_booking": next_booking,
+                "turn_minutes": row.get("TurnMinutes"),
+                "arrival_label": _format_turn_timestamp(row.get("ArrivalUTC")),
+                "arrival_source": str(row.get("ArrivalSource") or "").strip(),
+                "next_etd_label": _format_turn_timestamp(row.get("NextETDUTC")),
+                "next_route": str(row.get("NextRoute") or "").strip(),
+            }
+
+            risk_map[next_booking] = info
+            legs.append(info)
+
+        if legs:
+            summary.append({"aircraft": tail, "legs": legs})
+
+    return risk_map, summary
+
 def _late_early_label(delta_min: int) -> tuple[str, int]:
     # positive => late; negative => early
     label = "LATE" if delta_min >= 0 else "EARLY"
@@ -3668,6 +3725,8 @@ has_dep_series, has_arr_series = _compute_event_presence(df)
 turnaround_df = compute_turnaround_windows(df)
 
 turn_info_map = {}
+downline_risk_map: dict[str, dict[str, object]] = {}
+downline_risk_summary: list[dict[str, object]] = []
 if not turnaround_df.empty:
     for _, turn_row in turnaround_df.iterrows():
         booking_val = turn_row.get("CurrentBooking")
@@ -3695,12 +3754,65 @@ if not turnaround_df.empty:
             "minutes": minutes_int,
         }
 
+    downline_risk_map, downline_risk_summary = build_downline_risk_map(
+        turnaround_df, TURNAROUND_MIN_GAP_MINUTES
+    )
+
 df["_TurnMinutes"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("minutes"))
 df["Turn Time"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("text", "—"))
 df["Turn Time"] = df["Turn Time"].fillna("—")
 
+df["_DownlineRisk"] = df["Booking"].map(
+    lambda b: bool(downline_risk_map.get(str(b).strip() or ""))
+)
+
+
+def _format_downline_risk_text(booking_val: str) -> str:
+    payload = downline_risk_map.get(str(booking_val).strip() or "")
+    if not payload:
+        return "—"
+
+    minutes = payload.get("turn_minutes")
+    minutes_txt = f"{int(minutes)}m" if minutes is not None and not pd.isna(minutes) else "<45m"
+    source_booking = payload.get("source_booking") or "previous leg"
+    window_txt = ""
+    if payload.get("arrival_label") != "—" or payload.get("next_etd_label") != "—":
+        window_txt = f" ({payload.get('arrival_label')} → {payload.get('next_etd_label')})"
+
+    return f"Short turn after {source_booking}: {minutes_txt}{window_txt}".strip()
+
+
+df["Downline Risk"] = df["Booking"].map(_format_downline_risk_text)
+
 df.loc[has_dep_series, "Departs In"] = "—"
 df.loc[has_arr_series, "Arrives In"] = "—"
+
+# ============================
+# Downline risk monitor
+# ============================
+st.markdown("### Downline risk monitor")
+if downline_risk_summary:
+    st.caption(
+        "Next legs on the same tail with less than 45 minutes between arrival and the "
+        "following departure."
+    )
+    for entry in downline_risk_summary:
+        st.markdown(f"**{entry.get('aircraft') or 'Unknown tail'}**")
+        for leg in entry.get("legs", []):
+            route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
+            arrival_label = leg.get("arrival_label") or "—"
+            arrival_source = leg.get("arrival_source")
+            if arrival_source:
+                arrival_label = f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
+            next_window = f"{arrival_label} → {leg.get('next_etd_label') or '—'}"
+            minutes_txt = leg.get("turn_minutes")
+            minutes_txt = f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
+            st.markdown(
+                f"- {leg.get('next_booking') or 'Next leg'}{route_txt}: {minutes_txt} after "
+                f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
+            )
+else:
+    st.caption("No downline legs currently flagged for short turns.")
 
 # ============================
 # Quick Filters
@@ -3839,7 +3951,7 @@ display_cols = [
     "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
     "Off-Block (Sched)", "ETA (FA)",
     "On-Block (Sched)",
-    "Departs In", "Arrives In", "Turn Time",
+    "Departs In", "Arrives In", "Turn Time", "Downline Risk",
     "PIC", "SIC", "Workflow", "Status"
 ]
 
@@ -3873,6 +3985,9 @@ if "_RouteMismatch" in view_df.columns:
 
 if "_RouteMismatchMsg" in view_df.columns:
     view_df["_RouteMismatchMsg"] = view_df["_RouteMismatchMsg"].fillna("")
+
+if "_DownlineRisk" in view_df.columns:
+    view_df["_DownlineRisk"] = view_df["_DownlineRisk"].fillna(False).astype(bool)
 
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Sched)"] = view_df["ETD_UTC"]          # datetime
@@ -4183,6 +4298,13 @@ def _style_ops(x: pd.DataFrame):
         mask_turn = turn_warn.reindex(x.index, fill_value=False)
         styles.loc[mask_turn, "Turn Time"] = (
             styles.loc[mask_turn, "Turn Time"].fillna("") + turn_css
+        )
+
+    if "_DownlineRisk" in _base.columns and "Downline Risk" in x.columns:
+        risk_css = "background-color: rgba(255, 128, 171, 0.24); font-weight: 600; border-left: 6px solid #ec407a;"
+        risk_mask = _base["_DownlineRisk"].reindex(x.index, fill_value=False)
+        styles.loc[risk_mask, "Downline Risk"] = (
+            styles.loc[risk_mask, "Downline Risk"].fillna("") + risk_css
         )
 
     if "_RouteMismatch" in _base.columns and "Route" in x.columns:
