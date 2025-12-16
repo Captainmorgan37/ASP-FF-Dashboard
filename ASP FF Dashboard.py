@@ -14,6 +14,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dateutil import parser as dateparse
 from dateutil.tz import tzoffset
 from pathlib import Path
@@ -69,30 +70,83 @@ _clock_placeholder = st.empty()
 
 def _render_floating_clock(enabled: bool) -> None:
     if enabled:
-        _clock_placeholder.markdown(
+        components.html(
             """
-            <div id="utc-clock" style="position: fixed; top: 10px; right: 16px; z-index: 2000;">
-              <div style="background: rgba(255, 255, 255, 0.94); color: #0f172a; padding: 6px 12px; border-radius: 10px; font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 500; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12); border: 1px solid rgba(15, 23, 42, 0.08);">
-                <span id="utc-clock-label"></span>
-              </div>
-            </div>
             <script>
-            const utcClockEl = document.getElementById('utc-clock-label');
-            const pad = (n) => String(n).padStart(2, '0');
-            const renderUtcTime = () => {
-              const now = new Date();
-              const ts = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())} ${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())} UTC`;
-              if (utcClockEl) utcClockEl.textContent = ts;
-            };
-            renderUtcTime();
-            if (window.utcClockInterval) { clearInterval(window.utcClockInterval); }
-            window.utcClockInterval = setInterval(renderUtcTime, 1000);
+              const addUtcClock = () => {
+                const existing = window.parent.document.getElementById('utc-clock-container');
+                if (existing) return existing;
+                const wrapper = window.parent.document.createElement('div');
+                wrapper.id = 'utc-clock-container';
+                wrapper.style.position = 'fixed';
+                wrapper.style.top = '12px';
+                wrapper.style.right = '16px';
+                wrapper.style.zIndex = '9999';
+                wrapper.style.pointerEvents = 'none';
+                const inner = window.parent.document.createElement('div');
+                inner.style.display = 'inline-flex';
+                inner.style.alignItems = 'center';
+                inner.style.gap = '8px';
+                inner.style.background = 'rgba(255, 255, 255, 0.97)';
+                inner.style.color = '#0f172a';
+                inner.style.padding = '8px 14px';
+                inner.style.borderRadius = '12px';
+                inner.style.fontFamily = \"'Inter', system-ui, -apple-system, sans-serif\";
+                inner.style.fontSize = '14px';
+                inner.style.fontWeight = '600';
+                inner.style.boxShadow = '0 10px 30px rgba(0, 0, 0, 0.25)';
+                inner.style.border = '1px solid rgba(255, 255, 255, 0.18)';
+                const icon = window.parent.document.createElement('span');
+                icon.textContent = '🕑';
+                icon.setAttribute('aria-hidden', 'true');
+                icon.style.fontSize = '14px';
+                icon.style.lineHeight = '1';
+                const label = window.parent.document.createElement('span');
+                label.id = 'utc-clock-label';
+                label.textContent = 'Loading…';
+                inner.appendChild(icon);
+                inner.appendChild(label);
+                wrapper.appendChild(inner);
+                window.parent.document.body.appendChild(wrapper);
+                return wrapper;
+              };
+              const pad = (n) => String(n).padStart(2, '0');
+              const renderUtcTime = () => {
+                const label = window.parent.document.getElementById('utc-clock-label');
+                if (!label) return;
+                const now = new Date();
+                const ts = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())} ${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())} UTC`;
+                label.textContent = ts;
+              };
+              addUtcClock();
+              renderUtcTime();
+              if (window.parent.utcClockInterval) { clearInterval(window.parent.utcClockInterval); }
+              window.parent.utcClockInterval = setInterval(renderUtcTime, 1000);
             </script>
             """,
-            unsafe_allow_html=True,
+            height=0,
+            width=0,
         )
     else:
-        _clock_placeholder.empty()
+        components.html(
+            """
+            <script>
+              const removeUtcClock = () => {
+                const wrapper = window.parent.document.getElementById('utc-clock-container');
+                if (wrapper && wrapper.parentNode) {
+                  wrapper.parentNode.removeChild(wrapper);
+                }
+                if (window.parent.utcClockInterval) {
+                  clearInterval(window.parent.utcClockInterval);
+                  window.parent.utcClockInterval = null;
+                }
+              };
+              removeUtcClock();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
 
 
 caption_col, toggle_col = st.columns([5, 1])
