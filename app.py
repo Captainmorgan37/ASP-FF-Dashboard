@@ -403,6 +403,7 @@ enhanced_ff_state = SimpleNamespace(
 flight_gap_state = SimpleNamespace(container=None)
 
 clock_state = SimpleNamespace(visible=True)
+clock_container: ui.element | None = None
 clock_label: ui.label | None = None
 
 
@@ -756,10 +757,16 @@ def _on_enhanced_ff_selection_change(event) -> None:
     _refresh_enhanced_ff_table()
 
 
+def _update_clock_visibility() -> None:
+    if clock_container is not None:
+        clock_container.visible = bool(clock_state.visible)
+    if clock_label is not None:
+        clock_label.visible = bool(clock_state.visible)
+
+
 def _on_clock_toggle(event) -> None:
     clock_state.visible = bool(getattr(event, "value", False))
-    if clock_label is not None:
-        clock_label.visible = clock_state.visible
+    _update_clock_visibility()
 
 
 # ---------------------------------------------------------------------------
@@ -776,13 +783,17 @@ if os.path.isdir(docs_dir):
 ui.page_title("FF Dashboard (NiceGUI)")
 
 # Floating UTC clock that stays visible while scrolling
-clock_label = ui.label(_utc_timestamp()).classes(
-    "text-sm bg-white text-gray-900 px-3 py-1 rounded shadow-md border border-gray-200"
-).style(
-    "position: fixed; top: 12px; right: 16px; z-index: 2000;"
-)
-clock_label.visible = clock_state.visible
-ui.timer(1.0, lambda: clock_label.set_text(_utc_timestamp()))
+with ui.element("div") as clock_container:
+    clock_container.classes("flex items-center gap-2 pointer-events-none")
+    clock_container.style(
+        "position: fixed; top: 12px; right: 16px; z-index: 5000;"
+    )
+    ui.icon("schedule").classes("text-gray-600 text-sm")
+    clock_label = ui.label(_utc_timestamp()).classes(
+        "text-sm bg-white text-gray-900 px-3 py-1 rounded shadow-md border border-gray-200"
+    )
+_update_clock_visibility()
+ui.timer(1.0, lambda: clock_label.set_text(_utc_timestamp()) if clock_label else None)
 
 with ui.header().classes("items-center justify-between"):
     with ui.row().classes("items-center gap-3"):
