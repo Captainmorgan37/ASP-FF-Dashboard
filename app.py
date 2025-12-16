@@ -84,6 +84,7 @@ try:
         categorize_rows_by_phase,
         filtered_columns_for_phase,
     )
+    from schedule_sorting import sort_enroute_rows
 except Exception as e:
     IMPORT_ERROR = e
     # Fallbacks so the app can still run
@@ -98,9 +99,12 @@ except Exception as e:
             self.source = source
             self.raw_bytes = raw_bytes
             self.metadata = metadata or {}
+
     def load_schedule(*args, **kwargs):
         raise RuntimeError(f"data_sources not available: {e!r}")
 
+    def sort_enroute_rows(rows):
+        return list(rows)
 
 
 
@@ -433,7 +437,10 @@ def _refresh_table() -> None:
         available_columns = _current_schedule_columns()
         for phase, table in schedule_tables.items():
             table.columns = _table_columns(_schedule_columns_for_phase(phase, available_columns))
-            table.rows = buckets.get(phase, [])
+            rows_for_phase = buckets.get(phase, [])
+            if phase == SCHEDULE_PHASE_ENROUTE:
+                rows_for_phase = sort_enroute_rows(rows_for_phase)
+            table.rows = rows_for_phase
             table.update()
     _update_enhanced_ff_views(rows)
     _update_gap_summary(rows)
