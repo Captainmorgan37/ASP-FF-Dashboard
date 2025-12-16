@@ -72,9 +72,9 @@ def _render_floating_clock(enabled: bool) -> None:
     if enabled:
         components.html(
             """
-            <div id="utc-clock-container" style="position: fixed; top: 10px; right: 16px; z-index: 2000; pointer-events: none;">
-              <div style="display: inline-flex; align-items: center; gap: 8px; background: rgba(255, 255, 255, 0.94); color: #0f172a; padding: 6px 12px; border-radius: 10px; font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 600; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12); border: 1px solid rgba(15, 23, 42, 0.08);">
-                <span aria-hidden="true" style="font-size: 14px;">🕑</span>
+            <div id="utc-clock-container" style="position: fixed; top: 10px; right: 16px; z-index: 5000; pointer-events: none;">
+              <div style="display: inline-flex; align-items: center; gap: 8px; background: rgba(255, 255, 255, 0.97); color: #0f172a; padding: 8px 14px; border-radius: 12px; font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 600; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25); border: 1px solid rgba(255, 255, 255, 0.18);">
+                <span aria-hidden="true" style="font-size: 14px; line-height: 1;">🕑</span>
                 <span id="utc-clock-label">Loading…</span>
               </div>
             </div>
@@ -91,8 +91,8 @@ def _render_floating_clock(enabled: bool) -> None:
               window.utcClockInterval = setInterval(renderUtcTime, 1000);
             </script>
             """,
-            height=0,
-            width=0,
+            height=64,
+            width=240,
         )
     else:
         _clock_placeholder.empty()
