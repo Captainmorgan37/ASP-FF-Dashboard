@@ -15,6 +15,17 @@ if os.getenv("STREAMLIT_SERVER_PORT") or os.getenv("STREAMLIT_RUNTIME"):
     runpy.run_path(str(Path(__file__).with_name("asp_ff_dashboard.py")), run_name="__main__")
     raise SystemExit(0)
 
+# --- NiceGUI opt-out --------------------------------------------------------------
+ENABLE_NICEGUI = os.getenv("ENABLE_NICEGUI", "").strip().lower() in {"1", "true", "yes", "on"}
+
+if not ENABLE_NICEGUI:
+    if __name__ == "__main__":
+        print(
+            "NiceGUI mode is disabled. Launch the Streamlit dashboard instead:\n"
+            "  streamlit run asp_ff_dashboard.py"
+        )
+    raise SystemExit(0)
+
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Iterable
