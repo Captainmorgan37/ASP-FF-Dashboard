@@ -3880,45 +3880,6 @@ df.loc[has_dep_series, "Departs In"] = "—"
 df.loc[has_arr_series, "Arrives In"] = "—"
 
 # ============================
-# Downline risk monitor
-# ============================
-st.markdown("### Downline risk monitor")
-if downline_risk_summary:
-    st.caption(
-        "Next legs on the same tail with less than 45 minutes between arrival and the "
-        "following departure. Grouped by local departure date (today expanded; future days collapsed)."
-    )
-    for entry in downline_risk_summary:
-        section_label = entry.get("label") or "Upcoming departures"
-        tails = entry.get("tails", [])
-        expanded = not bool(entry.get("collapsed", False))
-        with st.expander(section_label, expanded=expanded):
-            if not tails:
-                st.caption("No downline legs in this date bucket.")
-                continue
-            for tail_entry in tails:
-                st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
-                for leg in tail_entry.get("legs", []):
-                    route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
-                    arrival_label = leg.get("arrival_label") or "—"
-                    arrival_source = leg.get("arrival_source")
-                    if arrival_source:
-                        arrival_label = (
-                            f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
-                        )
-                    next_window = f"{arrival_label} → {leg.get('next_etd_label') or '—'}"
-                    minutes_txt = leg.get("turn_minutes")
-                    minutes_txt = (
-                        f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
-                    )
-                    st.markdown(
-                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}: {minutes_txt} after "
-                        f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
-                    )
-else:
-    st.caption("No downline legs currently flagged for short turns.")
-
-# ============================
 # Quick Filters
 # ============================
 st.markdown("### Quick Filters")
@@ -4908,6 +4869,45 @@ for phase, title, description, expanded in SCHEDULE_PHASES:
         if description:
             st.caption(description)
         _render_schedule_table(schedule_buckets.get(phase, df_display.iloc[0:0]), phase)
+
+# ============================
+# Downline risk monitor
+# ============================
+st.markdown("### Downline risk monitor")
+if downline_risk_summary:
+    st.caption(
+        "Next legs on the same tail with less than 45 minutes between arrival and the "
+        "following departure. Grouped by local departure date (today expanded; future days collapsed)."
+    )
+    for entry in downline_risk_summary:
+        section_label = entry.get("label") or "Upcoming departures"
+        tails = entry.get("tails", [])
+        expanded = not bool(entry.get("collapsed", False))
+        with st.expander(section_label, expanded=expanded):
+            if not tails:
+                st.caption("No downline legs in this date bucket.")
+                continue
+            for tail_entry in tails:
+                st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
+                for leg in tail_entry.get("legs", []):
+                    route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
+                    arrival_label = leg.get("arrival_label") or "—"
+                    arrival_source = leg.get("arrival_source")
+                    if arrival_source:
+                        arrival_label = (
+                            f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
+                        )
+                    next_window = f"{arrival_label} → {leg.get('next_etd_label') or '—'}"
+                    minutes_txt = leg.get("turn_minutes")
+                    minutes_txt = (
+                        f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
+                    )
+                    st.markdown(
+                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}: {minutes_txt} after "
+                        f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
+                    )
+else:
+    st.caption("No downline legs currently flagged for short turns.")
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=False):
