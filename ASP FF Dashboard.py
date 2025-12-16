@@ -45,6 +45,7 @@ from flightaware_status import (
     fetch_flights_for_ident,
 )
 from schedule_phases import (
+    SCHEDULE_PHASE_ENROUTE,
     SCHEDULE_PHASES,
     categorize_dataframe_by_phase,
     filtered_columns_for_phase,
@@ -1712,6 +1713,38 @@ def fmt_td(td):
     hours, remainder = divmod(int(td_abs.total_seconds()), 3600)
     minutes = remainder // 60
     return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def _coerce_arrives_in_seconds(value: object) -> float:
+    """Return a numeric sort key for an ``Arrives In`` countdown string."""
+
+    if isinstance(value, pd.Timedelta):
+        return value.total_seconds()
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text == "—":
+            return float("inf")
+
+        negative = text.startswith("-")
+        if negative:
+            text = text[1:]
+
+        parts = text.split(":")
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            return float("inf")
+
+        seconds = hours * 3600 + minutes * 60
+        return -seconds if negative else seconds
+
+    return float("inf")
+
 
 def flight_time_hhmm_from_decimal(hours_decimal) -> str:
     try:
@@ -4361,6 +4394,13 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     if df_subset.empty:
         st.caption("No flights in this phase right now.")
         return
+
+    if phase == SCHEDULE_PHASE_ENROUTE and "Arrives In" in df_subset.columns:
+        df_subset = df_subset.sort_values(
+            by="Arrives In",
+            key=lambda col: col.apply(_coerce_arrives_in_seconds),
+            kind="stable",
+        )
 
     visible_columns = filtered_columns_for_phase(phase, df_subset.columns)
     view = df_subset.loc[:, visible_columns]
