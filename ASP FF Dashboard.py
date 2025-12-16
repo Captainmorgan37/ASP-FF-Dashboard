@@ -8,7 +8,7 @@ import imaplib, email
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal
 from typing import Any
 
@@ -53,6 +53,7 @@ from schedule_phases import (
 ICAO_TZ_MAP: dict[str, str] = {}
 ICAO_TO_IATA_MAP: dict[str, str] = {}
 IATA_TO_ICAO_MAP: dict[str, str] = {}
+LOCAL_TZ = tzlocal.get_localzone()
 
 # ============================
 # Page config
@@ -1966,6 +1967,44 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
 
     return datetime.combine(st.session_state[date_key], st.session_state[time_obj_key]).replace(tzinfo=timezone.utc)
 
+def _airport_timezone(icao: str | None):
+    icao = (icao or "").strip().upper()
+    tzname = ICAO_TZ_MAP.get(icao)
+    if tzname:
+        try:
+            return pytz.timezone(tzname)
+        except Exception:
+            pass
+    return LOCAL_TZ
+
+def _local_departure_date_parts(ts: pd.Timestamp | datetime | None, icao: str | None) -> tuple[date | None, str, int]:
+    """Return (local_date, label, day_delta) for a departure timestamp at the airport's local time."""
+    if ts is None or pd.isna(ts):
+        return None, "Date pending", 999
+
+    tz = _airport_timezone(icao)
+    try:
+        ts_local = pd.Timestamp(ts)
+        if ts_local.tzinfo is None:
+            ts_local = ts_local.tz_localize(timezone.utc)
+        ts_local = ts_local.tz_convert(tz)
+    except Exception:
+        return None, "Date pending", 999
+
+    local_date = ts_local.date()
+    today_local = datetime.now(tz).date()
+    day_delta = (local_date - today_local).days
+    base_label = ts_local.strftime("%a %b %d")
+
+    if day_delta == 0:
+        label = f"Today · {base_label}"
+    elif day_delta == 1:
+        label = f"Tomorrow · {base_label}"
+    else:
+        label = base_label
+
+    return local_date, label, day_delta
+
 def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
     """Return 'HHMM LT' at the airport's local time (fallback 'HHMM UTC')."""
     if ts is None or pd.isna(ts):
@@ -2040,6 +2079,8 @@ def compute_turnaround_windows(df: pd.DataFrame) -> pd.DataFrame:
                 "ArrivalUTC": pd.Timestamp(arr_ts),
                 "NextBooking": next_leg.get("Booking", ""),
                 "NextRoute": next_leg.get("Route", ""),
+                "NextFromICAO": next_leg.get("From_ICAO", ""),
+                "NextFromIATA": next_leg.get("From_IATA", ""),
                 "NextETDUTC": next_etd,
                 "TurnDelta": gap,
                 "TurnMinutes": int(round(gap.total_seconds() / 60.0)),
@@ -2065,7 +2106,7 @@ def _format_turn_timestamp(ts) -> str:
 def build_downline_risk_map(
     turnaround_df: pd.DataFrame, threshold_min: int
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
-    """Return booking → risk info and a summary grouped by aircraft."""
+    """Return booking → risk info and a summary grouped by local departure date."""
 
     if turnaround_df is None or turnaround_df.empty:
         return {}, []
@@ -2079,16 +2120,21 @@ def build_downline_risk_map(
         return {}, []
 
     risk_map: dict[str, dict[str, object]] = {}
-    summary: list[dict[str, object]] = []
+    all_legs: list[dict[str, object]] = []
+    grouped_by_date: dict[date | None, dict[str, list[dict[str, object]]]] = {}
+    date_meta: dict[date | None, dict[str, object]] = {}
 
     for tail, group in risky.groupby("Aircraft"):
-        legs: list[dict[str, object]] = []
         group = group.sort_values("NextETDUTC")
 
         for _, row in group.iterrows():
             next_booking = str(row.get("NextBooking") or "").strip()
             if not next_booking:
                 continue
+
+            next_etd = row.get("NextETDUTC")
+            next_from_icao = str(row.get("NextFromICAO") or "").strip().upper()
+            local_date, date_label, day_delta = _local_departure_date_parts(next_etd, next_from_icao)
 
             info = {
                 "aircraft": tail,
@@ -2097,15 +2143,61 @@ def build_downline_risk_map(
                 "turn_minutes": row.get("TurnMinutes"),
                 "arrival_label": _format_turn_timestamp(row.get("ArrivalUTC")),
                 "arrival_source": str(row.get("ArrivalSource") or "").strip(),
-                "next_etd_label": _format_turn_timestamp(row.get("NextETDUTC")),
+                "next_etd_label": _format_turn_timestamp(next_etd),
                 "next_route": str(row.get("NextRoute") or "").strip(),
+                "next_etd_utc": next_etd,
+                "next_from_icao": next_from_icao,
+                "next_local_date": local_date,
+                "next_local_date_label": date_label,
+                "next_local_day_delta": day_delta,
             }
 
             risk_map[next_booking] = info
-            legs.append(info)
+            all_legs.append(info)
 
-        if legs:
-            summary.append({"aircraft": tail, "legs": legs})
+            tails_for_date = grouped_by_date.setdefault(local_date, {})
+            tails_for_date.setdefault(tail, []).append(info)
+
+            meta = date_meta.setdefault(
+                local_date,
+                {"date": local_date, "label": date_label, "day_delta": day_delta},
+            )
+            meta["day_delta"] = min(meta.get("day_delta", day_delta), day_delta)
+            if not meta.get("label"):
+                meta["label"] = date_label
+
+    if not all_legs:
+        return {}, []
+
+    summary: list[dict[str, object]] = []
+    for date_key, tails_map in grouped_by_date.items():
+        tail_entries: list[dict[str, object]] = []
+        for tail, legs in tails_map.items():
+            legs_sorted = sorted(
+                legs,
+                key=lambda leg: leg.get("next_etd_utc") if pd.notna(leg.get("next_etd_utc")) else pd.Timestamp.max,
+            )
+            tail_entries.append({"aircraft": tail, "legs": legs_sorted})
+
+        tail_entries.sort(key=lambda t: (t.get("aircraft") or "").upper())
+        meta = date_meta.get(date_key, {})
+        summary.append(
+            {
+                "date": date_key,
+                "label": meta.get("label") or "Upcoming departures",
+                "day_delta": meta.get("day_delta", 999),
+                "tails": tail_entries,
+                "collapsed": meta.get("day_delta", 999) > 0,
+            }
+        )
+
+    summary.sort(
+        key=lambda entry: (
+            entry.get("day_delta", 999) != 0,
+            entry.get("day_delta", 999),
+            entry.get("date") or datetime.max.date(),
+        )
+    )
 
     return risk_map, summary
 
@@ -3794,23 +3886,35 @@ st.markdown("### Downline risk monitor")
 if downline_risk_summary:
     st.caption(
         "Next legs on the same tail with less than 45 minutes between arrival and the "
-        "following departure."
+        "following departure. Grouped by local departure date (today expanded; future days collapsed)."
     )
     for entry in downline_risk_summary:
-        st.markdown(f"**{entry.get('aircraft') or 'Unknown tail'}**")
-        for leg in entry.get("legs", []):
-            route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
-            arrival_label = leg.get("arrival_label") or "—"
-            arrival_source = leg.get("arrival_source")
-            if arrival_source:
-                arrival_label = f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
-            next_window = f"{arrival_label} → {leg.get('next_etd_label') or '—'}"
-            minutes_txt = leg.get("turn_minutes")
-            minutes_txt = f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
-            st.markdown(
-                f"- {leg.get('next_booking') or 'Next leg'}{route_txt}: {minutes_txt} after "
-                f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
-            )
+        section_label = entry.get("label") or "Upcoming departures"
+        tails = entry.get("tails", [])
+        expanded = not bool(entry.get("collapsed", False))
+        with st.expander(section_label, expanded=expanded):
+            if not tails:
+                st.caption("No downline legs in this date bucket.")
+                continue
+            for tail_entry in tails:
+                st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
+                for leg in tail_entry.get("legs", []):
+                    route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
+                    arrival_label = leg.get("arrival_label") or "—"
+                    arrival_source = leg.get("arrival_source")
+                    if arrival_source:
+                        arrival_label = (
+                            f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
+                        )
+                    next_window = f"{arrival_label} → {leg.get('next_etd_label') or '—'}"
+                    minutes_txt = leg.get("turn_minutes")
+                    minutes_txt = (
+                        f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
+                    )
+                    st.markdown(
+                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}: {minutes_txt} after "
+                        f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
+                    )
 else:
     st.caption("No downline legs currently flagged for short turns.")
 
@@ -4042,7 +4146,7 @@ view_df["Stage Progress"] = view_df.apply(_stage_badge, axis=1)
 df_display = view_df[display_cols].copy()
 
 # ----------------- Notify helpers used by buttons -----------------
-local_tz = tzlocal.get_localzone()
+local_tz = LOCAL_TZ
 
 def _default_minutes_delta(row) -> int:
     if pd.notna(row["_ETA_FA_ts"]) and pd.notna(row["ETA_UTC"]):
