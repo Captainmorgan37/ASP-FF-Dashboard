@@ -2113,19 +2113,23 @@ def _format_turn_timestamp(ts) -> str:
 
 
 def build_downline_risk_map(
-    turnaround_df: pd.DataFrame, threshold_min: int
+    schedule_df: pd.DataFrame, required_turn_min: int
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
-    """Return booking → risk info and a summary grouped by local departure date."""
+    """Return booking → risk info for carry-forward delays and a summary grouped by local date."""
 
-    if turnaround_df is None or turnaround_df.empty:
+    if schedule_df is None or schedule_df.empty:
         return {}, []
 
-    risky = turnaround_df[
-        turnaround_df["TurnMinutes"].notna()
-        & (turnaround_df["TurnMinutes"] < threshold_min)
-    ].copy()
+    needed = {"Aircraft", "Booking", "ETD_UTC", "ETA_UTC"}
+    if not needed.issubset(schedule_df.columns):
+        return {}, []
 
-    if risky.empty:
+    work = schedule_df[
+        schedule_df["Aircraft"].notna()
+        & schedule_df["ETD_UTC"].notna()
+        & schedule_df["ETA_UTC"].notna()
+    ].copy()
+    if work.empty:
         return {}, []
 
     risk_map: dict[str, dict[str, object]] = {}
@@ -2133,52 +2137,100 @@ def build_downline_risk_map(
     grouped_by_date: dict[date | None, dict[str, list[dict[str, object]]]] = {}
     date_meta: dict[date | None, dict[str, object]] = {}
 
-    for tail, group in risky.groupby("Aircraft"):
-        group = group.sort_values("NextETDUTC")
+    work = work.sort_values(["Aircraft", "ETD_UTC"])
+    required_turn_td = pd.Timedelta(minutes=int(required_turn_min))
+
+    for tail, group in work.groupby("Aircraft"):
+        group = group.sort_values("ETD_UTC").reset_index(drop=True)
+        if group.empty:
+            continue
+
+        prev_projected_arrival: pd.Timestamp | None = None
+        prev_arrival_label: str | None = None
+        prev_arrival_source: str | None = None
+        prev_booking: str | None = None
+        delay_source_booking: str | None = None
 
         for _, row in group.iterrows():
-            next_booking = str(row.get("NextBooking") or "").strip()
-            if not next_booking:
+            sched_dep = pd.Timestamp(row.get("ETD_UTC"))
+            sched_arr = pd.Timestamp(row.get("ETA_UTC"))
+            block_time = sched_arr - sched_dep
+            if pd.isna(block_time):
                 continue
 
-            next_etd = row.get("NextETDUTC")
-            next_from_icao = str(row.get("NextFromICAO") or "").strip().upper()
-            local_date, date_label, day_delta = _local_departure_date_parts(next_etd, next_from_icao)
-            next_account = str(row.get("NextAccount") or "").strip()
-            next_workflow = str(row.get("NextWorkflow") or "").strip()
-            next_service_type = _infer_service_type(next_workflow, next_account)
+            baseline_arrival, arrival_source = _select_arrival_baseline(row)
+            if baseline_arrival is None or pd.isna(baseline_arrival):
+                baseline_arrival = sched_arr
+                arrival_source = "Sched ETA"
+            baseline_arrival = pd.Timestamp(baseline_arrival)
 
-            info = {
-                "aircraft": tail,
-                "source_booking": str(row.get("CurrentBooking") or "").strip(),
-                "next_booking": next_booking,
-                "turn_minutes": row.get("TurnMinutes"),
-                "arrival_label": _format_turn_timestamp(row.get("ArrivalUTC")),
-                "arrival_source": str(row.get("ArrivalSource") or "").strip(),
-                "next_etd_label": _format_turn_timestamp(next_etd),
-                "next_route": str(row.get("NextRoute") or "").strip(),
-                "next_service_type": next_service_type,
-                "next_account": next_account,
-                "next_etd_utc": next_etd,
-                "next_from_icao": next_from_icao,
-                "next_local_date": local_date,
-                "next_local_date_label": date_label,
-                "next_local_day_delta": day_delta,
-            }
+            if prev_projected_arrival is None:
+                projected_dep = sched_dep
+                projected_arrival = baseline_arrival
+            else:
+                earliest_dep = prev_projected_arrival + required_turn_td
+                projected_dep = max(sched_dep, earliest_dep)
+                projected_arrival = max(baseline_arrival, projected_dep + block_time)
 
-            risk_map[next_booking] = info
-            all_legs.append(info)
+            delay_minutes = int(round((projected_dep - sched_dep).total_seconds() / 60.0))
+            booking = str(row.get("Booking") or "").strip()
+            if booking:
+                dep_actual = row.get("_DepActual_ts")
+                has_departed = dep_actual is not None and pd.notna(dep_actual)
+                if delay_minutes > 0 and not has_departed:
+                    from_icao = str(row.get("From_ICAO") or "").strip().upper()
+                    local_date, date_label, day_delta = _local_departure_date_parts(sched_dep, from_icao)
+                    next_account = str(row.get("Account") or "").strip()
+                    next_workflow = str(row.get("Workflow") or "").strip()
+                    next_service_type = _infer_service_type(next_workflow, next_account)
 
-            tails_for_date = grouped_by_date.setdefault(local_date, {})
-            tails_for_date.setdefault(tail, []).append(info)
+                    source_booking = delay_source_booking or prev_booking or ""
+                    info = {
+                        "aircraft": tail,
+                        "source_booking": source_booking,
+                        "next_booking": booking,
+                        "delay_minutes": delay_minutes,
+                        "arrival_label": prev_arrival_label or "—",
+                        "arrival_source": prev_arrival_source or "",
+                        "scheduled_etd_label": _format_turn_timestamp(sched_dep),
+                        "projected_etd_label": _format_turn_timestamp(projected_dep),
+                        "next_route": str(row.get("Route") or "").strip(),
+                        "next_service_type": next_service_type,
+                        "next_account": next_account,
+                        "next_etd_utc": sched_dep,
+                        "next_from_icao": from_icao,
+                        "next_local_date": local_date,
+                        "next_local_date_label": date_label,
+                        "next_local_day_delta": day_delta,
+                    }
 
-            meta = date_meta.setdefault(
-                local_date,
-                {"date": local_date, "label": date_label, "day_delta": day_delta},
-            )
-            meta["day_delta"] = min(meta.get("day_delta", day_delta), day_delta)
-            if not meta.get("label"):
-                meta["label"] = date_label
+                    risk_map[booking] = info
+                    all_legs.append(info)
+
+                    tails_for_date = grouped_by_date.setdefault(local_date, {})
+                    tails_for_date.setdefault(tail, []).append(info)
+
+                    meta = date_meta.setdefault(
+                        local_date,
+                        {"date": local_date, "label": date_label, "day_delta": day_delta},
+                    )
+                    meta["day_delta"] = min(meta.get("day_delta", day_delta), day_delta)
+                    if not meta.get("label"):
+                        meta["label"] = date_label
+
+            if projected_arrival > sched_arr:
+                if delay_source_booking is None:
+                    if baseline_arrival > sched_arr:
+                        delay_source_booking = booking or delay_source_booking
+                    else:
+                        delay_source_booking = prev_booking or booking or delay_source_booking
+            else:
+                delay_source_booking = None
+
+            prev_projected_arrival = projected_arrival
+            prev_arrival_label = _format_turn_timestamp(projected_arrival)
+            prev_arrival_source = arrival_source
+            prev_booking = booking or prev_booking
 
     if not all_legs:
         return {}, []
@@ -3860,9 +3912,9 @@ if not turnaround_df.empty:
             "minutes": minutes_int,
         }
 
-    downline_risk_map, downline_risk_summary = build_downline_risk_map(
-        turnaround_df, TURNAROUND_MIN_GAP_MINUTES
-    )
+downline_risk_map, downline_risk_summary = build_downline_risk_map(
+    df, TURNAROUND_MIN_GAP_MINUTES
+)
 
 df["_TurnMinutes"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("minutes"))
 df["Turn Time"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("text", "—"))
@@ -3878,14 +3930,14 @@ def _format_downline_risk_text(booking_val: str) -> str:
     if not payload:
         return "—"
 
-    minutes = payload.get("turn_minutes")
-    minutes_txt = f"{int(minutes)}m" if minutes is not None and not pd.isna(minutes) else "<45m"
+    minutes = payload.get("delay_minutes")
+    minutes_txt = f"+{int(minutes)}m" if minutes is not None and not pd.isna(minutes) else "+0m"
     source_booking = payload.get("source_booking") or "previous leg"
     window_txt = ""
-    if payload.get("arrival_label") != "—" or payload.get("next_etd_label") != "—":
-        window_txt = f" ({payload.get('arrival_label')} → {payload.get('next_etd_label')})"
+    if payload.get("arrival_label") != "—" or payload.get("projected_etd_label") != "—":
+        window_txt = f" ({payload.get('arrival_label')} → {payload.get('projected_etd_label')})"
 
-    return f"Short turn after {source_booking}: {minutes_txt}{window_txt}".strip()
+    return f"Carry-forward delay from {source_booking}: {minutes_txt}{window_txt}".strip()
 
 
 df["Downline Risk"] = df["Booking"].map(_format_downline_risk_text)
@@ -4897,8 +4949,8 @@ for phase, title, description, expanded in SCHEDULE_PHASES:
 st.markdown("### Downline risk monitor")
 if downline_risk_summary:
     st.caption(
-        "Next legs on the same tail with less than 45 minutes between arrival and the "
-        "following departure. Grouped by local departure date (today expanded; future days collapsed)."
+        "Next legs on the same tail projected to depart late after enforcing a 45 minute minimum turn. "
+        "Grouped by local departure date (today expanded; future days collapsed)."
     )
     for entry in downline_risk_summary:
         section_label = entry.get("label") or "Upcoming departures"
@@ -4926,17 +4978,17 @@ if downline_risk_summary:
                         arrival_label = (
                             f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
                         )
-                    next_window = f"{arrival_label} → {leg.get('next_etd_label') or '—'}"
-                    minutes_txt = leg.get("turn_minutes")
+                    next_window = f"{arrival_label} → {leg.get('projected_etd_label') or '—'}"
+                    minutes_txt = leg.get("delay_minutes")
                     minutes_txt = (
-                        f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
+                        f"+{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "+0m"
                     )
                     st.markdown(
-                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}: {minutes_txt} after "
-                        f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
+                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}: {minutes_txt} "
+                        f"delay from {leg.get('source_booking') or 'previous leg'} ({next_window})"
                     )
 else:
-    st.caption("No downline legs currently flagged for short turns.")
+    st.caption("No downline legs currently flagged for carry-forward delays.")
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=False):
