@@ -1758,6 +1758,19 @@ def classify_account(account_val: str) -> str:
         return "OCS"
     return "Owner"
 
+def _infer_service_type(workflow: str | None, account: str | None) -> str:
+    workflow_text = str(workflow or "").strip().lower()
+    account_text = str(account or "").strip().lower()
+    if re.search(r"\bpos\b|position", workflow_text):
+        return "POS"
+    if re.search(r"\bpax\b|passenger", workflow_text):
+        return "PAX"
+    if re.search(r"\bpos\b|position", account_text):
+        return "POS"
+    if account_text:
+        return "PAX"
+    return "—"
+
 def type_badge(flight_type: str) -> str:
     return {"OCS": "🟢 OCS", "Owner": "🔵 Owner"}.get(flight_type, "⚪︎")
 
@@ -2075,6 +2088,8 @@ def compute_turnaround_windows(df: pd.DataFrame) -> pd.DataFrame:
                 "NextRoute": next_leg.get("Route", ""),
                 "NextFromICAO": next_leg.get("From_ICAO", ""),
                 "NextFromIATA": next_leg.get("From_IATA", ""),
+                "NextAccount": next_leg.get("Account", ""),
+                "NextWorkflow": next_leg.get("Workflow", ""),
                 "NextETDUTC": next_etd,
                 "TurnDelta": gap,
                 "TurnMinutes": int(round(gap.total_seconds() / 60.0)),
@@ -2129,6 +2144,9 @@ def build_downline_risk_map(
             next_etd = row.get("NextETDUTC")
             next_from_icao = str(row.get("NextFromICAO") or "").strip().upper()
             local_date, date_label, day_delta = _local_departure_date_parts(next_etd, next_from_icao)
+            next_account = str(row.get("NextAccount") or "").strip()
+            next_workflow = str(row.get("NextWorkflow") or "").strip()
+            next_service_type = _infer_service_type(next_workflow, next_account)
 
             info = {
                 "aircraft": tail,
@@ -2139,6 +2157,8 @@ def build_downline_risk_map(
                 "arrival_source": str(row.get("ArrivalSource") or "").strip(),
                 "next_etd_label": _format_turn_timestamp(next_etd),
                 "next_route": str(row.get("NextRoute") or "").strip(),
+                "next_service_type": next_service_type,
+                "next_account": next_account,
                 "next_etd_utc": next_etd,
                 "next_from_icao": next_from_icao,
                 "next_local_date": local_date,
@@ -4892,6 +4912,14 @@ if downline_risk_summary:
                 st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
                 for leg in tail_entry.get("legs", []):
                     route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
+                    service_type = leg.get("next_service_type") or "—"
+                    service_txt = service_type
+                    if service_type == "PAX":
+                        account_txt = format_account_value(leg.get("next_account"))
+                        if account_txt != "—":
+                            service_txt = f"{service_type} · {account_txt}"
+                    if service_txt != "—":
+                        service_txt = f" · {service_txt}"
                     arrival_label = leg.get("arrival_label") or "—"
                     arrival_source = leg.get("arrival_source")
                     if arrival_source:
@@ -4904,7 +4932,7 @@ if downline_risk_summary:
                         f"{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "<45m"
                     )
                     st.markdown(
-                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}: {minutes_txt} after "
+                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}: {minutes_txt} after "
                         f"{leg.get('source_booking') or 'previous leg'} ({next_window})"
                     )
 else:
