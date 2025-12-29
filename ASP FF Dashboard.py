@@ -2177,7 +2177,7 @@ def build_downline_risk_map(
             if booking:
                 dep_actual = row.get("_DepActual_ts")
                 has_departed = dep_actual is not None and pd.notna(dep_actual)
-                if delay_minutes > 0 and not has_departed:
+                if delay_minutes >= 5 and not has_departed:
                     from_icao = str(row.get("From_ICAO") or "").strip().upper()
                     local_date, date_label, day_delta = _local_departure_date_parts(sched_dep, from_icao)
                     next_account = str(row.get("Account") or "").strip()
