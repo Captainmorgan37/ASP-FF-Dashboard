@@ -1763,6 +1763,8 @@ def _infer_service_type(workflow: str | None, account: str | None) -> str:
     account_text = str(account or "").strip().lower()
     if re.search(r"\bpos\b|position", workflow_text):
         return "POS"
+    if classify_account(account or "") == "OCS":
+        return "OCS"
     if re.search(r"\bpax\b|passenger", workflow_text):
         return "PAX"
     if re.search(r"\bpos\b|position", account_text):
