@@ -116,7 +116,8 @@ def _connect_db() -> sqlite3.Connection:
     return conn
 
 
-def init_db():
+@st.cache_resource(show_spinner=False)
+def init_db() -> bool:
     with _connect_db() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS status_events (
@@ -160,6 +161,7 @@ def init_db():
             to_date TEXT
         )
         """)
+    return True
 
 def load_status_map() -> dict:
     with _connect_db() as conn:
