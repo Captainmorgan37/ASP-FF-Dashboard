@@ -105,9 +105,19 @@ except Exception:
 # SQLite persistence (statuses + CSV)
 # ============================
 DB_PATH = "status_store.db"
+DB_BUSY_TIMEOUT_MS = 5000
+
+
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+    return conn
+
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS status_events (
             booking TEXT NOT NULL,
@@ -152,7 +162,7 @@ def init_db():
         """)
 
 def load_status_map() -> dict:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute("""
             SELECT booking, event_type, status, actual_time_utc, delta_min
             FROM status_events
@@ -175,7 +185,7 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
                 delta_value = int(delta_min)
         except (TypeError, ValueError):
             delta_value = None
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
             INSERT INTO status_events (booking, event_type, status, actual_time_utc, delta_min, updated_at)
             VALUES (?, ?, ?, ?, ?, datetime('now'))
@@ -187,12 +197,12 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
         """, (booking, event_type, status, actual_time_iso, delta_value))
 
 def delete_status(booking: str, event_type: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("DELETE FROM status_events WHERE booking=? AND event_type=?", (booking, event_type))
 
 
 def save_csv_to_db(name: str, content_bytes: bytes):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
             INSERT INTO csv_store (id, name, content, uploaded_at)
             VALUES (1, ?, ?, datetime('now'))
@@ -203,19 +213,19 @@ def save_csv_to_db(name: str, content_bytes: bytes):
         """, (name, content_bytes))
 
 def load_csv_from_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute("SELECT name, content, uploaded_at FROM csv_store WHERE id=1").fetchone()
     if row:
         return row[0], row[1], row[2]
     return None, None, None
 
 def get_last_uid(mailbox: str) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute("SELECT last_uid FROM email_cursor WHERE mailbox=?", (mailbox,)).fetchone()
     return int(row[0]) if row and row[0] is not None else 0
 
 def set_last_uid(mailbox: str, uid: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
         INSERT INTO email_cursor (mailbox, last_uid)
         VALUES (?, ?)
@@ -223,12 +233,12 @@ def set_last_uid(mailbox: str, uid: int):
         """, (mailbox, int(uid)))
 
 def load_tail_overrides() -> dict[str, str]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute("SELECT booking, tail FROM tail_overrides").fetchall()
     return {str(booking): tail for booking, tail in rows if tail}
 
 def upsert_tail_override(booking: str, tail: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
             INSERT INTO tail_overrides (booking, tail, updated_at)
             VALUES (?, ?, datetime('now'))
@@ -238,12 +248,12 @@ def upsert_tail_override(booking: str, tail: str):
         """, (booking, tail))
 
 def delete_tail_override(booking: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
 
 def load_fl3xx_cache():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute(
             "SELECT payload, hash, fetched_at, from_date, to_date FROM fl3xx_cache WHERE id=1"
         ).fetchone()
@@ -272,7 +282,7 @@ def save_fl3xx_cache(
     fetched_at: str,
 ):
     payload_json = json.dumps(flights, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date)
