@@ -158,10 +158,22 @@ def init_db() -> bool:
             hash TEXT,
             fetched_at TEXT,
             from_date TEXT,
-            to_date TEXT
+            to_date TEXT,
+            crew_fetched_at TEXT
         )
         """)
+        _ensure_fl3xx_cache_columns(conn)
     return True
+
+
+def _ensure_fl3xx_cache_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(fl3xx_cache)").fetchall()
+        if row and len(row) > 1
+    }
+    if "crew_fetched_at" not in cols:
+        conn.execute("ALTER TABLE fl3xx_cache ADD COLUMN crew_fetched_at TEXT")
 
 def load_status_map() -> dict:
     with _connect_db() as conn:
@@ -257,11 +269,11 @@ def delete_tail_override(booking: str):
 def load_fl3xx_cache():
     with _connect_db() as conn:
         row = conn.execute(
-            "SELECT payload, hash, fetched_at, from_date, to_date FROM fl3xx_cache WHERE id=1"
+            "SELECT payload, hash, fetched_at, from_date, to_date, crew_fetched_at FROM fl3xx_cache WHERE id=1"
         ).fetchone()
     if not row:
         return None
-    payload_json, digest, fetched_at, from_date, to_date = row
+    payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at = row
     try:
         flights = json.loads(payload_json) if payload_json else []
     except json.JSONDecodeError:
@@ -272,6 +284,7 @@ def load_fl3xx_cache():
         "fetched_at": fetched_at,
         "from_date": from_date,
         "to_date": to_date,
+        "crew_fetched_at": crew_fetched_at,
     }
 
 
@@ -282,21 +295,23 @@ def save_fl3xx_cache(
     from_date: str,
     to_date: str,
     fetched_at: str,
+    crew_fetched_at: str | None = None,
 ):
     payload_json = json.dumps(flights, ensure_ascii=False)
     with _connect_db() as conn:
         conn.execute(
             """
-            INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date)
-            VALUES (1, ?, ?, ?, ?, ?)
+            INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date, crew_fetched_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 payload=excluded.payload,
                 hash=excluded.hash,
                 fetched_at=excluded.fetched_at,
                 from_date=excluded.from_date,
-                to_date=excluded.to_date
+                to_date=excluded.to_date,
+                crew_fetched_at=excluded.crew_fetched_at
             """,
-            (payload_json, digest, fetched_at, from_date, to_date),
+            (payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at),
         )
 
 
@@ -306,6 +321,7 @@ init_db()
 # Helpers
 # ============================
 FL3XX_REFRESH_MINUTES = 5
+FL3XX_CREW_REFRESH_MINUTES = 60
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -1423,6 +1439,32 @@ def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
             upsert_status(booking_str, "OnBlock", "On Block", _to_iso8601_z(on_dt), None)
 
 
+def _apply_cached_crew(
+    flights: list[dict[str, Any]],
+    cached_flights: list[dict[str, Any]] | None,
+) -> None:
+    if not flights or not cached_flights:
+        return
+    cached_by_id: dict[str, dict[str, Any]] = {}
+    for cached in cached_flights:
+        flight_id = cached.get("flightId") or cached.get("id")
+        if flight_id is None:
+            continue
+        cached_by_id[str(flight_id)] = cached
+    if not cached_by_id:
+        return
+    for flight in flights:
+        flight_id = flight.get("flightId") or flight.get("id")
+        if flight_id is None:
+            continue
+        cached = cached_by_id.get(str(flight_id))
+        if not cached:
+            continue
+        for key in ("crewMembers", "picName", "sicName"):
+            if cached.get(key) and not flight.get(key):
+                flight[key] = cached.get(key)
+
+
 def _get_fl3xx_schedule(
     config: Fl3xxApiConfig | None = None,
     now: datetime | None = None,
@@ -1439,13 +1481,23 @@ def _get_fl3xx_schedule(
     current_time = now or datetime.now(timezone.utc)
     cache_entry = load_fl3xx_cache()
     last_fetch = _parse_iso8601(cache_entry.get("fetched_at")) if cache_entry else None
+    last_crew_fetch = _parse_iso8601(cache_entry.get("crew_fetched_at")) if cache_entry else None
     refresh_due = cache_entry is None or last_fetch is None or (
         current_time - last_fetch >= timedelta(minutes=FL3XX_REFRESH_MINUTES)
+    )
+    crew_refresh_due = last_crew_fetch is None or (
+        current_time - last_crew_fetch >= timedelta(minutes=FL3XX_CREW_REFRESH_MINUTES)
     )
 
     if refresh_due:
         flights, metadata = fetch_flights(config, now=current_time)
-        crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        crew_fetched_at = cache_entry.get("crew_fetched_at") if cache_entry else None
+        if crew_refresh_due:
+            crew_summary = enrich_flights_with_crew(config, flights, force=True)
+            crew_fetched_at = metadata.get("fetched_at")
+        else:
+            crew_summary = {"fetched": 0, "errors": [], "updated": False}
+            _apply_cached_crew(flights, cache_entry.get("flights") if cache_entry else None)
         digest = compute_flights_digest(flights)
         _ingest_fl3xx_actuals(flights)
         changed = cache_entry is None or cache_entry.get("hash") != digest
@@ -1455,6 +1507,7 @@ def _get_fl3xx_schedule(
             from_date=metadata["from_date"],
             to_date=metadata["to_date"],
             fetched_at=metadata["fetched_at"],
+            crew_fetched_at=crew_fetched_at,
         )
         fetched_dt = _parse_iso8601(metadata.get("fetched_at"))
         next_refresh = None if fetched_dt is None else fetched_dt + timedelta(minutes=FL3XX_REFRESH_MINUTES)
@@ -1464,6 +1517,7 @@ def _get_fl3xx_schedule(
                 "changed": changed,
                 "used_cache": False,
                 "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "crew_refresh_interval_minutes": FL3XX_CREW_REFRESH_MINUTES,
                 "next_refresh_after": _to_iso8601_z(next_refresh),
                 "crew_fetch_count": crew_summary["fetched"],
                 "crew_fetch_errors": crew_summary["errors"],
@@ -1476,6 +1530,7 @@ def _get_fl3xx_schedule(
         # Should not happen because refresh_due would be True, but keep defensive fallback.
         flights, metadata = fetch_flights(config, now=current_time)
         crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        crew_fetched_at = metadata.get("fetched_at")
         digest = compute_flights_digest(flights)
         _ingest_fl3xx_actuals(flights)
         save_fl3xx_cache(
@@ -1484,6 +1539,7 @@ def _get_fl3xx_schedule(
             from_date=metadata["from_date"],
             to_date=metadata["to_date"],
             fetched_at=metadata["fetched_at"],
+            crew_fetched_at=crew_fetched_at,
         )
         metadata.update(
             {
@@ -1491,6 +1547,7 @@ def _get_fl3xx_schedule(
                 "changed": True,
                 "used_cache": False,
                 "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "crew_refresh_interval_minutes": FL3XX_CREW_REFRESH_MINUTES,
                 "next_refresh_after": _to_iso8601_z(
                     _parse_iso8601(metadata.get("fetched_at")) + timedelta(minutes=FL3XX_REFRESH_MINUTES)
                     if metadata.get("fetched_at")
@@ -1505,10 +1562,15 @@ def _get_fl3xx_schedule(
 
     flights = cache_entry.get("flights", [])
     _ingest_fl3xx_actuals(flights)
-    crew_summary = enrich_flights_with_crew(config, flights, force=False)
+    crew_fetched_at = cache_entry.get("crew_fetched_at")
+    if crew_refresh_due:
+        crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        crew_fetched_at = _to_iso8601_z(current_time)
+    else:
+        crew_summary = {"fetched": 0, "errors": [], "updated": False}
     digest = compute_flights_digest(flights) if flights else cache_entry.get("hash") or ""
 
-    if crew_summary["updated"] and flights:
+    if flights and (crew_summary["updated"] or crew_refresh_due):
         fetched_at = cache_entry.get("fetched_at") or _to_iso8601_z(last_fetch) or _to_iso8601_z(current_time)
         save_fl3xx_cache(
             flights,
@@ -1516,6 +1578,7 @@ def _get_fl3xx_schedule(
             from_date=str(cache_entry.get("from_date") or ""),
             to_date=str(cache_entry.get("to_date") or ""),
             fetched_at=fetched_at or _to_iso8601_z(current_time),
+            crew_fetched_at=crew_fetched_at,
         )
 
     next_refresh = None
@@ -1540,6 +1603,7 @@ def _get_fl3xx_schedule(
         "changed": False,
         "used_cache": True,
         "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+        "crew_refresh_interval_minutes": FL3XX_CREW_REFRESH_MINUTES,
         "next_refresh_after": _to_iso8601_z(next_refresh),
         "request_url": config.base_url,
         "request_params": cached_params,
