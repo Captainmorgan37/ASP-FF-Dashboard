@@ -151,12 +151,22 @@ def _rows_from_schedule(schedule: ScheduleData | None) -> list[dict[str, object]
     if schedule is None or schedule.frame.empty:
         return []
     frame = schedule.frame.fillna("")
-    return frame.to_dict(orient="records")
+    rows = frame.to_dict(orient="records")
+    for row in rows:
+        row[EARLY_LATE_COLUMN] = _early_late_display(row)
+    return rows
 
 
 def _table_columns(columns: Iterable[str]) -> list[dict[str, object]]:
     return [
-        {"name": name, "label": name, "field": name, "align": "left", "sortable": True}
+        {
+            "name": name,
+            "label": name,
+            "field": name,
+            "align": "left",
+            "sortable": True,
+            **({"html": True} if name == EARLY_LATE_COLUMN else {}),
+        }
         for name in columns
     ]
 
@@ -189,6 +199,34 @@ ARRIVAL_TIME_FIELDS = (
     "Landing (FA)",
     "Actual On",
     "Actual In",
+)
+SCHEDULED_ARRIVAL_FIELDS = (
+    "En-Route (Sched)",
+    "En Route (Sched)",
+    "Enroute (Sched)",
+    "On-Block (Sched)",
+    "On Block (Sched)",
+    "On-Block (Scheduled)",
+    "On Block (Scheduled)",
+    "Arrival (Sched)",
+    "Arrival (Scheduled)",
+)
+FA_ARRIVAL_ETA_FIELDS = (
+    "ETA (FA)",
+    "ETA (UTC)",
+    "Landing (FA)",
+    "Landing (UTC)",
+    "ETA",
+)
+EARLY_LATE_COLUMN = "Early/Late?"
+EARLY_LATE_ANCHOR_COLUMNS = (
+    "En-Route (Sched)",
+    "En Route (Sched)",
+    "Enroute (Sched)",
+    "On-Block (Sched)",
+    "On Block (Sched)",
+    "ETA (FA)",
+    "ETA (UTC)",
 )
 
 
@@ -252,6 +290,27 @@ def _first_timestamp_from_fields(row: dict[str, object], fields: Iterable[str]) 
         if ts is not None:
             return ts
     return None
+
+
+def _format_early_late_value(delta_minutes: int) -> tuple[str, str]:
+    if delta_minutes == 0:
+        text = "On time"
+    else:
+        descriptor = "delay" if delta_minutes > 0 else "early"
+        text = f"{abs(delta_minutes)} min {descriptor}"
+    color = "#dc2626" if abs(delta_minutes) >= 15 else "#16a34a"
+    return text, color
+
+
+def _early_late_display(row: dict[str, object]) -> str:
+    scheduled = _first_timestamp_from_fields(row, SCHEDULED_ARRIVAL_FIELDS)
+    eta = _first_timestamp_from_fields(row, FA_ARRIVAL_ETA_FIELDS)
+    if scheduled is None or eta is None:
+        return ""
+
+    delta_minutes = int(round((eta - scheduled).total_seconds() / 60))
+    text, color = _format_early_late_value(delta_minutes)
+    return f'<span style="color: {color};">{text}</span>'
 
 
 def _flight_windows_from_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -437,7 +496,20 @@ def _current_schedule_columns() -> list[str]:
 
 def _schedule_columns_for_phase(phase: str, columns: Iterable[str] | None = None) -> list[str]:
     source_columns = list(columns) if columns is not None else _current_schedule_columns()
-    return filtered_columns_for_phase(phase, source_columns)
+    filtered = filtered_columns_for_phase(phase, source_columns)
+    if phase == SCHEDULE_PHASE_ENROUTE:
+        return _insert_early_late_column(filtered)
+    return filtered
+
+
+def _insert_early_late_column(columns: list[str]) -> list[str]:
+    if EARLY_LATE_COLUMN in columns:
+        return columns
+    for anchor in EARLY_LATE_ANCHOR_COLUMNS:
+        if anchor in columns:
+            insert_at = columns.index(anchor) + 1
+            return columns[:insert_at] + [EARLY_LATE_COLUMN] + columns[insert_at:]
+    return columns + [EARLY_LATE_COLUMN]
 
 
 

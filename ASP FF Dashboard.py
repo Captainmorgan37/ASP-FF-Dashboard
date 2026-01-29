@@ -4097,6 +4097,7 @@ display_cols = [
     "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
     "Off-Block (Sched)", "ETA (FA)",
     "On-Block (Sched)",
+    "Early/Late?",
     "Departs In", "Arrives In", "Turn Time", "Downline Risk",
     "PIC", "SIC", "Workflow", "Status"
 ]
@@ -4138,6 +4139,21 @@ if "_DownlineRisk" in view_df.columns:
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Sched)"] = view_df["ETD_UTC"]          # datetime
 view_df["On-Block (Sched)"]  = view_df["ETA_UTC"]          # datetime
+
+
+def _early_late_text(row) -> str:
+    eta_fa = row.get("_ETA_FA_ts")
+    sched = row.get("ETA_UTC")
+    if pd.isna(eta_fa) or pd.isna(sched):
+        return "—"
+    delta_minutes = int(round((eta_fa - sched).total_seconds() / 60.0))
+    if delta_minutes == 0:
+        return "On time"
+    descriptor = "delay" if delta_minutes > 0 else "early"
+    return f"{abs(delta_minutes)} min {descriptor}"
+
+
+view_df["Early/Late?"] = view_df.apply(_early_late_text, axis=1)
 view_df["ETA (FA)"]          = view_df["_ETA_FA_ts"]       # datetime or NaT
 view_df["Landing (FA)"]      = view_df["_ArrActual_ts"]   # datetime or NaT
 
@@ -4418,6 +4434,20 @@ def _style_ops(x: pd.DataFrame):
     if "Landing (FA)" in x.columns:
         styles.loc[mask_arr, "Landing (FA)"] = (
             styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
+        )
+
+    if "Early/Late?" in x.columns:
+        early_late_delta = eta_fa_vs_sched.reindex(x.index)
+        threshold = pd.Timedelta(minutes=15)
+        early_late_red = early_late_delta.notna() & (early_late_delta.abs() >= threshold)
+        early_late_green = early_late_delta.notna() & (early_late_delta.abs() < threshold)
+        early_late_red_css = "color: #dc2626; font-weight: 600;"
+        early_late_green_css = "color: #16a34a; font-weight: 600;"
+        styles.loc[early_late_green, "Early/Late?"] = (
+            styles.loc[early_late_green, "Early/Late?"].fillna("") + early_late_green_css
+        )
+        styles.loc[early_late_red, "Early/Late?"] = (
+            styles.loc[early_late_red, "Early/Late?"].fillna("") + early_late_red_css
         )
 
     if "Status" in x.columns:

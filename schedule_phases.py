@@ -89,6 +89,7 @@ PHASE_COLUMN_EXCLUDES: dict[str, tuple[str, ...]] = {
         "Departs In",
         "Arrives In",
         "Downline Risk",
+        "Early/Late?",
     ),
     SCHEDULE_PHASE_ENROUTE: (
         "Departs In",
@@ -116,6 +117,7 @@ PHASE_COLUMN_EXCLUDES: dict[str, tuple[str, ...]] = {
         "On Block (UTC)",
         "On-Block (Sched)",
         "On Block (Sched)",
+        "Early/Late?",
     ),
 }
 
