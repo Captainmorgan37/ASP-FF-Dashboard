@@ -268,9 +268,17 @@ def delete_tail_override(booking: str):
 
 def load_fl3xx_cache():
     with _connect_db() as conn:
-        row = conn.execute(
-            "SELECT payload, hash, fetched_at, from_date, to_date, crew_fetched_at FROM fl3xx_cache WHERE id=1"
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT payload, hash, fetched_at, from_date, to_date, crew_fetched_at "
+                "FROM fl3xx_cache WHERE id=1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            _ensure_fl3xx_cache_columns(conn)
+            row = conn.execute(
+                "SELECT payload, hash, fetched_at, from_date, to_date, crew_fetched_at "
+                "FROM fl3xx_cache WHERE id=1"
+            ).fetchone()
     if not row:
         return None
     payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at = row
