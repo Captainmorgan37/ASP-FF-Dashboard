@@ -3783,14 +3783,27 @@ def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
             return False
         return (scheduled - actual) > thr
 
+    def _format_arrival_delta(actual, scheduled):
+        if actual is None or scheduled is None:
+            return None
+        minutes = int(abs(actual - scheduled).total_seconds() // 60)
+        unit = "min" if minutes == 1 else "mins"
+        return f"{minutes} {unit}"
+
     if has_div:
         return rec["Diversion"].get("status", "🔷 DIVERTED")
 
     if has_arr:
         if eta_sched and arr_actual:
             if _is_late(arr_actual, eta_sched):
+                delta = _format_arrival_delta(arr_actual, eta_sched)
+                if delta:
+                    return f"🔴 Arrived ({delta} delayed)"
                 return "🔴 Arrived (Delay)"
             if _is_early(arr_actual, eta_sched):
+                delta = _format_arrival_delta(arr_actual, eta_sched)
+                if delta:
+                    return f"🟢 Arrived ({delta} early)"
                 return "🟢 Arrived (Early)"
             if _within_threshold(arr_actual, eta_sched):
                 return "🟣 Arrived (On Sched)"
@@ -4524,11 +4537,14 @@ def _style_ops(x: pd.DataFrame):
 
     if "Status" in x.columns:
         delay_statuses = {
-            "🔴 Arrived (Delay)",
             "🟠 Delayed Arrival",
             "🔴 DELAY",
         }
-        mask_status = _base["Status"].isin(delay_statuses).reindex(x.index, fill_value=False)
+        status_series = _base["Status"].astype(str)
+        mask_status = (
+            status_series.isin(delay_statuses)
+            | status_series.str.contains("delayed", case=False, na=False)
+        ).reindex(x.index, fill_value=False)
         styles.loc[mask_status, "Status"] = (
             styles.loc[mask_status, "Status"].fillna("") + cell_css
         )
