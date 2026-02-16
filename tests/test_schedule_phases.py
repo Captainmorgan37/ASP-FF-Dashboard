@@ -72,3 +72,10 @@ def test_landed_columns_hide_countdowns():
     assert "Departs In" not in filtered
     assert "Arrives In" not in filtered
     assert "On Block" in filtered
+
+
+def test_to_depart_columns_hide_postflight_delay_codes():
+    columns = ["Booking", "Off Block Delay Codes", "Status"]
+    filtered = filtered_columns_for_phase(SCHEDULE_PHASE_TO_DEPART, columns)
+    assert "Off Block Delay Codes" not in filtered
+    assert filtered == ["Booking", "Status"]

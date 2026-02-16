@@ -136,6 +136,45 @@ def fetch_flights(
     return flights, metadata
 
 
+def _parse_datetime_utc(value: Any) -> Optional[datetime]:
+    """Best-effort parsing for FL3XX datetime values into UTC datetimes."""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric > 1_000_000_000_000:
+            numeric = numeric / 1000.0
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return _parse_datetime_utc(int(raw))
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _build_postflight_endpoint(base_url: str, flight_id: Any) -> str:
+    base = base_url.rstrip("/")
+    if base.lower().endswith("/flights"):
+        base = base[: -len("/flights")]
+    return f"{base}/{flight_id}/postflight"
+
+
+
 def _build_flight_endpoint(base_url: str, flight_id: Any) -> str:
     base = base_url.rstrip("/")
     if base.lower().endswith("/flights"):
@@ -210,6 +249,152 @@ def fetch_flight_crew(
                 http.close()
             except AttributeError:
                 pass
+
+
+def fetch_flight_postflight(
+    config: Fl3xxApiConfig,
+    flight_id: Any,
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Return the postflight payload for a specific flight."""
+
+    http = session or requests.Session()
+    close_session = session is None
+    try:
+        response = http.get(
+            _build_postflight_endpoint(config.base_url, flight_id),
+            headers=config.build_headers(),
+            timeout=config.timeout,
+            verify=config.verify_ssl,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, MutableMapping) else {}
+    finally:
+        if close_session:
+            try:
+                http.close()
+            except AttributeError:
+                pass
+
+
+def _extract_delay_off_block_reasons(payload: Dict[str, Any]) -> List[str]:
+    if not isinstance(payload, MutableMapping):
+        return []
+    time_section = payload.get("time")
+    if not isinstance(time_section, MutableMapping):
+        return []
+    dep_section = time_section.get("dep")
+    if not isinstance(dep_section, MutableMapping):
+        return []
+
+    reasons: List[str] = []
+    reasons_list = dep_section.get("delayOffBlockReasons")
+    if isinstance(reasons_list, Iterable) and not isinstance(reasons_list, (str, bytes, bytearray)):
+        for item in reasons_list:
+            text = str(item).strip()
+            if text:
+                reasons.append(text)
+
+    if not reasons:
+        single_reason = dep_section.get("delayOffBlockReason")
+        if single_reason is not None:
+            text = str(single_reason).strip()
+            if text:
+                reasons.append(text)
+
+    deduped: List[str] = []
+    seen = set()
+    for reason in reasons:
+        key = reason.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(reason)
+    return deduped
+
+
+def _flight_offblock_delay_minutes(flight: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(flight, MutableMapping):
+        return None
+    actual = None
+    for key in ("_OffBlock_UTC", "realDateOUT", "realDateOut", "realDateOutUTC", "blockOffActualUTC"):
+        actual = _parse_datetime_utc(flight.get(key))
+        if actual is not None:
+            break
+    scheduled = None
+    for key in ("blockOffEstUTC", "dateOUT", "dateOut", "schedDateOUT", "scheduledDateOUT"):
+        scheduled = _parse_datetime_utc(flight.get(key))
+        if scheduled is not None:
+            break
+    if actual is None or scheduled is None:
+        return None
+    return int(round((actual - scheduled).total_seconds() / 60.0))
+
+
+def enrich_flights_with_postflight_delay_codes(
+    config: Fl3xxApiConfig,
+    flights: Iterable[Dict[str, Any]],
+    *,
+    delay_threshold_minutes: int = 15,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Populate postflight delay-off-block reasons for significantly delayed flights."""
+
+    summary = {"fetched": 0, "eligible": 0, "errors": [], "updated": False}
+    mutable_flights = [flight for flight in flights if isinstance(flight, MutableMapping)]
+    if not mutable_flights:
+        return summary
+
+    threshold = max(0, int(delay_threshold_minutes))
+    http = session or requests.Session()
+    close_session = session is None
+    try:
+        for flight in mutable_flights:
+            flight_id = flight.get("flightId") or flight.get("id")
+            if not flight_id:
+                continue
+            delay_minutes = _flight_offblock_delay_minutes(flight)
+            if delay_minutes is None or delay_minutes < threshold:
+                continue
+
+            summary["eligible"] += 1
+            existing = flight.get("delayOffBlockReasons")
+            if isinstance(existing, list) and any(str(item).strip() for item in existing):
+                continue
+
+            # Keep postflight pulls lightweight: once we attempt a flight, do not re-pull
+            # on every refresh if the payload still lacks delay codes.
+            if flight.get("postflightAttemptedAt"):
+                continue
+
+            attempted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            try:
+                postflight_payload = fetch_flight_postflight(config, flight_id, session=http)
+            except Exception as exc:  # pragma: no cover - defensive path
+                flight["postflightAttemptedAt"] = attempted_at
+                summary["errors"].append({"flight_id": flight_id, "error": str(exc)})
+                continue
+
+            summary["fetched"] += 1
+            reasons = _extract_delay_off_block_reasons(postflight_payload)
+            previous_reasons = flight.get("delayOffBlockReasons")
+            flight["delayOffBlockReasons"] = reasons
+            flight["delayOffBlockReason"] = reasons[0] if reasons else ""
+            flight["postflightAttemptedAt"] = attempted_at
+            flight["postflightFetchedAt"] = attempted_at
+            if reasons and reasons != previous_reasons:
+                summary["updated"] = True
+    finally:
+        if close_session:
+            try:
+                http.close()
+            except AttributeError:
+                pass
+
+    return summary
+
 
 
 def _select_crew_member(crew: Iterable[Dict[str, Any]], role: str) -> Optional[Dict[str, Any]]:
@@ -303,5 +488,7 @@ __all__ = [
     "compute_flights_digest",
     "fetch_flights",
     "fetch_flight_crew",
+    "fetch_flight_postflight",
     "enrich_flights_with_crew",
+    "enrich_flights_with_postflight_delay_codes",
 ]

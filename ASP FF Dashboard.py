@@ -35,6 +35,7 @@ from fl3xx_client import (
     Fl3xxApiConfig,
     compute_flights_digest,
     enrich_flights_with_crew,
+    enrich_flights_with_postflight_delay_codes,
     fetch_flights,
 )
 from flightaware_status import (
@@ -373,6 +374,7 @@ init_db()
 # ============================
 FL3XX_REFRESH_MINUTES = 5
 FL3XX_CREW_REFRESH_MINUTES = 60
+FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES = 15
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -1490,6 +1492,33 @@ def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
             upsert_status(booking_str, "OnBlock", "On Block", _to_iso8601_z(on_dt), None)
 
 
+
+
+def _apply_cached_postflight_delay(
+    flights: list[dict[str, Any]],
+    cached_flights: list[dict[str, Any]] | None,
+) -> None:
+    if not flights or not cached_flights:
+        return
+    cached_by_id: dict[str, dict[str, Any]] = {}
+    for cached in cached_flights:
+        flight_id = cached.get("flightId") or cached.get("id")
+        if flight_id is None:
+            continue
+        cached_by_id[str(flight_id)] = cached
+    if not cached_by_id:
+        return
+    for flight in flights:
+        flight_id = flight.get("flightId") or flight.get("id")
+        if flight_id is None:
+            continue
+        cached = cached_by_id.get(str(flight_id))
+        if not cached:
+            continue
+        for key in ("delayOffBlockReasons", "delayOffBlockReason", "postflightFetchedAt", "postflightAttemptedAt"):
+            if cached.get(key) and not flight.get(key):
+                flight[key] = cached.get(key)
+
 def _apply_cached_crew(
     flights: list[dict[str, Any]],
     cached_flights: list[dict[str, Any]] | None,
@@ -1549,6 +1578,14 @@ def _get_fl3xx_schedule(
         else:
             crew_summary = {"fetched": 0, "errors": [], "updated": False}
             _apply_cached_crew(flights, cache_entry.get("flights") if cache_entry else None)
+
+        _apply_cached_postflight_delay(flights, cache_entry.get("flights") if cache_entry else None)
+        postflight_summary = enrich_flights_with_postflight_delay_codes(
+            config,
+            flights,
+            delay_threshold_minutes=FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES,
+        )
+
         digest = compute_flights_digest(flights)
         _ingest_fl3xx_actuals(flights)
         changed = cache_entry is None or cache_entry.get("hash") != digest
@@ -1573,6 +1610,10 @@ def _get_fl3xx_schedule(
                 "crew_fetch_count": crew_summary["fetched"],
                 "crew_fetch_errors": crew_summary["errors"],
                 "crew_updated": crew_summary["updated"],
+                "postflight_fetch_count": postflight_summary["fetched"],
+                "postflight_eligible_count": postflight_summary["eligible"],
+                "postflight_fetch_errors": postflight_summary["errors"],
+                "postflight_updated": postflight_summary["updated"],
             }
         )
         return flights, metadata
@@ -1582,6 +1623,11 @@ def _get_fl3xx_schedule(
         flights, metadata = fetch_flights(config, now=current_time)
         crew_summary = enrich_flights_with_crew(config, flights, force=True)
         crew_fetched_at = metadata.get("fetched_at")
+        postflight_summary = enrich_flights_with_postflight_delay_codes(
+            config,
+            flights,
+            delay_threshold_minutes=FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES,
+        )
         digest = compute_flights_digest(flights)
         _ingest_fl3xx_actuals(flights)
         save_fl3xx_cache(
@@ -1607,6 +1653,10 @@ def _get_fl3xx_schedule(
                 "crew_fetch_count": crew_summary["fetched"],
                 "crew_fetch_errors": crew_summary["errors"],
                 "crew_updated": crew_summary["updated"],
+                "postflight_fetch_count": postflight_summary["fetched"],
+                "postflight_eligible_count": postflight_summary["eligible"],
+                "postflight_fetch_errors": postflight_summary["errors"],
+                "postflight_updated": postflight_summary["updated"],
             }
         )
         return flights, metadata
@@ -1619,9 +1669,16 @@ def _get_fl3xx_schedule(
         crew_fetched_at = _to_iso8601_z(current_time)
     else:
         crew_summary = {"fetched": 0, "errors": [], "updated": False}
+
+    postflight_summary = enrich_flights_with_postflight_delay_codes(
+        config,
+        flights,
+        delay_threshold_minutes=FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES,
+    )
+
     digest = compute_flights_digest(flights) if flights else cache_entry.get("hash") or ""
 
-    if flights and (crew_summary["updated"] or crew_refresh_due):
+    if flights and (crew_summary["updated"] or crew_refresh_due or postflight_summary["updated"] or postflight_summary["fetched"] > 0):
         fetched_at = cache_entry.get("fetched_at") or _to_iso8601_z(last_fetch) or _to_iso8601_z(current_time)
         save_fl3xx_cache(
             flights,
@@ -1661,6 +1718,10 @@ def _get_fl3xx_schedule(
         "crew_fetch_count": crew_summary["fetched"],
         "crew_fetch_errors": crew_summary["errors"],
         "crew_updated": crew_summary["updated"],
+        "postflight_fetch_count": postflight_summary["fetched"],
+        "postflight_eligible_count": postflight_summary["eligible"],
+        "postflight_fetch_errors": postflight_summary["errors"],
+        "postflight_updated": postflight_summary["updated"],
     }
 
     return flights, metadata
@@ -3486,6 +3547,16 @@ def _render_fl3xx_status(metadata: dict) -> None:
     elif crew_errors is not None:
         status_bits.append("No crew fetch errors.")
 
+    postflight_count = metadata.get("postflight_fetch_count")
+    if postflight_count is not None:
+        status_bits.append(f"Postflight pulls: {postflight_count}.")
+    postflight_eligible = metadata.get("postflight_eligible_count")
+    if postflight_eligible is not None:
+        status_bits.append(f"Postflight-eligible flights: {postflight_eligible}.")
+    postflight_errors = metadata.get("postflight_fetch_errors")
+    if postflight_errors:
+        status_bits.append(f"{len(postflight_errors)} postflight pull error(s).")
+
     st.caption(" ".join(status_bits))
 
     if crew_errors:
@@ -3530,6 +3601,10 @@ except Exception as exc:
             "crew_fetch_count": 0,
             "crew_fetch_errors": [],
             "crew_updated": False,
+            "postflight_fetch_count": 0,
+            "postflight_eligible_count": 0,
+            "postflight_fetch_errors": [],
+            "postflight_updated": False,
         }
         flights = cache_entry.get("flights", [])
         fl3xx_flights_payload = flights
@@ -3634,16 +3709,25 @@ if not df.empty:
             off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
             on_iso = flight.get("_OnBlock_UTC") or flight.get("realDateIN") or flight.get("realDateIn")
             status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
+            delay_reasons_raw = flight.get("delayOffBlockReasons")
+            delay_reasons: list[str] = []
+            if isinstance(delay_reasons_raw, list):
+                delay_reasons = [str(item).strip() for item in delay_reasons_raw if str(item).strip()]
+            elif delay_reasons_raw:
+                delay_reasons = [str(delay_reasons_raw).strip()]
+
             actual_map[booking_str].append({
                 "off": off_iso,
                 "on": on_iso,
                 "status": status_val,
+                "delay_reasons": " | ".join(delay_reasons) if delay_reasons else "",
             })
 
         booking_seq = defaultdict(int)
         off_vals: list[str | None] = []
         on_vals: list[str | None] = []
         status_vals: list[str] = []
+        delay_reason_vals: list[str] = []
 
         for booking in df["Booking"]:
             seq_idx = booking_seq[booking]
@@ -3652,18 +3736,22 @@ if not df.empty:
             off_iso = None
             on_iso = None
             status_val = ""
+            delay_reasons_text = ""
             if seq_idx < len(entries):
                 payload = entries[seq_idx]
                 off_iso = payload.get("off")
                 on_iso = payload.get("on")
                 status_val = (payload.get("status") or "").strip()
+                delay_reasons_text = (payload.get("delay_reasons") or "").strip()
             off_vals.append(off_iso)
             on_vals.append(on_iso)
             status_vals.append(status_val)
+            delay_reason_vals.append(delay_reasons_text)
 
         df["_OffBlock_UTC"] = pd.to_datetime(off_vals, utc=True, errors="coerce")
         df["_OnBlock_UTC"] = pd.to_datetime(on_vals, utc=True, errors="coerce")
         df["_FlightStatusRaw"] = status_vals
+        df["Off Block Delay Codes"] = delay_reason_vals
 else:
     df["_LegKey"] = pd.Series(dtype=str, index=df.index)
 
@@ -3678,6 +3766,7 @@ else:
     df["_OnBlock_UTC"] = pd.to_datetime(pd.Series(pd.NaT, index=df.index), utc=True, errors="coerce")
 
 df["_FlightStatusRaw"] = df.get("_FlightStatusRaw", pd.Series("", index=df.index)).fillna("").astype(str)
+df["Off Block Delay Codes"] = df.get("Off Block Delay Codes", pd.Series("", index=df.index)).fillna("").astype(str)
 
 if _tail_override_map and not df.empty:
     df["Aircraft"] = [
@@ -4225,7 +4314,7 @@ display_cols = [
     "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
     "Off-Block (Sched)", "ETA (FA)",
     "On-Block (Sched)",
-    "Early/Late?",
+    "Early/Late?", "Off Block Delay Codes",
     "Departs In", "Arrives In", "Turn Time", "Downline Risk",
     "PIC", "SIC", "Workflow", "Status"
 ]
@@ -5311,6 +5400,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                 )
             with reason_col:
                 reason_key = f"delay_reason_{booking_str}_{idx}"
+                auto_reason = str(row.get("Off Block Delay Codes") or "").strip()
+                if auto_reason and not str(st.session_state.get(reason_key, "")).strip():
+                    st.session_state[reason_key] = auto_reason
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
                 notes_key = f"delay_notes_{booking_str}_{idx}"
                 st.text_area(
