@@ -27,6 +27,9 @@ if not ENABLE_NICEGUI:
     raise SystemExit(0)
 
 from datetime import datetime, timezone, timedelta
+import json
+from pathlib import Path
+from threading import Lock
 from types import SimpleNamespace
 from typing import Iterable
 from secrets_diagnostics import SecretSection, collect_secret_diagnostics
@@ -458,6 +461,9 @@ schedule_state = SimpleNamespace(data=None)  # type: ignore[attr-defined]
 schedule_tables: dict[str, ui.table] = {}
 status_label: ui.label | None = None
 notification_log: ui.log | None = None
+NOTIFICATION_HISTORY_MAX_LINES = 50
+NOTIFICATION_HISTORY_FILE = Path(__file__).with_name("notification_history.json")
+_notification_history_lock = Lock()
 # secrets UI state
 secret_state = SimpleNamespace(sections=[])
 secret_sections_container: ui.column | None = None
@@ -656,16 +662,63 @@ def simulate_fetch_from_fl3xx() -> None:
     )
 
 
+def _read_notification_history() -> list[str]:
+    with _notification_history_lock:
+        if not NOTIFICATION_HISTORY_FILE.exists():
+            return []
+
+        try:
+            raw = json.loads(NOTIFICATION_HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Unable to read notification history: {exc}")
+            return []
+
+        if not isinstance(raw, list):
+            return []
+
+        entries = [str(item) for item in raw if str(item).strip()]
+        return entries[-NOTIFICATION_HISTORY_MAX_LINES:]
+
+
+def _write_notification_history(entries: list[str]) -> None:
+    trimmed = [str(entry) for entry in entries if str(entry).strip()][-NOTIFICATION_HISTORY_MAX_LINES:]
+    with _notification_history_lock:
+        try:
+            NOTIFICATION_HISTORY_FILE.write_text(
+                json.dumps(trimmed, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"Unable to write notification history: {exc}")
+
+
+def _append_notification_history(entry: str) -> None:
+    history = _read_notification_history()
+    history.append(entry)
+    _write_notification_history(history)
+
+
 def send_notification(message_box: ui.textarea) -> None:
     message = (message_box.value or "").strip()
     if not message:
         ui.notify("Add a message before sending a notification", type="warning")
         return
 
-    timestamp = _utc_timestamp()
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = f"{timestamp} · {message}"
+    _append_notification_history(entry)
+
     ui.notify("Notification sent ✅", type="positive")
     if notification_log is not None:
-        notification_log.push(f"{timestamp} · {message}")
+        notification_log.push(entry)
+
+
+def _restore_notification_history() -> None:
+    if notification_log is None:
+        return
+
+    for entry in _read_notification_history():
+        notification_log.push(entry)
 
 
 def _booking_value(row: dict[str, object]) -> str:
@@ -921,7 +974,9 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
             ).props("color=secondary")
 
         with ui.expansion("Notification history", icon="notifications").classes("w-full"):
-            notification_log = ui.log(max_lines=50).classes("h-40")
+            ui.label("Shared across connected users on this deployment.").classes("text-xs text-gray-600 mb-1")
+            notification_log = ui.log(max_lines=NOTIFICATION_HISTORY_MAX_LINES).classes("h-40")
+            _restore_notification_history()
 
     with ui.card().classes("w-full"):
         with ui.row().classes("items-center justify-between w-full"):
