@@ -6,7 +6,9 @@ from fl3xx_client import (
     Fl3xxApiConfig,
     compute_fetch_dates,
     enrich_flights_with_crew,
+    enrich_flights_with_postflight_delay_codes,
     fetch_flight_crew,
+    fetch_flight_postflight,
     fetch_flights,
 )
 
@@ -268,3 +270,89 @@ def test_enrich_flights_with_crew_skips_when_names_present_and_not_forced():
     assert summary["fetched"] == 0
     assert summary["updated"] is False
     assert len(session.calls) == 0
+
+
+def test_fetch_flight_postflight_uses_expected_endpoint():
+    payload = {"time": {"dep": {"delayOffBlockReasons": ["Flow|EDCT|ATC"]}}}
+    expected_url = "https://app.fl3xx.us/api/external/flight/321/postflight"
+    session = FakeSession(response_map={expected_url: FakeResponse(payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    postflight = fetch_flight_postflight(config, 321, session=session)
+
+    assert postflight == payload
+    assert len(session.calls) == 1
+    assert session.calls[0]["url"] == expected_url
+
+
+def test_enrich_flights_with_postflight_delay_codes_only_fetches_eligible_flights():
+    flights = [
+        {
+            "flightId": 1,
+            "blockOffEstUTC": "2026-02-16T15:00:00Z",
+            "realDateOUT": "2026-02-16T15:20:00Z",
+        },
+        {
+            "flightId": 2,
+            "blockOffEstUTC": "2026-02-16T15:00:00Z",
+            "realDateOUT": "2026-02-16T15:10:00Z",
+        },
+    ]
+    payload = {"time": {"dep": {"delayOffBlockReasons": ["Flow|EDCT|ATC"]}}}
+    expected_url = "https://app.fl3xx.us/api/external/flight/1/postflight"
+    session = FakeSession(response_map={expected_url: FakeResponse(payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    summary = enrich_flights_with_postflight_delay_codes(config, flights, delay_threshold_minutes=15, session=session)
+
+    assert summary["eligible"] == 1
+    assert summary["fetched"] == 1
+    assert summary["updated"] is True
+    assert len(session.calls) == 1
+    assert flights[0]["delayOffBlockReasons"] == ["Flow|EDCT|ATC"]
+    assert flights[0]["delayOffBlockReason"] == "Flow|EDCT|ATC"
+    assert "delayOffBlockReasons" not in flights[1]
+
+
+def test_enrich_flights_with_postflight_delay_codes_skips_when_reason_already_present():
+    flights = [
+        {
+            "flightId": 1,
+            "blockOffEstUTC": "2026-02-16T15:00:00Z",
+            "realDateOUT": "2026-02-16T15:20:00Z",
+            "delayOffBlockReasons": ["Crew"],
+        }
+    ]
+    session = FakeSession()
+    config = Fl3xxApiConfig(api_token="token123")
+
+    summary = enrich_flights_with_postflight_delay_codes(config, flights, delay_threshold_minutes=15, session=session)
+
+    assert summary["eligible"] == 1
+    assert summary["fetched"] == 0
+    assert summary["updated"] is False
+    assert len(session.calls) == 0
+
+
+def test_enrich_flights_with_postflight_delay_codes_only_attempts_once_when_no_reasons_returned():
+    flights = [
+        {
+            "flightId": 1,
+            "blockOffEstUTC": "2026-02-16T15:00:00Z",
+            "realDateOUT": "2026-02-16T15:20:00Z",
+        }
+    ]
+    payload = {"time": {"dep": {"delayOffBlockReasons": []}}}
+    expected_url = "https://app.fl3xx.us/api/external/flight/1/postflight"
+    session = FakeSession(response_map={expected_url: FakeResponse(payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    first = enrich_flights_with_postflight_delay_codes(config, flights, delay_threshold_minutes=15, session=session)
+    second = enrich_flights_with_postflight_delay_codes(config, flights, delay_threshold_minutes=15, session=session)
+
+    assert first["fetched"] == 1
+    assert second["fetched"] == 0
+    assert len(session.calls) == 1
+    assert flights[0]["postflightAttemptedAt"]
+    assert flights[0]["delayOffBlockReasons"] == []
+

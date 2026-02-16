@@ -60,6 +60,14 @@ Two modules already expose the transformations you need:
   API calls, caching, and digest tracking that the Streamlit version uses before
   it hands the flights to the scheduler.【F:ASP FF Dashboard.py†L1278-L1320】
 
+### FL3XX crew enrichment endpoint (not postflight)
+
+The app does a **secondary per-flight crew pull** after the main
+`/api/external/flight/flights` request. That secondary request is built as
+`/api/external/flight/{flightId}/crew` and is used to populate `crewMembers`,
+`picName`, and `sicName` on each flight object. This is part of the normal
+flight API flow and is **not** a postflight endpoint.
+
 Update `simulate_fetch_from_fl3xx()` (or add a new handler) so that it builds a
 real `Fl3xxApiConfig` from secrets, calls the client functions, and feeds the
 returned flights through `load_schedule("fl3xx_api", metadata={...})`. That will
@@ -88,4 +96,3 @@ Run the NiceGUI app on your workstation with the same environment variables you
 plan to inject into App Runner. Once the table shows live flights and the
 webhook diagnostics return records, push the changes so App Runner picks up the
 new code automatically.
-
