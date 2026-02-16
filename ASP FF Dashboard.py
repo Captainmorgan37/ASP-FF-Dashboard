@@ -162,6 +162,13 @@ def init_db() -> bool:
             crew_fetched_at TEXT
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at_utc TEXT NOT NULL,
+            entry_text TEXT NOT NULL
+        )
+        """)
         _ensure_fl3xx_cache_columns(conn)
     return True
 
@@ -265,6 +272,42 @@ def delete_tail_override(booking: str):
     with _connect_db() as conn:
         conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
+
+def append_notification_history(entry_text: str) -> None:
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO notification_history (sent_at_utc, entry_text)
+            VALUES (?, ?)
+            """,
+            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), entry_text),
+        )
+        conn.execute(
+            """
+            DELETE FROM notification_history
+            WHERE id NOT IN (
+                SELECT id
+                FROM notification_history
+                ORDER BY id DESC
+                LIMIT 100
+            )
+            """
+        )
+
+
+def load_notification_history(limit: int = 50) -> list[str]:
+    with _connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT sent_at_utc, entry_text
+            FROM notification_history
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    rows.reverse()
+    return [f"{sent_at} · {entry}" for sent_at, entry in rows]
 
 def load_fl3xx_cache():
     with _connect_db() as conn:
@@ -5299,8 +5342,20 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                         )
                         if ok:
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+                            append_notification_history(
+                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']}"
+                            )
                         else:
                             st.error(f"Failed: {err}")
+
+    notification_entries = load_notification_history(limit=50)
+    with st.expander("Notification history (shared)", expanded=False):
+        if notification_entries:
+            st.caption("Shared across users of this Streamlit deployment.")
+            for entry in notification_entries:
+                st.text(entry)
+        else:
+            st.caption("No notifications have been sent yet.")
 
 # -------- end Quick Notify panel --------
 
