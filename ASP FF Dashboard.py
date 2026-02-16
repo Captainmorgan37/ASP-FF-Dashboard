@@ -5400,6 +5400,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                 )
             with reason_col:
                 reason_key = f"delay_reason_{booking_str}_{idx}"
+                auto_reason = str(row.get("Off Block Delay Codes") or "").strip()
+                if auto_reason and not str(st.session_state.get(reason_key, "")).strip():
+                    st.session_state[reason_key] = auto_reason
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
                 notes_key = f"delay_notes_{booking_str}_{idx}"
                 st.text_area(
