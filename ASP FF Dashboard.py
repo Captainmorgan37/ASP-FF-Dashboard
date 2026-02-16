@@ -5,14 +5,16 @@ import re
 import json
 import sqlite3
 import imaplib, email
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal
 from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dateutil import parser as dateparse
 from dateutil.tz import tzoffset
 from pathlib import Path
@@ -27,7 +29,7 @@ except ImportError:  # pragma: no cover - optional dependency
     boto3 = None
     Key = None
 
-from data_sources import ScheduleSource, load_schedule
+from data_sources import ScheduleData, ScheduleSource, load_schedule
 from fl3xx_client import (
     DEFAULT_FL3XX_BASE_URL,
     Fl3xxApiConfig,
@@ -42,20 +44,42 @@ from flightaware_status import (
     derive_event_times,
     fetch_flights_for_ident,
 )
+from schedule_phases import (
+    SCHEDULE_PHASE_ENROUTE,
+    SCHEDULE_PHASES,
+    categorize_dataframe_by_phase,
+    filtered_columns_for_phase,
+)
 # Global lookup maps populated after loading airport metadata. Define them early so
 # helper functions can reference the names during the initial Streamlit run.
 ICAO_TZ_MAP: dict[str, str] = {}
 ICAO_TO_IATA_MAP: dict[str, str] = {}
 IATA_TO_ICAO_MAP: dict[str, str] = {}
+LOCAL_TZ = tzlocal.get_localzone()
 
 # ============================
 # Page config
 # ============================
 st.set_page_config(page_title="Daily Ops Dashboard (Schedule + Status)", layout="wide")
 st.title("Daily Ops Dashboard (Schedule + Status)")
+
 st.caption(
     "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
+)
+
+# Shared styles for flashing landed rows awaiting block-on confirmation
+st.markdown(
+    """
+    <style>
+    @keyframes landed-on-alert {
+      0%   { background-color: rgba(255, 193, 7, 0.18); }
+      50%  { background-color: rgba(255, 241, 118, 0.65); }
+      100% { background-color: rgba(255, 193, 7, 0.18); }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 if "inline_edit_toast" in st.session_state:
@@ -64,31 +88,37 @@ if "inline_edit_toast" in st.session_state:
 # ============================
 # Auto-refresh controls (no page reload fallback)
 # ============================
-ar1, ar2 = st.columns([1, 1])
-with ar1:
-    auto_refresh = st.checkbox("Auto-refresh", value=True, help="Re-run the app so countdowns update.")
-with ar2:
-    refresh_sec = st.number_input(
-        "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
-    )
+refresh_sec = st.number_input(
+    "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
+)
 
-if auto_refresh:
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
-    except Exception:
-        st.warning(
-            "Auto-refresh requires the 'streamlit-autorefresh' package. "
-            "Add `streamlit-autorefresh` to requirements.txt (or disable Auto-refresh)."
-        )
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=int(refresh_sec * 1000), key="ops_auto_refresh")
+except Exception:
+    st.warning(
+        "Auto-refresh requires the 'streamlit-autorefresh' package. "
+        "Add `streamlit-autorefresh` to requirements.txt."
+    )
 
 # ============================
 # SQLite persistence (statuses + CSV)
 # ============================
 DB_PATH = "status_store.db"
+DB_BUSY_TIMEOUT_MS = 5000
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+@st.cache_resource(show_spinner=False)
+def init_db() -> bool:
+    with _connect_db() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS status_events (
             booking TEXT NOT NULL,
@@ -128,12 +158,32 @@ def init_db():
             hash TEXT,
             fetched_at TEXT,
             from_date TEXT,
-            to_date TEXT
+            to_date TEXT,
+            crew_fetched_at TEXT
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at_utc TEXT NOT NULL,
+            entry_text TEXT NOT NULL
+        )
+        """)
+        _ensure_fl3xx_cache_columns(conn)
+    return True
+
+
+def _ensure_fl3xx_cache_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(fl3xx_cache)").fetchall()
+        if row and len(row) > 1
+    }
+    if "crew_fetched_at" not in cols:
+        conn.execute("ALTER TABLE fl3xx_cache ADD COLUMN crew_fetched_at TEXT")
 
 def load_status_map() -> dict:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute("""
             SELECT booking, event_type, status, actual_time_utc, delta_min
             FROM status_events
@@ -156,7 +206,7 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
                 delta_value = int(delta_min)
         except (TypeError, ValueError):
             delta_value = None
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
             INSERT INTO status_events (booking, event_type, status, actual_time_utc, delta_min, updated_at)
             VALUES (?, ?, ?, ?, ?, datetime('now'))
@@ -168,12 +218,12 @@ def upsert_status(booking, event_type, status, actual_time_iso, delta_min):
         """, (booking, event_type, status, actual_time_iso, delta_value))
 
 def delete_status(booking: str, event_type: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("DELETE FROM status_events WHERE booking=? AND event_type=?", (booking, event_type))
 
 
 def save_csv_to_db(name: str, content_bytes: bytes):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
             INSERT INTO csv_store (id, name, content, uploaded_at)
             VALUES (1, ?, ?, datetime('now'))
@@ -184,19 +234,19 @@ def save_csv_to_db(name: str, content_bytes: bytes):
         """, (name, content_bytes))
 
 def load_csv_from_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute("SELECT name, content, uploaded_at FROM csv_store WHERE id=1").fetchone()
     if row:
         return row[0], row[1], row[2]
     return None, None, None
 
 def get_last_uid(mailbox: str) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute("SELECT last_uid FROM email_cursor WHERE mailbox=?", (mailbox,)).fetchone()
     return int(row[0]) if row and row[0] is not None else 0
 
 def set_last_uid(mailbox: str, uid: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
         INSERT INTO email_cursor (mailbox, last_uid)
         VALUES (?, ?)
@@ -204,12 +254,12 @@ def set_last_uid(mailbox: str, uid: int):
         """, (mailbox, int(uid)))
 
 def load_tail_overrides() -> dict[str, str]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute("SELECT booking, tail FROM tail_overrides").fetchall()
     return {str(booking): tail for booking, tail in rows if tail}
 
 def upsert_tail_override(booking: str, tail: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("""
             INSERT INTO tail_overrides (booking, tail, updated_at)
             VALUES (?, ?, datetime('now'))
@@ -219,18 +269,62 @@ def upsert_tail_override(booking: str, tail: str):
         """, (booking, tail))
 
 def delete_tail_override(booking: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
 
+def append_notification_history(entry_text: str) -> None:
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO notification_history (sent_at_utc, entry_text)
+            VALUES (?, ?)
+            """,
+            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), entry_text),
+        )
+        conn.execute(
+            """
+            DELETE FROM notification_history
+            WHERE id NOT IN (
+                SELECT id
+                FROM notification_history
+                ORDER BY id DESC
+                LIMIT 100
+            )
+            """
+        )
+
+
+def load_notification_history(limit: int = 50) -> list[str]:
+    with _connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT sent_at_utc, entry_text
+            FROM notification_history
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    rows.reverse()
+    return [f"{sent_at} · {entry}" for sent_at, entry in rows]
+
 def load_fl3xx_cache():
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT payload, hash, fetched_at, from_date, to_date FROM fl3xx_cache WHERE id=1"
-        ).fetchone()
+    with _connect_db() as conn:
+        try:
+            row = conn.execute(
+                "SELECT payload, hash, fetched_at, from_date, to_date, crew_fetched_at "
+                "FROM fl3xx_cache WHERE id=1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            _ensure_fl3xx_cache_columns(conn)
+            row = conn.execute(
+                "SELECT payload, hash, fetched_at, from_date, to_date, crew_fetched_at "
+                "FROM fl3xx_cache WHERE id=1"
+            ).fetchone()
     if not row:
         return None
-    payload_json, digest, fetched_at, from_date, to_date = row
+    payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at = row
     try:
         flights = json.loads(payload_json) if payload_json else []
     except json.JSONDecodeError:
@@ -241,6 +335,7 @@ def load_fl3xx_cache():
         "fetched_at": fetched_at,
         "from_date": from_date,
         "to_date": to_date,
+        "crew_fetched_at": crew_fetched_at,
     }
 
 
@@ -251,21 +346,23 @@ def save_fl3xx_cache(
     from_date: str,
     to_date: str,
     fetched_at: str,
+    crew_fetched_at: str | None = None,
 ):
     payload_json = json.dumps(flights, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
-            INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date)
-            VALUES (1, ?, ?, ?, ?, ?)
+            INSERT INTO fl3xx_cache (id, payload, hash, fetched_at, from_date, to_date, crew_fetched_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 payload=excluded.payload,
                 hash=excluded.hash,
                 fetched_at=excluded.fetched_at,
                 from_date=excluded.from_date,
-                to_date=excluded.to_date
+                to_date=excluded.to_date,
+                crew_fetched_at=excluded.crew_fetched_at
             """,
-            (payload_json, digest, fetched_at, from_date, to_date),
+            (payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at),
         )
 
 
@@ -275,6 +372,7 @@ init_db()
 # Helpers
 # ============================
 FL3XX_REFRESH_MINUTES = 5
+FL3XX_CREW_REFRESH_MINUTES = 60
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -693,9 +791,13 @@ def _imap_secret_diagnostics_rows() -> list[dict[str, str]]:
             "Sender filter provided" if sender else "Sender filter not set",
         )
 
-    edct_only = _normalize_secret_value(_resolve_secret("IMAP_EDCT_ONLY"), allow_blank=True)
-    if edct_only is not None:
-        _add_row("IMAP_EDCT_ONLY", True, f"EDCT-only mode = {edct_only}")
+    rows.append(
+        {
+            "Source": "IMAP processing mode",
+            "Detected": "✅",
+            "Details": "EDCT-only processing is enabled",
+        }
+    )
 
     return rows
 
@@ -1317,6 +1419,103 @@ def _has_fl3xx_credentials_configured() -> bool:
     return bool(config.auth_header or config.api_token)
 
 
+def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
+    """Normalize FL3XX real block times and persist them as status events."""
+
+    def _first_value(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+        for key in keys:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+            elif isinstance(value, datetime):
+                iso_val = _to_iso8601_z(value)
+                if iso_val:
+                    return iso_val
+            else:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+
+    for flight in flights:
+        if not isinstance(flight, dict):
+            continue
+
+        off_raw = _first_value(
+            flight,
+            (
+                "_OffBlock_UTC",
+                "realDateOUT",
+                "realDateOut",
+                "realDateOutUTC",
+                "blockOffActualUTC",
+            ),
+        )
+        on_raw = _first_value(
+            flight,
+            (
+                "_OnBlock_UTC",
+                "realDateIN",
+                "realDateIn",
+                "realDateInUTC",
+                "blockOnActualUTC",
+            ),
+        )
+
+        off_dt = parse_iso_to_utc(off_raw) if off_raw else None
+        on_dt = parse_iso_to_utc(on_raw) if on_raw else None
+
+        flight["_OffBlock_UTC"] = _to_iso8601_z(off_dt) if off_dt else None
+        flight["_OnBlock_UTC"] = _to_iso8601_z(on_dt) if on_dt else None
+        flight["_FlightStatus"] = (flight.get("flightStatus") or "").strip()
+
+        booking_key = (
+            flight.get("bookingIdentifier")
+            or flight.get("bookingReference")
+            or flight.get("quoteId")
+        )
+        if not booking_key:
+            continue
+
+        booking_str = str(booking_key)
+        if off_dt:
+            upsert_status(booking_str, "OffBlock", "Off Block", _to_iso8601_z(off_dt), None)
+        if on_dt:
+            upsert_status(booking_str, "OnBlock", "On Block", _to_iso8601_z(on_dt), None)
+
+
+def _apply_cached_crew(
+    flights: list[dict[str, Any]],
+    cached_flights: list[dict[str, Any]] | None,
+) -> None:
+    if not flights or not cached_flights:
+        return
+    cached_by_id: dict[str, dict[str, Any]] = {}
+    for cached in cached_flights:
+        flight_id = cached.get("flightId") or cached.get("id")
+        if flight_id is None:
+            continue
+        cached_by_id[str(flight_id)] = cached
+    if not cached_by_id:
+        return
+    for flight in flights:
+        flight_id = flight.get("flightId") or flight.get("id")
+        if flight_id is None:
+            continue
+        cached = cached_by_id.get(str(flight_id))
+        if not cached:
+            continue
+        for key in ("crewMembers", "picName", "sicName"):
+            if cached.get(key) and not flight.get(key):
+                flight[key] = cached.get(key)
+
+
 def _get_fl3xx_schedule(
     config: Fl3xxApiConfig | None = None,
     now: datetime | None = None,
@@ -1333,14 +1532,25 @@ def _get_fl3xx_schedule(
     current_time = now or datetime.now(timezone.utc)
     cache_entry = load_fl3xx_cache()
     last_fetch = _parse_iso8601(cache_entry.get("fetched_at")) if cache_entry else None
+    last_crew_fetch = _parse_iso8601(cache_entry.get("crew_fetched_at")) if cache_entry else None
     refresh_due = cache_entry is None or last_fetch is None or (
         current_time - last_fetch >= timedelta(minutes=FL3XX_REFRESH_MINUTES)
+    )
+    crew_refresh_due = last_crew_fetch is None or (
+        current_time - last_crew_fetch >= timedelta(minutes=FL3XX_CREW_REFRESH_MINUTES)
     )
 
     if refresh_due:
         flights, metadata = fetch_flights(config, now=current_time)
-        crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        crew_fetched_at = cache_entry.get("crew_fetched_at") if cache_entry else None
+        if crew_refresh_due:
+            crew_summary = enrich_flights_with_crew(config, flights, force=True)
+            crew_fetched_at = metadata.get("fetched_at")
+        else:
+            crew_summary = {"fetched": 0, "errors": [], "updated": False}
+            _apply_cached_crew(flights, cache_entry.get("flights") if cache_entry else None)
         digest = compute_flights_digest(flights)
+        _ingest_fl3xx_actuals(flights)
         changed = cache_entry is None or cache_entry.get("hash") != digest
         save_fl3xx_cache(
             flights,
@@ -1348,6 +1558,7 @@ def _get_fl3xx_schedule(
             from_date=metadata["from_date"],
             to_date=metadata["to_date"],
             fetched_at=metadata["fetched_at"],
+            crew_fetched_at=crew_fetched_at,
         )
         fetched_dt = _parse_iso8601(metadata.get("fetched_at"))
         next_refresh = None if fetched_dt is None else fetched_dt + timedelta(minutes=FL3XX_REFRESH_MINUTES)
@@ -1357,6 +1568,7 @@ def _get_fl3xx_schedule(
                 "changed": changed,
                 "used_cache": False,
                 "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "crew_refresh_interval_minutes": FL3XX_CREW_REFRESH_MINUTES,
                 "next_refresh_after": _to_iso8601_z(next_refresh),
                 "crew_fetch_count": crew_summary["fetched"],
                 "crew_fetch_errors": crew_summary["errors"],
@@ -1369,13 +1581,16 @@ def _get_fl3xx_schedule(
         # Should not happen because refresh_due would be True, but keep defensive fallback.
         flights, metadata = fetch_flights(config, now=current_time)
         crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        crew_fetched_at = metadata.get("fetched_at")
         digest = compute_flights_digest(flights)
+        _ingest_fl3xx_actuals(flights)
         save_fl3xx_cache(
             flights,
             digest=digest,
             from_date=metadata["from_date"],
             to_date=metadata["to_date"],
             fetched_at=metadata["fetched_at"],
+            crew_fetched_at=crew_fetched_at,
         )
         metadata.update(
             {
@@ -1383,6 +1598,7 @@ def _get_fl3xx_schedule(
                 "changed": True,
                 "used_cache": False,
                 "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+                "crew_refresh_interval_minutes": FL3XX_CREW_REFRESH_MINUTES,
                 "next_refresh_after": _to_iso8601_z(
                     _parse_iso8601(metadata.get("fetched_at")) + timedelta(minutes=FL3XX_REFRESH_MINUTES)
                     if metadata.get("fetched_at")
@@ -1396,10 +1612,16 @@ def _get_fl3xx_schedule(
         return flights, metadata
 
     flights = cache_entry.get("flights", [])
-    crew_summary = enrich_flights_with_crew(config, flights, force=False)
+    _ingest_fl3xx_actuals(flights)
+    crew_fetched_at = cache_entry.get("crew_fetched_at")
+    if crew_refresh_due:
+        crew_summary = enrich_flights_with_crew(config, flights, force=True)
+        crew_fetched_at = _to_iso8601_z(current_time)
+    else:
+        crew_summary = {"fetched": 0, "errors": [], "updated": False}
     digest = compute_flights_digest(flights) if flights else cache_entry.get("hash") or ""
 
-    if crew_summary["updated"] and flights:
+    if flights and (crew_summary["updated"] or crew_refresh_due):
         fetched_at = cache_entry.get("fetched_at") or _to_iso8601_z(last_fetch) or _to_iso8601_z(current_time)
         save_fl3xx_cache(
             flights,
@@ -1407,6 +1629,7 @@ def _get_fl3xx_schedule(
             from_date=str(cache_entry.get("from_date") or ""),
             to_date=str(cache_entry.get("to_date") or ""),
             fetched_at=fetched_at or _to_iso8601_z(current_time),
+            crew_fetched_at=crew_fetched_at,
         )
 
     next_refresh = None
@@ -1431,6 +1654,7 @@ def _get_fl3xx_schedule(
         "changed": False,
         "used_cache": True,
         "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+        "crew_refresh_interval_minutes": FL3XX_CREW_REFRESH_MINUTES,
         "next_refresh_after": _to_iso8601_z(next_refresh),
         "request_url": config.base_url,
         "request_params": cached_params,
@@ -1617,6 +1841,38 @@ def fmt_td(td):
     minutes = remainder // 60
     return f"{sign}{hours:02d}:{minutes:02d}"
 
+
+def _coerce_arrives_in_seconds(value: object) -> float:
+    """Return a numeric sort key for an ``Arrives In`` countdown string."""
+
+    if isinstance(value, pd.Timedelta):
+        return value.total_seconds()
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text == "—":
+            return float("inf")
+
+        negative = text.startswith("-")
+        if negative:
+            text = text[1:]
+
+        parts = text.split(":")
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            return float("inf")
+
+        seconds = hours * 3600 + minutes * 60
+        return -seconds if negative else seconds
+
+    return float("inf")
+
+
 def flight_time_hhmm_from_decimal(hours_decimal) -> str:
     try:
         mins = int(round(float(hours_decimal) * 60))
@@ -1628,6 +1884,21 @@ def classify_account(account_val: str) -> str:
     if isinstance(account_val, str) and "airsprint inc" in account_val.lower():
         return "OCS"
     return "Owner"
+
+def _infer_service_type(workflow: str | None, account: str | None) -> str:
+    workflow_text = str(workflow or "").strip().lower()
+    account_text = str(account or "").strip().lower()
+    if re.search(r"\bpos\b|position", workflow_text):
+        return "POS"
+    if classify_account(account or "") == "OCS":
+        return "OCS"
+    if re.search(r"\bpax\b|passenger", workflow_text):
+        return "PAX"
+    if re.search(r"\bpos\b|position", account_text):
+        return "POS"
+    if account_text:
+        return "PAX"
+    return "—"
 
 def type_badge(flight_type: str) -> str:
     return {"OCS": "🟢 OCS", "Owner": "🔵 Owner"}.get(flight_type, "⚪︎")
@@ -1672,6 +1943,11 @@ def _normalize_delay_reason(delay_reason: str | None) -> str:
     return reason if reason else "Unknown"
 
 
+def _format_notes_line(notes: str | None) -> str | None:
+    note = (notes or "").strip()
+    return f"Notes: {note}" if note else None
+
+
 def _build_delay_msg(
     tail: str,
     booking: str,
@@ -1679,6 +1955,7 @@ def _build_delay_msg(
     new_eta_hhmm: str,
     account: str | None = None,
     delay_reason: str | None = None,
+    notes: str | None = None,
 ) -> str:
     # Tail like "C-FASW" or "CFASW" → "CFASW"
     tail_disp = (tail or "").replace("-", "").upper()
@@ -1710,6 +1987,9 @@ def _build_delay_msg(
         f"UPDATED ETA: {eta_disp}",
         f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
     ]
+    notes_line = _format_notes_line(notes)
+    if notes_line:
+        lines.append(notes_line)
     return "\n".join(lines)
 
 def post_to_telus_team(team: str, text: str) -> tuple[bool, str]:
@@ -1735,6 +2015,7 @@ def notify_delay_chat(
     new_eta_hhmm: str,
     account: str | None = None,
     delay_reason: str | None = None,
+    notes: str | None = None,
 ):
     msg = _build_delay_msg(
         tail,
@@ -1743,6 +2024,7 @@ def notify_delay_chat(
         new_eta_hhmm,
         account=account,
         delay_reason=delay_reason,
+        notes=notes,
     )
     ok, err = post_to_telus_team(team, msg)
     if ok:
@@ -1821,6 +2103,44 @@ def utc_datetime_picker(label: str, key: str, initial_dt_utc: datetime | None = 
 
     return datetime.combine(st.session_state[date_key], st.session_state[time_obj_key]).replace(tzinfo=timezone.utc)
 
+def _airport_timezone(icao: str | None):
+    icao = (icao or "").strip().upper()
+    tzname = ICAO_TZ_MAP.get(icao)
+    if tzname:
+        try:
+            return pytz.timezone(tzname)
+        except Exception:
+            pass
+    return LOCAL_TZ
+
+def _local_departure_date_parts(ts: pd.Timestamp | datetime | None, icao: str | None) -> tuple[date | None, str, int]:
+    """Return (local_date, label, day_delta) for a departure timestamp at the airport's local time."""
+    if ts is None or pd.isna(ts):
+        return None, "Date pending", 999
+
+    tz = _airport_timezone(icao)
+    try:
+        ts_local = pd.Timestamp(ts)
+        if ts_local.tzinfo is None:
+            ts_local = ts_local.tz_localize(timezone.utc)
+        ts_local = ts_local.tz_convert(tz)
+    except Exception:
+        return None, "Date pending", 999
+
+    local_date = ts_local.date()
+    today_local = datetime.now(tz).date()
+    day_delta = (local_date - today_local).days
+    base_label = ts_local.strftime("%a %b %d")
+
+    if day_delta == 0:
+        label = f"Today · {base_label}"
+    elif day_delta == 1:
+        label = f"Tomorrow · {base_label}"
+    else:
+        label = base_label
+
+    return local_date, label, day_delta
+
 def local_hhmm(ts: pd.Timestamp | datetime | None, icao: str) -> str:
     """Return 'HHMM LT' at the airport's local time (fallback 'HHMM UTC')."""
     if ts is None or pd.isna(ts):
@@ -1895,6 +2215,10 @@ def compute_turnaround_windows(df: pd.DataFrame) -> pd.DataFrame:
                 "ArrivalUTC": pd.Timestamp(arr_ts),
                 "NextBooking": next_leg.get("Booking", ""),
                 "NextRoute": next_leg.get("Route", ""),
+                "NextFromICAO": next_leg.get("From_ICAO", ""),
+                "NextFromIATA": next_leg.get("From_IATA", ""),
+                "NextAccount": next_leg.get("Account", ""),
+                "NextWorkflow": next_leg.get("Workflow", ""),
                 "NextETDUTC": next_etd,
                 "TurnDelta": gap,
                 "TurnMinutes": int(round(gap.total_seconds() / 60.0)),
@@ -1907,12 +2231,181 @@ def compute_turnaround_windows(df: pd.DataFrame) -> pd.DataFrame:
     result = result.sort_values(["NextETDUTC", "Aircraft", "CurrentBooking"]).reset_index(drop=True)
     return result
 
+
+def _format_turn_timestamp(ts) -> str:
+    if ts is None or pd.isna(ts):
+        return "—"
+    try:
+        return pd.Timestamp(ts).strftime("%H:%MZ")
+    except Exception:
+        return "—"
+
+
+def build_downline_risk_map(
+    schedule_df: pd.DataFrame, required_turn_min: int
+) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+    """Return booking → risk info for carry-forward delays and a summary grouped by local date."""
+
+    if schedule_df is None or schedule_df.empty:
+        return {}, []
+
+    needed = {"Aircraft", "Booking", "ETD_UTC", "ETA_UTC"}
+    if not needed.issubset(schedule_df.columns):
+        return {}, []
+
+    work = schedule_df[
+        schedule_df["Aircraft"].notna()
+        & schedule_df["ETD_UTC"].notna()
+        & schedule_df["ETA_UTC"].notna()
+    ].copy()
+    if work.empty:
+        return {}, []
+
+    risk_map: dict[str, dict[str, object]] = {}
+    all_legs: list[dict[str, object]] = []
+    grouped_by_date: dict[date | None, dict[str, list[dict[str, object]]]] = {}
+    date_meta: dict[date | None, dict[str, object]] = {}
+
+    work = work.sort_values(["Aircraft", "ETD_UTC"])
+    required_turn_td = pd.Timedelta(minutes=int(required_turn_min))
+
+    for tail, group in work.groupby("Aircraft"):
+        group = group.sort_values("ETD_UTC").reset_index(drop=True)
+        if group.empty:
+            continue
+
+        prev_projected_arrival: pd.Timestamp | None = None
+        prev_arrival_label: str | None = None
+        prev_arrival_source: str | None = None
+        prev_booking: str | None = None
+        delay_source_booking: str | None = None
+
+        for _, row in group.iterrows():
+            sched_dep = pd.Timestamp(row.get("ETD_UTC"))
+            sched_arr = pd.Timestamp(row.get("ETA_UTC"))
+            block_time = sched_arr - sched_dep
+            if pd.isna(block_time):
+                continue
+
+            baseline_arrival, arrival_source = _select_arrival_baseline(row)
+            if baseline_arrival is None or pd.isna(baseline_arrival):
+                baseline_arrival = sched_arr
+                arrival_source = "Sched ETA"
+            baseline_arrival = pd.Timestamp(baseline_arrival)
+
+            if prev_projected_arrival is None:
+                projected_dep = sched_dep
+                projected_arrival = baseline_arrival
+            else:
+                earliest_dep = prev_projected_arrival + required_turn_td
+                projected_dep = max(sched_dep, earliest_dep)
+                projected_arrival = max(baseline_arrival, projected_dep + block_time)
+
+            delay_minutes = int(round((projected_dep - sched_dep).total_seconds() / 60.0))
+            booking = str(row.get("Booking") or "").strip()
+            if booking:
+                dep_actual = row.get("_DepActual_ts")
+                has_departed = dep_actual is not None and pd.notna(dep_actual)
+                if delay_minutes >= 5 and not has_departed:
+                    from_icao = str(row.get("From_ICAO") or "").strip().upper()
+                    local_date, date_label, day_delta = _local_departure_date_parts(sched_dep, from_icao)
+                    next_account = str(row.get("Account") or "").strip()
+                    next_workflow = str(row.get("Workflow") or "").strip()
+                    next_service_type = _infer_service_type(next_workflow, next_account)
+
+                    source_booking = delay_source_booking or prev_booking or ""
+                    info = {
+                        "aircraft": tail,
+                        "source_booking": source_booking,
+                        "next_booking": booking,
+                        "delay_minutes": delay_minutes,
+                        "arrival_label": prev_arrival_label or "—",
+                        "arrival_source": prev_arrival_source or "",
+                        "scheduled_etd_label": _format_turn_timestamp(sched_dep),
+                        "projected_etd_label": _format_turn_timestamp(projected_dep),
+                        "next_route": str(row.get("Route") or "").strip(),
+                        "next_service_type": next_service_type,
+                        "next_account": next_account,
+                        "next_etd_utc": sched_dep,
+                        "next_from_icao": from_icao,
+                        "next_local_date": local_date,
+                        "next_local_date_label": date_label,
+                        "next_local_day_delta": day_delta,
+                    }
+
+                    risk_map[booking] = info
+                    all_legs.append(info)
+
+                    tails_for_date = grouped_by_date.setdefault(local_date, {})
+                    tails_for_date.setdefault(tail, []).append(info)
+
+                    meta = date_meta.setdefault(
+                        local_date,
+                        {"date": local_date, "label": date_label, "day_delta": day_delta},
+                    )
+                    meta["day_delta"] = min(meta.get("day_delta", day_delta), day_delta)
+                    if not meta.get("label"):
+                        meta["label"] = date_label
+
+            if projected_arrival > sched_arr:
+                if delay_source_booking is None:
+                    if baseline_arrival > sched_arr:
+                        delay_source_booking = booking or delay_source_booking
+                    else:
+                        delay_source_booking = prev_booking or booking or delay_source_booking
+            else:
+                delay_source_booking = None
+
+            prev_projected_arrival = projected_arrival
+            prev_arrival_label = _format_turn_timestamp(projected_arrival)
+            prev_arrival_source = arrival_source
+            prev_booking = booking or prev_booking
+
+    if not all_legs:
+        return {}, []
+
+    summary: list[dict[str, object]] = []
+    for date_key, tails_map in grouped_by_date.items():
+        tail_entries: list[dict[str, object]] = []
+        for tail, legs in tails_map.items():
+            legs_sorted = sorted(
+                legs,
+                key=lambda leg: leg.get("next_etd_utc") if pd.notna(leg.get("next_etd_utc")) else pd.Timestamp.max,
+            )
+            tail_entries.append({"aircraft": tail, "legs": legs_sorted})
+
+        tail_entries.sort(key=lambda t: (t.get("aircraft") or "").upper())
+        meta = date_meta.get(date_key, {})
+        summary.append(
+            {
+                "date": date_key,
+                "label": meta.get("label") or "Upcoming departures",
+                "day_delta": meta.get("day_delta", 999),
+                "tails": tail_entries,
+                "collapsed": meta.get("day_delta", 999) > 0,
+            }
+        )
+
+    summary.sort(
+        key=lambda entry: (
+            entry.get("day_delta", 999) != 0,
+            entry.get("day_delta", 999),
+            entry.get("date") or datetime.max.date(),
+        )
+    )
+
+    return risk_map, summary
+
 def _late_early_label(delta_min: int) -> tuple[str, int]:
     # positive => late; negative => early
     label = "LATE" if delta_min >= 0 else "EARLY"
     return label, abs(int(delta_min))
 
-def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = None) -> str:
+def build_stateful_notify_message(
+    row: pd.Series,
+    delay_reason: str | None = None,
+    notes: str | None = None,
+) -> str:
     """
     Build a Telus BC message whose contents depend on flight state.
     Priority for reason if multiple cells are red:
@@ -1936,6 +2429,8 @@ def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = Non
     arr_var = (arr_ts - eta_est) if (pd.notna(arr_ts) and pd.notna(eta_est)) else None
 
     # Derive state & choose priority reason
+    notes_line = _format_notes_line(notes)
+
     if pd.notna(arr_var):  # ARRIVED late/early
         delta_min = int(round(arr_var.total_seconds()/60.0))
         label, mins = _late_early_label(delta_min)
@@ -1947,6 +2442,8 @@ def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = Non
             f"ARRIVAL: {arr_local}",
             f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
         ]
+        if notes_line:
+            lines.append(notes_line)
         return "\n".join(lines)
 
     if pd.notna(eta_var):  # ENROUTE with FA ETA variance
@@ -1960,6 +2457,8 @@ def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = Non
             f"UPDATED ETA: {eta_local}",
             f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
         ]
+        if notes_line:
+            lines.append(notes_line)
         return "\n".join(lines)
 
     if pd.notna(dep_var):  # TAKEOFF variance (usually already enroute)
@@ -1973,6 +2472,8 @@ def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = Non
             f"TAKEOFF (FA): {dep_local}",
             f"Delay Reason: {_normalize_delay_reason(delay_reason)}",
         ]
+        if notes_line:
+            lines.append(notes_line)
         return "\n".join(lines)
 
     # Fallback: keep current generic builder (should rarely hit with our panel filters)
@@ -1983,6 +2484,7 @@ def build_stateful_notify_message(row: pd.Series, delay_reason: str | None = Non
         new_eta_hhmm=get_local_eta_str(row),  # ETA LT or UTC
         account=account_val,
         delay_reason=delay_reason,
+        notes=notes,
     )
 
 
@@ -2563,15 +3065,18 @@ def select_leg_row_for_booking(booking: str | None, event: str, event_dt_utc: da
 # ============================
 # Controls
 # ============================
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    show_only_upcoming = st.checkbox("Show only upcoming departures", value=False)
-with c2:
-    limit_next_hours = st.checkbox("Limit to next X hours", value=False)
-with c3:
-    next_hours = st.number_input("X hours (for filter above)", min_value=1, max_value=48, value=6)
-
-delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, max_value=120, value=15)
+_delay_threshold_secret = _resolve_secret("DELAY_THRESHOLD_MIN", "DELAY_THRESHOLD_MINUTES")
+delay_threshold_min = 15
+if _delay_threshold_secret not in (None, ""):
+    try:
+        candidate = int(_delay_threshold_secret)
+    except (TypeError, ValueError):
+        st.warning("Invalid DELAY_THRESHOLD_MIN value; defaulting to 15 minutes.")
+    else:
+        if 1 <= candidate <= 120:
+            delay_threshold_min = candidate
+        else:
+            st.warning("DELAY_THRESHOLD_MIN must be between 1 and 120 minutes; defaulting to 15 minutes.")
 
 # --- ASP Callsign ↔ Tail mapping -------------------------------------------
 # You can optionally put this in Streamlit secrets as:
@@ -2580,7 +3085,7 @@ delay_threshold_min = st.number_input("Delay threshold (minutes)", min_value=1, 
 #   ASP503: CFASW
 #   ... (etc)
 #
-# If not in secrets, we display a text area to paste/edit the list at runtime.
+# If not in secrets, we fall back to the bundled defaults defined below.
 
 DEFAULT_ASP_MAP_TEXT = """\
 C-GASL\tASP816
@@ -2625,6 +3130,8 @@ C-GFSD\tASP655
 C-FSUP\tASP653
 C-FSRY\tASP565
 C-GFSJ\tASP501
+C-GIAS\tASP531
+C-FSVP\tASP716
 """
 
 def _parse_asp_map_text(txt: str) -> dict[str, str]:
@@ -2644,13 +3151,7 @@ _secrets_map = _read_streamlit_secret("ASP_MAP")
 if isinstance(_secrets_map, dict) and _secrets_map:
     ASP_MAP = {k.upper(): v.upper() for k, v in _secrets_map.items()}
 else:
-    with st.expander("Callsign ↔ Tail mapping (ASP → Tail)", expanded=False):
-        map_text = st.text_area(
-            "Paste mapping (Tail then ASP, separated by tab/space, one pair per line):",
-            value=DEFAULT_ASP_MAP_TEXT,
-            height=200,
-        )
-    ASP_MAP = _parse_asp_map_text(map_text)
+    ASP_MAP = _parse_asp_map_text(DEFAULT_ASP_MAP_TEXT)
 
 def tail_from_asp(text: str) -> list[str]:
     """
@@ -2912,28 +3413,6 @@ def apply_flightaware_webhook_updates(
 # ============================
 # Schedule data source selection
 # ============================
-DATA_SOURCE_OPTIONS = {
-    "fl3xx_api": "FL3XX API (automatic)",
-    "csv_upload": "Upload CSV",
-}
-
-with st.sidebar:
-    st.subheader("Schedule data source")
-    option_keys = list(DATA_SOURCE_OPTIONS.keys())
-    default_source = st.session_state.get("schedule_source_choice")
-    if default_source not in option_keys:
-        default_source = "fl3xx_api" if _has_fl3xx_credentials_configured() else "csv_upload"
-    if default_source not in option_keys:
-        default_source = option_keys[0]
-    default_index = option_keys.index(default_source)
-    selected_source: ScheduleSource = st.radio(
-        "Select source",
-        options=option_keys,
-        index=default_index,
-        format_func=lambda key: DATA_SOURCE_OPTIONS[key],
-        key="schedule_source_choice",
-    )
-
 btn_cols = st.columns([1, 3, 1])
 with btn_cols[0]:
     if st.button("Reset data & clear cache"):
@@ -2947,176 +3426,119 @@ with btn_cols[0]:
             conn.execute("DELETE FROM fl3xx_cache")
         st.rerun()
 
-schedule_payload = None
+schedule_payload: ScheduleData | None = None
 schedule_metadata: dict[str, Any] = {}
+fl3xx_flights_payload: list[dict[str, Any]] | None = None
 
-if selected_source == "csv_upload":
-    uploaded = st.file_uploader(
-        "Upload your daily flights CSV (FL3XX export)",
-        type=["csv"],
-        key="flights_csv",
+config = _build_fl3xx_config_from_secrets()
+if not config.auth_header and not config.api_token:
+    st.error(
+        "FL3XX API credentials are not configured. Provide an API token or a pre-built "
+        "authorization header to load the automatic schedule."
     )
-
-    # Priority order: upload → session → DB
-    csv_bytes: bytes | None = None
-    csv_name: str | None = None
-    csv_uploaded_at: str | None = None
-    if uploaded is not None:
-        csv_bytes = uploaded.getvalue()
-        csv_name = uploaded.name
-        csv_uploaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-        st.session_state["csv_bytes"] = csv_bytes
-        st.session_state["csv_name"] = csv_name
-        st.session_state["csv_uploaded_at"] = csv_uploaded_at
-        save_csv_to_db(csv_name, csv_bytes)
-    elif "csv_bytes" in st.session_state:
-        csv_bytes = st.session_state["csv_bytes"]
-        csv_name = st.session_state.get("csv_name", "flights.csv")
-        csv_uploaded_at = st.session_state.get("csv_uploaded_at", "")
-        st.caption(
-            f"Using cached CSV: **{csv_name}** (uploaded {csv_uploaded_at})"
+    st.info("Open the **Secrets diagnostics** panel above for a breakdown of detected FL3XX credentials.")
+    with st.expander("How to supply FL3XX credentials", expanded=True):
+        st.markdown(
+            "- Add a `[fl3xx_api]` section to Streamlit secrets with `api_token` or `auth_header`.\n"
+            "- Alternatively, set the `FL3XX_API_TOKEN` environment variable (App Runner secret).\n"
+            "- Optional: set `FL3XX_AUTH_HEADER_NAME` when the API expects a different header name."
         )
-    else:
-        name, content, uploaded_at = load_csv_from_db()
-        if content is not None:
-            csv_bytes = content
-            csv_name = name or "flights.csv"
-            csv_uploaded_at = uploaded_at or ""
-            st.session_state["csv_bytes"] = csv_bytes
-            st.session_state["csv_name"] = csv_name
-            st.session_state["csv_uploaded_at"] = csv_uploaded_at
-            st.caption(
-                f"Loaded CSV from storage: **{csv_name}** (uploaded {csv_uploaded_at})"
-            )
+        diag_rows = _fl3xx_secret_diagnostics_rows()
+        if diag_rows:
+            st.dataframe(pd.DataFrame(diag_rows), width="stretch")
         else:
-            st.info("Upload today’s FL3XX flights CSV to begin.")
-            st.stop()
-
-    if csv_bytes is None:
-        st.error("CSV data unavailable. Upload a file to continue.")
-        st.stop()
-
-    schedule_metadata = {
-        "filename": csv_name,
-        "uploaded_at": csv_uploaded_at,
-    }
-    schedule_payload = load_schedule(
-        "csv_upload",
-        csv_bytes=csv_bytes,
-        metadata=schedule_metadata,
-    )
-
-elif selected_source == "fl3xx_api":
-    config = _build_fl3xx_config_from_secrets()
-    if not config.auth_header and not config.api_token:
-        st.error(
-            "FL3XX API credentials are not configured. Provide an API token or a pre-built "
-            "authorization header before selecting the automatic schedule source."
-        )
-        st.info("Open the **Secrets diagnostics** panel above for a breakdown of detected FL3XX credentials.")
-        with st.expander("How to supply FL3XX credentials", expanded=True):
-            st.markdown(
-                "- Add a `[fl3xx_api]` section to Streamlit secrets with `api_token` or `auth_header`.\n"
-                "- Alternatively, set the `FL3XX_API_TOKEN` environment variable (App Runner secret).\n"
-                "- Optional: set `FL3XX_AUTH_HEADER_NAME` when the API expects a different header name."
-            )
-            diag_rows = _fl3xx_secret_diagnostics_rows()
-            if diag_rows:
-                st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
-            else:
-                st.caption("No FL3XX credential hints detected in secrets or environment variables.")
-        st.stop()
-
-    cache_entry = load_fl3xx_cache()
-
-    def _render_fl3xx_status(metadata: dict) -> None:
-        status_bits = [
-            "FL3XX flights fetched at",
-            (metadata.get("fetched_at") or "unknown time"),
-            "UTC.",
-        ]
-        if metadata.get("used_cache"):
-            status_bits.append("Using cached schedule data.")
-        else:
-            status_bits.append("Latest API response loaded.")
-        if metadata.get("changed"):
-            status_bits.append("Changes detected since previous fetch.")
-        else:
-            status_bits.append("No schedule changes detected.")
-        next_refresh = metadata.get("next_refresh_after")
-        if next_refresh:
-            status_bits.append(f"Next refresh after {next_refresh}.")
-
-        crew_fetch_count = metadata.get("crew_fetch_count")
-        if crew_fetch_count is not None:
-            status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
-
-        crew_updated = metadata.get("crew_updated")
-        if crew_updated is True:
-            status_bits.append("Crew roster updated.")
-        elif crew_updated is False:
-            status_bits.append("Crew roster unchanged.")
-
-        crew_errors = metadata.get("crew_fetch_errors")
-        if crew_errors:
-            status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
-        elif crew_errors is not None:
-            status_bits.append("No crew fetch errors.")
-
-        st.caption(" ".join(status_bits))
-
-        if crew_errors:
-            st.warning(
-                "One or more crew fetch errors occurred while refreshing crew data."
-            )
-            with st.expander("Crew fetch error details", expanded=False):
-                for error in crew_errors:
-                    st.write(error)
-    try:
-        flights, api_metadata = _get_fl3xx_schedule(config=config)
-        schedule_metadata = api_metadata
-        schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
-        _render_fl3xx_status(api_metadata)
-    except Exception as exc:
-        if cache_entry:
-            st.warning(
-                "Unable to refresh FL3XX flights. Using cached data fetched at "
-                f"{cache_entry.get('fetched_at') or 'unknown time'} UTC.\n{exc}"
-            )
-            fallback_metadata = {
-                "from_date": cache_entry.get("from_date"),
-                "to_date": cache_entry.get("to_date"),
-                "time_zone": "UTC",
-                "value": "ALL",
-                "fetched_at": cache_entry.get("fetched_at"),
-                "hash": cache_entry.get("hash"),
-                "used_cache": True,
-                "changed": False,
-                "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
-                "next_refresh_after": None,
-                "request_url": config.base_url,
-                "request_params": {
-                    "from": cache_entry.get("from_date"),
-                    "to": cache_entry.get("to_date"),
-                    "timeZone": "UTC",
-                    "value": "ALL",
-                    **config.extra_params,
-                },
-                "crew_fetch_count": 0,
-                "crew_fetch_errors": [],
-                "crew_updated": False,
-            }
-            flights = cache_entry.get("flights", [])
-            schedule_metadata = fallback_metadata
-            schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
-            _render_fl3xx_status(fallback_metadata)
-        else:
-            st.error(f"Unable to load FL3XX flights: {exc}")
-            st.stop()
-
-else:
-    st.error(f"Unsupported schedule source: {selected_source}")
+            st.caption("No FL3XX credential hints detected in secrets or environment variables.")
     st.stop()
+
+cache_entry = load_fl3xx_cache()
+
+def _render_fl3xx_status(metadata: dict) -> None:
+    status_bits = [
+        "FL3XX flights fetched at",
+        (metadata.get("fetched_at") or "unknown time"),
+        "UTC.",
+    ]
+    if metadata.get("used_cache"):
+        status_bits.append("Using cached schedule data.")
+    else:
+        status_bits.append("Latest API response loaded.")
+    if metadata.get("changed"):
+        status_bits.append("Changes detected since previous fetch.")
+    else:
+        status_bits.append("No schedule changes detected.")
+    next_refresh = metadata.get("next_refresh_after")
+    if next_refresh:
+        status_bits.append(f"Next refresh after {next_refresh}.")
+
+    crew_fetch_count = metadata.get("crew_fetch_count")
+    if crew_fetch_count is not None:
+        status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
+
+    crew_updated = metadata.get("crew_updated")
+    if crew_updated is True:
+        status_bits.append("Crew roster updated.")
+    elif crew_updated is False:
+        status_bits.append("Crew roster unchanged.")
+
+    crew_errors = metadata.get("crew_fetch_errors")
+    if crew_errors:
+        status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
+    elif crew_errors is not None:
+        status_bits.append("No crew fetch errors.")
+
+    st.caption(" ".join(status_bits))
+
+    if crew_errors:
+        st.warning(
+            "One or more crew fetch errors occurred while refreshing crew data."
+        )
+        with st.expander("Crew fetch error details", expanded=False):
+            for error in crew_errors:
+                st.write(error)
+
+try:
+    flights, api_metadata = _get_fl3xx_schedule(config=config)
+    fl3xx_flights_payload = flights
+    schedule_metadata = api_metadata
+    schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **api_metadata})
+    _render_fl3xx_status(api_metadata)
+except Exception as exc:
+    if cache_entry:
+        st.warning(
+            "Unable to refresh FL3XX flights. Using cached data fetched at "
+            f"{cache_entry.get('fetched_at') or 'unknown time'} UTC.\n{exc}"
+        )
+        fallback_metadata = {
+            "from_date": cache_entry.get("from_date"),
+            "to_date": cache_entry.get("to_date"),
+            "time_zone": "UTC",
+            "value": "ALL",
+            "fetched_at": cache_entry.get("fetched_at"),
+            "hash": cache_entry.get("hash"),
+            "used_cache": True,
+            "changed": False,
+            "refresh_interval_minutes": FL3XX_REFRESH_MINUTES,
+            "next_refresh_after": None,
+            "request_url": config.base_url,
+            "request_params": {
+                "from": cache_entry.get("from_date"),
+                "to": cache_entry.get("to_date"),
+                "timeZone": "UTC",
+                "value": "ALL",
+                **config.extra_params,
+            },
+            "crew_fetch_count": 0,
+            "crew_fetch_errors": [],
+            "crew_updated": False,
+        }
+        flights = cache_entry.get("flights", [])
+        fl3xx_flights_payload = flights
+        schedule_metadata = fallback_metadata
+        schedule_payload = load_schedule("fl3xx_api", metadata={"flights": flights, **fallback_metadata})
+        _render_fl3xx_status(fallback_metadata)
+    else:
+        st.error(f"Unable to load FL3XX flights: {exc}")
+        st.stop()
 
 if schedule_payload is None:
     st.error("Schedule data unavailable.")
@@ -3150,6 +3572,9 @@ if missing:
 df = df_raw.copy()
 df["Booking"] = df["Booking"].fillna("").astype(str).str.strip()
 df["Aircraft"] = df["Aircraft"].fillna("").astype(str).str.strip()
+df["_OffBlock_UTC"] = pd.NaT
+df["_OnBlock_UTC"] = pd.NaT
+df["_FlightStatusRaw"] = ""
 _tail_override_map = load_tail_overrides()
 if _tail_override_map:
     df["Aircraft"] = [
@@ -3193,8 +3618,66 @@ if not df.empty:
             df["Booking"], booking_order, booking_sizes, df.index
         )
     ]
+
+    if fl3xx_flights_payload:
+        actual_map: dict[str, list[dict[str, str | None]]] = defaultdict(list)
+        for flight in fl3xx_flights_payload:
+            if not isinstance(flight, dict):
+                continue
+            booking_key = (
+                flight.get("bookingIdentifier")
+                or flight.get("bookingReference")
+                or flight.get("quoteId")
+                or ""
+            )
+            booking_str = str(booking_key)
+            off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
+            on_iso = flight.get("_OnBlock_UTC") or flight.get("realDateIN") or flight.get("realDateIn")
+            status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
+            actual_map[booking_str].append({
+                "off": off_iso,
+                "on": on_iso,
+                "status": status_val,
+            })
+
+        booking_seq = defaultdict(int)
+        off_vals: list[str | None] = []
+        on_vals: list[str | None] = []
+        status_vals: list[str] = []
+
+        for booking in df["Booking"]:
+            seq_idx = booking_seq[booking]
+            booking_seq[booking] += 1
+            entries = actual_map.get(booking, [])
+            off_iso = None
+            on_iso = None
+            status_val = ""
+            if seq_idx < len(entries):
+                payload = entries[seq_idx]
+                off_iso = payload.get("off")
+                on_iso = payload.get("on")
+                status_val = (payload.get("status") or "").strip()
+            off_vals.append(off_iso)
+            on_vals.append(on_iso)
+            status_vals.append(status_val)
+
+        df["_OffBlock_UTC"] = pd.to_datetime(off_vals, utc=True, errors="coerce")
+        df["_OnBlock_UTC"] = pd.to_datetime(on_vals, utc=True, errors="coerce")
+        df["_FlightStatusRaw"] = status_vals
 else:
     df["_LegKey"] = pd.Series(dtype=str, index=df.index)
+
+if "_OffBlock_UTC" in df.columns:
+    df["_OffBlock_UTC"] = pd.to_datetime(df["_OffBlock_UTC"], utc=True, errors="coerce")
+else:
+    df["_OffBlock_UTC"] = pd.to_datetime(pd.Series(pd.NaT, index=df.index), utc=True, errors="coerce")
+
+if "_OnBlock_UTC" in df.columns:
+    df["_OnBlock_UTC"] = pd.to_datetime(df["_OnBlock_UTC"], utc=True, errors="coerce")
+else:
+    df["_OnBlock_UTC"] = pd.to_datetime(pd.Series(pd.NaT, index=df.index), utc=True, errors="coerce")
+
+df["_FlightStatusRaw"] = df.get("_FlightStatusRaw", pd.Series("", index=df.index)).fillna("").astype(str)
 
 if _tail_override_map and not df.empty:
     df["Aircraft"] = [
@@ -3234,40 +3717,7 @@ else:
         f"FlightAware webhook integration unavailable: {webhook_diag_msg}"
     )
 
-default_use_webhook = st.session_state.get("use_flightaware_webhook")
-if default_use_webhook is None:
-    default_use_webhook = bool(webhook_config)
-
-webhook_debug_default = st.session_state.get("show_webhook_debug")
-if webhook_debug_default is None:
-    webhook_debug_default = False
-
-use_webhook_alerts = st.checkbox(
-    "Use FlightAware webhook alerts (DynamoDB)",
-    value=bool(default_use_webhook),
-    help=(
-        "Apply recent OOOI webhook events stored in DynamoDB. "
-        "Configure AWS credentials and the DynamoDB table in Streamlit secrets."
-    ),
-)
-st.session_state["use_flightaware_webhook"] = use_webhook_alerts
-
-show_webhook_debug = st.checkbox(
-    "Show FlightAware webhook diagnostics",
-    value=bool(webhook_debug_default),
-    help=(
-        "Display connection status, record counts, and recent webhook payloads "
-        "returned from DynamoDB."
-    ),
-)
-st.session_state["show_webhook_debug"] = show_webhook_debug
-
-if use_webhook_alerts and not webhook_config:
-    message = webhook_diag_msg or "Missing DynamoDB configuration for webhook alerts."
-    webhook_status_placeholder.error(
-        "FlightAware webhook integration is not configured: "
-        f"{message}"
-    )
+use_webhook_alerts = bool(webhook_config)
 
 # ============================
 # Email-driven status + enrich FA/EDCT times
@@ -3279,24 +3729,17 @@ if st.session_state.get("status_updates"):
         events_map.setdefault(key, {})[et] = upd
 
 webhook_records: list[dict[str, Any]] = []
-webhook_fetch_error: str | None = None
-webhook_cache_entry: Mapping[str, Any] | None = None
 applied_webhook = 0
 
-should_fetch_webhook = bool(webhook_config) and (use_webhook_alerts or show_webhook_debug)
+should_fetch_webhook = use_webhook_alerts
 if should_fetch_webhook:
     webhook_idents = collect_active_webhook_idents(df_clean)
     if webhook_idents:
         try:
             webhook_records = fetch_flightaware_webhook_events(webhook_idents, webhook_config)
-            cache_dict = st.session_state.get("_webhook_alert_cache")
-            if isinstance(cache_dict, Mapping):
-                cache_key = (tuple(sorted(webhook_idents)), webhook_config.get("table_name"))
-                webhook_cache_entry = cache_dict.get(cache_key)
             if use_webhook_alerts:
                 applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
         except Exception as exc:
-            webhook_fetch_error = str(exc)
             if use_webhook_alerts:
                 webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
         else:
@@ -3313,47 +3756,6 @@ if should_fetch_webhook:
         if use_webhook_alerts:
             webhook_status_placeholder.caption(
                 "FlightAware webhook has no mapped ASP callsigns for the current schedule."
-            )
-
-if show_webhook_debug:
-    debug_container = st.container()
-    if webhook_fetch_error:
-        debug_container.error(f"Webhook diagnostics error: {webhook_fetch_error}")
-    elif not should_fetch_webhook:
-        debug_container.info("Enable webhook alerts to run diagnostics.")
-    else:
-        fetched_at_display = None
-        if webhook_cache_entry and isinstance(webhook_cache_entry, Mapping):
-            fetched_at = webhook_cache_entry.get("fetched_at")
-            if isinstance(fetched_at, datetime):
-                fetched_at_display = fetched_at.astimezone(timezone.utc).isoformat()
-
-        if fetched_at_display:
-            debug_container.caption(f"Last fetch (UTC): {fetched_at_display}")
-
-        if webhook_records:
-            per_ident: dict[str, int] = {}
-            for record in webhook_records:
-                ident = str(record.get("ident") or "").strip() or "(missing ident)"
-                per_ident[ident] = per_ident.get(ident, 0) + 1
-
-            summary_rows = sorted(per_ident.items(), key=lambda item: item[0])
-            debug_container.write(
-                {
-                    "records_returned": len(webhook_records),
-                    "idents_covered": summary_rows,
-                }
-            )
-
-            debug_frame = pd.DataFrame(webhook_records)
-            if not debug_frame.empty:
-                for col in ("_event_dt", "received_at", "event_time", "event_ts", "source_ts"):
-                    if col in debug_frame.columns:
-                        debug_frame[col] = pd.to_datetime(debug_frame[col], errors="coerce")
-                debug_container.dataframe(debug_frame.head(25))
-        else:
-            debug_container.info(
-                "DynamoDB returned zero webhook records for the current schedule/filter criteria."
             )
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
@@ -3424,14 +3826,27 @@ def compute_status_row(leg_key, booking, dep_utc, eta_utc) -> str:
             return False
         return (scheduled - actual) > thr
 
+    def _format_arrival_delta(actual, scheduled):
+        if actual is None or scheduled is None:
+            return None
+        minutes = int(abs(actual - scheduled).total_seconds() // 60)
+        unit = "min" if minutes == 1 else "mins"
+        return f"{minutes} {unit}"
+
     if has_div:
         return rec["Diversion"].get("status", "🔷 DIVERTED")
 
     if has_arr:
         if eta_sched and arr_actual:
             if _is_late(arr_actual, eta_sched):
+                delta = _format_arrival_delta(arr_actual, eta_sched)
+                if delta:
+                    return f"🔴 Arrived ({delta} delayed)"
                 return "🔴 Arrived (Delay)"
             if _is_early(arr_actual, eta_sched):
+                delta = _format_arrival_delta(arr_actual, eta_sched)
+                if delta:
+                    return f"🟢 Arrived ({delta} early)"
                 return "🟢 Arrived (Early)"
             if _within_threshold(arr_actual, eta_sched):
                 return "🟣 Arrived (On Sched)"
@@ -3611,6 +4026,8 @@ has_dep_series, has_arr_series = _compute_event_presence(df)
 turnaround_df = compute_turnaround_windows(df)
 
 turn_info_map = {}
+downline_risk_map: dict[str, dict[str, object]] = {}
+downline_risk_summary: list[dict[str, object]] = []
 if not turnaround_df.empty:
     for _, turn_row in turnaround_df.iterrows():
         booking_val = turn_row.get("CurrentBooking")
@@ -3638,9 +4055,35 @@ if not turnaround_df.empty:
             "minutes": minutes_int,
         }
 
+downline_risk_map, downline_risk_summary = build_downline_risk_map(
+    df, TURNAROUND_MIN_GAP_MINUTES
+)
+
 df["_TurnMinutes"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("minutes"))
 df["Turn Time"] = df["Booking"].map(lambda b: turn_info_map.get(b, {}).get("text", "—"))
 df["Turn Time"] = df["Turn Time"].fillna("—")
+
+df["_DownlineRisk"] = df["Booking"].map(
+    lambda b: bool(downline_risk_map.get(str(b).strip() or ""))
+)
+
+
+def _format_downline_risk_text(booking_val: str) -> str:
+    payload = downline_risk_map.get(str(booking_val).strip() or "")
+    if not payload:
+        return "—"
+
+    minutes = payload.get("delay_minutes")
+    minutes_txt = f"+{int(minutes)}m" if minutes is not None and not pd.isna(minutes) else "+0m"
+    source_booking = payload.get("source_booking") or "previous leg"
+    window_txt = ""
+    if payload.get("arrival_label") != "—" or payload.get("projected_etd_label") != "—":
+        window_txt = f" ({payload.get('arrival_label')} → {payload.get('projected_etd_label')})"
+
+    return f"Carry-forward delay from {source_booking}: {minutes_txt}{window_txt}".strip()
+
+
+df["Downline Risk"] = df["Booking"].map(_format_downline_risk_text)
 
 df.loc[has_dep_series, "Departs In"] = "—"
 df.loc[has_arr_series, "Arrives In"] = "—"
@@ -3668,43 +4111,40 @@ if airports_sel:
 if workflows_sel:
     df = df[df["Workflow"].isin(workflows_sel)]
 
-# Limit to upcoming legs / next-hour window if requested
-if show_only_upcoming or limit_next_hours:
-    etd_series = pd.to_datetime(df["ETD_UTC"], errors="coerce", utc=True)
-    df["ETD_UTC"] = etd_series
+st.caption("Limit the view to the operational window while retaining legs that already departed.")
+window_hours = st.slider(
+    "Show flights departing within the next (hours)",
+    min_value=1,
+    max_value=48,
+    value=3,
+    step=1,
+)
 
-    visibility_mask = pd.Series(True, index=df.index)
-
-    if show_only_upcoming:
-        has_dep_for_filter = has_dep_series.reindex(df.index).fillna(False)
-        visibility_mask &= ~has_dep_for_filter
-
-    if limit_next_hours:
-        window_start = datetime.now(timezone.utc)
-        window_end = window_start + timedelta(hours=int(next_hours))
-        window_mask = etd_series.notna() & etd_series.between(window_start, window_end)
-        if not show_only_upcoming:
-            # Keep legs without an ETD only when we're not forcing "upcoming" only
-            window_mask = window_mask | etd_series.isna()
-        visibility_mask &= window_mask
-
-    df = df[visibility_mask].copy()
+if window_hours and not df.empty:
+    etd_series = pd.to_datetime(df.get("ETD_UTC"), errors="coerce", utc=True)
+    cutoff_future = now_utc + pd.Timedelta(hours=int(window_hours))
+    upcoming_mask = etd_series.notna() & (etd_series <= cutoff_future)
+    keep_mask = has_dep_series | upcoming_mask
+    df = df[keep_mask].copy()
 
 # ============================
 # Post-arrival visibility controls
 # ============================
 v1, v2 = st.columns([1, 1])
 with v1:
-    highlight_landed_legs = st.checkbox("Highlight landed legs", value=True)
+    # highlight toggle removed; green overlay always applied
+    auto_hide_on_block = st.checkbox("Auto-hide on block", value=True)
 with v2:
-    auto_hide_landed = st.checkbox("Auto-hide landed", value=True)
-hide_hours = st.number_input("Hide landed after (hours)", min_value=1, max_value=24, value=1, step=1)
+    hide_hours = st.number_input(
+        "Hide on block after (hours)", min_value=1, max_value=24, value=1, step=1
+    )
 
-# Hide legs that landed more than N hours ago (if enabled)
+# Hide legs that have been on block more than N hours ago (if enabled)
 now_utc = datetime.now(timezone.utc)
-if auto_hide_landed:
+if auto_hide_on_block:
     cutoff_hide = now_utc - pd.Timedelta(hours=int(hide_hours))
-    df = df[~(df["_ArrActual_ts"].notna() & (df["_ArrActual_ts"] < cutoff_hide))].copy()
+    on_block_series = pd.to_datetime(df.get("_OnBlock_UTC"), errors="coerce", utc=True)
+    df = df[~(on_block_series.notna() & (on_block_series < cutoff_hide))].copy()
 
 # (Re)compute these after filtering so masks align cleanly
 has_dep_series, has_arr_series = _compute_event_presence(df)
@@ -3717,7 +4157,6 @@ df.loc[has_arr_series, "Arrives In"] = "—"
 # ============================
 # Keep your default chronological sort first
 df = df.sort_values(by=["ETD_UTC", "ETA_UTC"], ascending=[True, True]).copy()
-df["_orig_order"] = range(len(df))  # for stable ordering when Delayed View is off
 
 delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))   # e.g., 15m
 row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # ≥30m
@@ -3752,48 +4191,42 @@ cell_dep = dep_delay.notna()       & (dep_delay       > delay_thr_td)
 cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
 cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
-# ---- New: Delayed View controls next to the title ----
-head_toggle_col, head_title_col = st.columns([1.6, 8.4])
-with head_toggle_col:
-    delayed_view = st.checkbox("Delayed View", value=False, help="Show RED (≥30m) first, then YELLOW (15–29m).")
+st.subheader("Schedule")
+option_cols = st.columns([1, 1, 1])
+with option_cols[0]:
     show_account_column = st.checkbox(
         "Show Account column",
         value=False,
-        help="Display the Account value from the uploaded CSV in the schedule table.",
+        help="Display the Account value from the active schedule in the table.",
     )
+with option_cols[1]:
     show_sic_column = st.checkbox(
         "Show SIC column",
         value=False,
-        help="Display the SIC value from the uploaded CSV in the schedule table.",
+        help="Display the SIC value from the active schedule in the table.",
     )
+with option_cols[2]:
     show_workflow_column = st.checkbox(
         "Show Workflow column",
         value=False,
-        help="Display the Workflow value from the uploaded CSV in the schedule table.",
+        help="Display the Workflow value from the active schedule in the table.",
     )
-with head_title_col:
-    st.subheader("Schedule")
+
+# Placeholder so the Enhanced Flight Following section renders ahead of the main table
+enhanced_ff_container = st.container()
 
 # Compute a delay priority (2 = red, 1 = yellow, 0 = normal)
 delay_priority = (row_red.astype(int) * 2 + row_yellow.astype(int))
 df["_DelayPriority"] = delay_priority
 
-# If Delayed View is on: optionally filter, then sort by priority
-df_view = df.copy()
-if delayed_view:
-    df_view = df_view[df_view["_DelayPriority"] > 0].copy()
-    # Keep chronological order within each priority by using the earlier sort's order
-    df_view = df_view.sort_values(
-        by=["_DelayPriority", "_orig_order"],
-        ascending=[False, True]
-    )
-
 # ---- Build a view that keeps REAL datetimes for sorting, but shows time-only ----
 display_cols = [
     "TypeBadge", "Booking", "Aircraft", "Aircraft Type", "Route",
-    "Off-Block (Sched)", "Takeoff (FA)", "ETA (FA)",
-    "On-Block (Sched)", "Landing (FA)",
-    "Departs In", "Arrives In", "Turn Time",
+    "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
+    "Off-Block (Sched)", "ETA (FA)",
+    "On-Block (Sched)",
+    "Early/Late?",
+    "Departs In", "Arrives In", "Turn Time", "Downline Risk",
     "PIC", "SIC", "Workflow", "Status"
 ]
 
@@ -3810,16 +4243,13 @@ if not show_sic_column:
 if not show_workflow_column:
     display_cols = [c for c in display_cols if c != "Workflow"]
 
-view_df = (df_view if delayed_view else df).copy()
+view_df = df.copy()
 
 if show_account_column and "Account" in view_df.columns:
     view_df["Account"] = view_df["Account"].map(format_account_value)
 
 view_df["_GapRow"] = False
-if not delayed_view:
-    view_df = insert_gap_notice_rows(view_df)
-else:
-    view_df = view_df.reset_index(drop=True)
+view_df = insert_gap_notice_rows(view_df)
 
 # Ensure gap flag remains boolean after any transforms
 if "_GapRow" in view_df.columns:
@@ -3831,9 +4261,27 @@ if "_RouteMismatch" in view_df.columns:
 if "_RouteMismatchMsg" in view_df.columns:
     view_df["_RouteMismatchMsg"] = view_df["_RouteMismatchMsg"].fillna("")
 
+if "_DownlineRisk" in view_df.columns:
+    view_df["_DownlineRisk"] = view_df["_DownlineRisk"].fillna(False).astype(bool)
+
 # Keep underlying dtypes as datetimes for sorting:
 view_df["Off-Block (Sched)"] = view_df["ETD_UTC"]          # datetime
 view_df["On-Block (Sched)"]  = view_df["ETA_UTC"]          # datetime
+
+
+def _early_late_text(row) -> str:
+    eta_fa = row.get("_ETA_FA_ts")
+    sched = row.get("ETA_UTC")
+    if pd.isna(eta_fa) or pd.isna(sched):
+        return "—"
+    delta_minutes = int(round((eta_fa - sched).total_seconds() / 60.0))
+    if delta_minutes == 0:
+        return "On time"
+    descriptor = "delay" if delta_minutes > 0 else "early"
+    return f"{abs(delta_minutes)} min {descriptor}"
+
+
+view_df["Early/Late?"] = view_df.apply(_early_late_text, axis=1)
 view_df["ETA (FA)"]          = view_df["_ETA_FA_ts"]       # datetime or NaT
 view_df["Landing (FA)"]      = view_df["_ArrActual_ts"]   # datetime or NaT
 
@@ -3856,10 +4304,35 @@ def _landing_display(row):
 view_df["Takeoff (FA)"] = view_df.apply(_takeoff_display, axis=1)
 view_df["Landing (FA)"] = view_df.apply(_landing_display, axis=1)
 
+view_df["Off Block (UTC)"] = view_df["_OffBlock_UTC"]
+view_df["Takeoff (UTC)"]   = view_df["_DepActual_ts"]
+view_df["Landing (UTC)"]   = view_df["_ArrActual_ts"]
+view_df["On Block (UTC)"]  = view_df["_OnBlock_UTC"]
+
+def _stage_badge(row):
+    off_block = row.get("_OffBlock_UTC")
+    if pd.isna(off_block):
+        edct_ts = row.get("_EDCT_ts")
+        if pd.notna(edct_ts):
+            return "🟪 EDCT · " + edct_ts.strftime("%H:%MZ")
+
+    badges: list[str] = []
+    if pd.notna(off_block):
+        badges.append("🟡 Off")
+    if pd.notna(row.get("_DepActual_ts")):
+        badges.append("🟢 Airborne")
+    if pd.notna(row.get("_ArrActual_ts")):
+        badges.append("🟢 Landed")
+    if pd.notna(row.get("_OnBlock_UTC")):
+        badges.append("🟣 On")
+    return " → ".join(badges) if badges else "—"
+
+view_df["Stage Progress"] = view_df.apply(_stage_badge, axis=1)
+
 df_display = view_df[display_cols].copy()
 
 # ----------------- Notify helpers used by buttons -----------------
-local_tz = tzlocal.get_localzone()
+local_tz = LOCAL_TZ
 
 def _default_minutes_delta(row) -> int:
     if pd.notna(row["_ETA_FA_ts"]) and pd.notna(row["ETA_UTC"]):
@@ -4012,6 +4485,13 @@ cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 # Landed-leg green overlay
 row_green = _base["_ArrActual_ts"].notna()
 
+# Flash landed legs that have not yet gone on blocks for 15+ minutes
+landed_overdue = (
+    _base["_ArrActual_ts"].notna()
+    & _base["_OnBlock_UTC"].isna()
+    & ((now_utc - _base["_ArrActual_ts"]) >= pd.Timedelta(minutes=15))
+)
+
 # EDCT purple (until true departure is received)
 idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
 
@@ -4030,9 +4510,12 @@ def _style_ops(x: pd.DataFrame):
     styles.loc[row_red.reindex(x.index,    fill_value=False), :] = row_r_css
 
     # 2) GREEN overlay for landed legs (applied after Y/R so it wins at row level)
-    if 'highlight_landed_legs' in globals() and highlight_landed_legs:
-        row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
-        styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
+    row_g_css = "background-color: rgba(76, 175, 80, 0.18); border-left: 6px solid #4caf50;"
+    styles.loc[row_green.reindex(x.index, fill_value=False), :] = row_g_css
+
+    # 2b) FLASHING amber overlay for landed legs missing block-on times
+    flash_css = "background-color: rgba(255, 193, 7, 0.18); border-left: 6px solid #f59e0b; animation: landed-on-alert 1.15s ease-in-out infinite;"
+    styles.loc[landed_overdue.reindex(x.index, fill_value=False), :] = flash_css
 
     # 3) Pink overlay for planned inactivity gaps
     if "_GapRow" in _base.columns:
@@ -4068,23 +4551,43 @@ def _style_ops(x: pd.DataFrame):
                 styles.loc[mask_stage, "Landing (FA)"].fillna("") + stage_css
             )
 
-    styles.loc[mask_dep, "Takeoff (FA)"] = (
-        styles.loc[mask_dep, "Takeoff (FA)"].fillna("") + cell_css
-    )
-    styles.loc[mask_eta, "ETA (FA)"] = (
-        styles.loc[mask_eta, "ETA (FA)"].fillna("") + cell_css
-    )
-    styles.loc[mask_arr, "Landing (FA)"] = (
-        styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
-    )
+    if "Takeoff (FA)" in x.columns:
+        styles.loc[mask_dep, "Takeoff (FA)"] = (
+            styles.loc[mask_dep, "Takeoff (FA)"].fillna("") + cell_css
+        )
+    if "ETA (FA)" in x.columns:
+        styles.loc[mask_eta, "ETA (FA)"] = (
+            styles.loc[mask_eta, "ETA (FA)"].fillna("") + cell_css
+        )
+    if "Landing (FA)" in x.columns:
+        styles.loc[mask_arr, "Landing (FA)"] = (
+            styles.loc[mask_arr, "Landing (FA)"].fillna("") + cell_css
+        )
+
+    if "Early/Late?" in x.columns:
+        early_late_delta = eta_fa_vs_sched.reindex(x.index)
+        threshold = pd.Timedelta(minutes=15)
+        early_late_red = early_late_delta.notna() & (early_late_delta.abs() >= threshold)
+        early_late_green = early_late_delta.notna() & (early_late_delta.abs() < threshold)
+        early_late_red_css = "color: #dc2626; font-weight: 600;"
+        early_late_green_css = "color: #16a34a; font-weight: 600;"
+        styles.loc[early_late_green, "Early/Late?"] = (
+            styles.loc[early_late_green, "Early/Late?"].fillna("") + early_late_green_css
+        )
+        styles.loc[early_late_red, "Early/Late?"] = (
+            styles.loc[early_late_red, "Early/Late?"].fillna("") + early_late_red_css
+        )
 
     if "Status" in x.columns:
         delay_statuses = {
-            "🔴 Arrived (Delay)",
             "🟠 Delayed Arrival",
             "🔴 DELAY",
         }
-        mask_status = _base["Status"].isin(delay_statuses).reindex(x.index, fill_value=False)
+        status_series = _base["Status"].astype(str)
+        mask_status = (
+            status_series.isin(delay_statuses)
+            | status_series.str.contains("delayed", case=False, na=False)
+        ).reindex(x.index, fill_value=False)
         styles.loc[mask_status, "Status"] = (
             styles.loc[mask_status, "Status"].fillna("") + cell_css
         )
@@ -4092,15 +4595,23 @@ def _style_ops(x: pd.DataFrame):
     # 5) EDCT purple on Takeoff (FA) (applied last so it wins for that cell)
     cell_edct_css = "background-color: rgba(155, 81, 224, 0.28); border-left: 6px solid #9b51e0;"
     mask_edct = idx_edct.reindex(x.index, fill_value=False)
-    styles.loc[mask_edct, "Takeoff (FA)"] = (
-        styles.loc[mask_edct, "Takeoff (FA)"].fillna("") + cell_edct_css
-    )
+    if "Takeoff (FA)" in x.columns:
+        styles.loc[mask_edct, "Takeoff (FA)"] = (
+            styles.loc[mask_edct, "Takeoff (FA)"].fillna("") + cell_edct_css
+        )
 
     if "Turn Time" in x.columns:
         turn_css = "background-color: rgba(255, 82, 82, 0.2); font-weight: 600;"
         mask_turn = turn_warn.reindex(x.index, fill_value=False)
         styles.loc[mask_turn, "Turn Time"] = (
             styles.loc[mask_turn, "Turn Time"].fillna("") + turn_css
+        )
+
+    if "_DownlineRisk" in _base.columns and "Downline Risk" in x.columns:
+        risk_css = "background-color: rgba(255, 128, 171, 0.24); font-weight: 600; border-left: 6px solid #ec407a;"
+        risk_mask = _base["_DownlineRisk"].reindex(x.index, fill_value=False)
+        styles.loc[risk_mask, "Downline Risk"] = (
+            styles.loc[risk_mask, "Downline Risk"].fillna("") + risk_css
         )
 
     if "_RouteMismatch" in _base.columns and "Route" in x.columns:
@@ -4119,8 +4630,226 @@ fmt_map = {
     "On-Block (Sched)":  lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "ETA (FA)":          lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     "Landing (FA)":      lambda v: v if isinstance(v, str) else (v.strftime("%H:%MZ") if pd.notna(v) else "—"),
+    "Off Block (UTC)":   lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "Takeoff (UTC)":     lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "Landing (UTC)":     lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
+    "On Block (UTC)":    lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—",
     # NOTE: "Takeoff (FA)" is already a string with optional EDCT prefix
 }
+
+
+def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
+    if df_subset.empty:
+        st.caption("No flights in this phase right now.")
+        return
+
+    if phase == SCHEDULE_PHASE_ENROUTE and "Arrives In" in df_subset.columns:
+        df_subset = df_subset.sort_values(
+            by="Arrives In",
+            key=lambda col: col.apply(_coerce_arrives_in_seconds),
+            kind="stable",
+        )
+
+    visible_columns = filtered_columns_for_phase(phase, df_subset.columns)
+    view = df_subset.loc[:, visible_columns]
+
+    styler = view.style
+    if hasattr(styler, "hide_index"):
+        styler = styler.hide_index()
+    else:
+        styler = styler.hide(axis="index")
+
+    try:
+        active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
+        styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
+        st.dataframe(styler, width="stretch")
+    except Exception:
+        st.warning("Styling disabled (env compatibility). Showing plain table.")
+        tmp = view.copy()
+        for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
+            if c in tmp.columns:
+                tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
+        st.dataframe(tmp, width="stretch")
+
+def _normalize_booking_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _booking_series(df: pd.DataFrame) -> pd.Series:
+    if "Booking" in df.columns:
+        source = df["Booking"]
+    elif "bookingIdentifier" in df.columns:
+        source = df["bookingIdentifier"]
+    else:
+        return pd.Series([""] * len(df), index=df.index, dtype=str)
+
+    return source.apply(_normalize_booking_value)
+
+
+with enhanced_ff_container:
+    st.markdown("#### Enhanced Flight Following")
+
+    enhanced_toggle_key = "enhanced_ff_enabled"
+    enhanced_selected_key = "enhanced_ff_selected"
+    enhanced_cache_key = "enhanced_ff_selected_cache"
+
+    initial_toggle = st.session_state.get(enhanced_toggle_key, False)
+    enhanced_enabled = st.checkbox(
+        "Enhanced Flight Following Requested",
+        value=initial_toggle,
+        key=enhanced_toggle_key,
+        help="Track a subset of flights that need enhanced monitoring.",
+    )
+
+    selected_ids_raw = st.session_state.get(enhanced_selected_key, [])
+    if not isinstance(selected_ids_raw, list):
+        try:
+            selected_ids_raw = list(selected_ids_raw)
+        except TypeError:
+            selected_ids_raw = [selected_ids_raw]
+    selected_ids = [
+        _normalize_booking_value(val)
+        for val in selected_ids_raw
+        if _normalize_booking_value(val)
+    ]
+
+    # Normalize the stored selections before any widgets with the same key are instantiated.
+    if selected_ids != selected_ids_raw or enhanced_selected_key not in st.session_state:
+        st.session_state[enhanced_selected_key] = selected_ids
+
+    cache = st.session_state.get(enhanced_cache_key, {}) or {}
+
+    working_df = df.copy()
+    working_df["Booking"] = _booking_series(working_df)
+    working_df = working_df[working_df["Booking"] != ""]
+
+    # Normalize the booking field used for display so multiselect choices and the
+    # rendered table share the same, trimmed identifier values even after
+    # auto-refresh.
+    display_bookings = _booking_series(df_display)
+
+    # Normalize the booking field used for display so multiselect choices and the
+    # rendered table share the same, trimmed identifier values even after
+    # auto-refresh.
+    display_bookings = df_display["Booking"].astype(str).str.strip()
+
+    if working_df.empty:
+        if selected_ids:
+            labels = {val: f"{val} · not in current schedule" for val in selected_ids}
+            st.multiselect(
+                "Select flights",
+                options=selected_ids,
+                default=selected_ids,
+                key=enhanced_selected_key,
+                format_func=lambda val: labels.get(val, val),
+                help=(
+                    "Choose one or more flights that require Enhanced Flight Following. "
+                    "Selections stay visible while the schedule refreshes."
+                ),
+                disabled=True,
+            )
+            cached_rows = list(cache.values())
+            if cached_rows:
+                selected_df = pd.DataFrame(cached_rows)
+                selected_df = selected_df.reindex(columns=df_display.columns, fill_value="")
+                st.caption("Showing last known details for selected flights.")
+                st.dataframe(selected_df, width="stretch")
+            else:
+                st.caption("Selected flights will reappear once the schedule reloads.")
+        else:
+            st.caption("Load a schedule to select flights for Enhanced Flight Following.")
+    elif not enhanced_enabled:
+        st.caption("Enhanced Flight Following is turned off.")
+    else:
+        booking_labels: dict[str, str] = {}
+        for _, row in working_df.iterrows():
+            booking = row.get("Booking", "")
+            if not booking or booking in booking_labels:
+                continue
+            route = str(row.get("Route", "")).strip()
+            if not route:
+                origin = str(row.get("From", "")).strip()
+                destination = str(row.get("To", "")).strip()
+                if origin or destination:
+                    route = f"{origin or '???'} → {destination or '???'}"
+            label = f"{booking} · {route}" if route else booking
+            booking_labels[str(booking)] = label
+
+        options = list(booking_labels.keys())
+
+        # Preserve any previously selected flights even if they are filtered out
+        # of the current schedule (e.g., due to auto-hide settings).
+        missing_selected = [val for val in selected_ids if val not in options]
+        if missing_selected:
+            for val in missing_selected:
+                booking_labels[val] = f"{val} · not in current schedule"
+            options.extend(missing_selected)
+
+        if options:
+            selected = st.multiselect(
+                "Select flights",
+                options=options,
+                key=enhanced_selected_key,
+                default=selected_ids,
+                format_func=lambda val: booking_labels.get(val, val),
+                help="Choose one or more flights that require Enhanced Flight Following.",
+            )
+            selected_ids = selected
+        else:
+            st.caption(
+                "Schedule data is temporarily unavailable; keeping prior Enhanced Flight Following selections."
+            )
+
+        # Cache last known row data for selected flights so the section stays
+        # populated even if filters temporarily remove them from the live view.
+        for idx, row in df_display.iterrows():
+            booking = display_bookings.iat[idx]
+            if booking in selected_ids and booking:
+                cache[booking] = row.to_dict()
+        if selected_ids:
+            cache = {
+                booking: data for booking, data in cache.items() if booking in selected_ids
+            }
+        st.session_state[enhanced_cache_key] = cache
+
+        if not selected_ids:
+            st.caption("No flights selected for Enhanced Flight Following yet.")
+        else:
+            selected_mask = display_bookings.isin(selected_ids)
+            selected_df = df_display.loc[selected_mask].copy()
+            if selected_df.empty:
+                cached_rows = list(cache.values())
+                if cached_rows:
+                    selected_df = pd.DataFrame(cached_rows)
+                    selected_df = selected_df.reindex(columns=df_display.columns, fill_value="")
+                    st.caption(
+                        "Showing last known details for flights missing from the current schedule."
+                    )
+                else:
+                    st.caption(
+                        "Selected flights are no longer present in the current schedule."
+                    )
+            else:
+                st.caption("Enhanced Flight Following flights")
+                selected_styler = selected_df.style
+                if hasattr(selected_styler, "hide_index"):
+                    selected_styler = selected_styler.hide_index()
+                else:  # pragma: no cover - Streamlit < 1.25 fallback
+                    selected_styler = selected_styler.hide(axis="index")
+                try:
+                    selected_styler = selected_styler.apply(_style_ops, axis=None).format(fmt_map)
+                    st.dataframe(selected_styler, width="stretch")
+                except Exception:
+                    st.dataframe(selected_df, width="stretch")
 
 # Helpers for inline editing (data_editor expects naive datetimes)
 def _format_editor_datetime(ts):
@@ -4382,21 +5111,60 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
 
 # ----------------- Schedule render with inline Notify -----------------
 
-styler = df_display.style
-if hasattr(styler, "hide_index"):
-    styler = styler.hide_index()
-else:
-    styler = styler.hide(axis="index")
+schedule_buckets = categorize_dataframe_by_phase(df_display)
 
-try:
-    styler = styler.apply(_style_ops, axis=None).format(fmt_map)
-    st.dataframe(styler, use_container_width=True)
-except Exception:
-    st.warning("Styling disabled (env compatibility). Showing plain table.")
-    tmp = df_display.copy()
-    for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
-        tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-    st.dataframe(tmp, use_container_width=True)
+for phase, title, description, expanded in SCHEDULE_PHASES:
+    with st.expander(title, expanded=expanded):
+        if description:
+            st.caption(description)
+        _render_schedule_table(schedule_buckets.get(phase, df_display.iloc[0:0]), phase)
+
+# ============================
+# Downline risk monitor
+# ============================
+st.markdown("### Downline risk monitor")
+if downline_risk_summary:
+    st.caption(
+        "Next legs on the same tail projected to depart late after enforcing a 45 minute minimum turn. "
+        "Grouped by local departure date (today expanded; future days collapsed)."
+    )
+    for entry in downline_risk_summary:
+        section_label = entry.get("label") or "Upcoming departures"
+        tails = entry.get("tails", [])
+        expanded = not bool(entry.get("collapsed", False))
+        with st.expander(section_label, expanded=expanded):
+            if not tails:
+                st.caption("No downline legs in this date bucket.")
+                continue
+            for tail_entry in tails:
+                st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
+                for leg in tail_entry.get("legs", []):
+                    route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
+                    service_type = leg.get("next_service_type") or "—"
+                    service_txt = service_type
+                    if service_type == "PAX":
+                        account_txt = format_account_value(leg.get("next_account"))
+                        if account_txt != "—":
+                            service_txt = f"{service_type} · {account_txt}"
+                    if service_txt != "—":
+                        service_txt = f" · {service_txt}"
+                    arrival_label = leg.get("arrival_label") or "—"
+                    arrival_source = leg.get("arrival_source")
+                    if arrival_source:
+                        arrival_label = (
+                            f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
+                        )
+                    next_window = f"{arrival_label} → {leg.get('projected_etd_label') or '—'}"
+                    minutes_txt = leg.get("delay_minutes")
+                    minutes_txt = (
+                        f"+{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "+0m"
+                    )
+                    st.markdown(
+                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}: {minutes_txt} "
+                        f"delay from {leg.get('source_booking') or 'previous leg'} ({next_window})"
+                    )
+else:
+    st.caption("No downline legs currently flagged for carry-forward delays.")
 
 # ----------------- Inline editor for manual overrides -----------------
 with st.expander("Inline manual updates (UTC)", expanded=False):
@@ -4431,7 +5199,7 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
             key="schedule_inline_editor",
             hide_index=True,
             num_rows="fixed",
-            use_container_width=True,
+            width="stretch",
             column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "ETA (FA)", "Landing (FA)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
@@ -4475,7 +5243,7 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
         _apply_inline_editor_updates(inline_original, edited_inline, editable_source)
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
-_show = (df_view if delayed_view else df)  # NOTE: keep original index; do NOT reset here
+_show = df  # NOTE: keep original index; do NOT reset here
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
@@ -4524,7 +5292,7 @@ def _top_reason(idx) -> tuple[str, int]:
         return (f"🔴 **FlightAware takeoff** was {m} {_min_word(m)} later than **scheduled**.", m)
     return ("Delay detected by rules, details not classifiable.", 0)
 
-with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_delayed) > 0)):
+with st.expander("Quick Notify (cell-level delays only)", expanded=False):
     if _delayed.empty:
         st.caption("No triggered cell-level delays right now 🎉")
     else:
@@ -4544,6 +5312,13 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
             with reason_col:
                 reason_key = f"delay_reason_{booking_str}_{idx}"
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
+                notes_key = f"delay_notes_{booking_str}_{idx}"
+                st.text_area(
+                    "Notes",
+                    key=notes_key,
+                    placeholder="Optional context shared at the end of the Telus post",
+                    height=80,
+                )
             with btn_col:
                 btn_key = f"notify_{booking_str}_{idx}"
                 if st.button("📣 Notify", key=btn_key):
@@ -4556,27 +5331,41 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=bool(len(_del
                         st.error("No TELUS teams configured in secrets.")
                     else:
                         reason_val = st.session_state.get(reason_key, "")
+                        notes_val = st.session_state.get(notes_key, "")
                         ok, err = post_to_telus_team(
                             team=teams[0],
-                            text=build_stateful_notify_message(row, delay_reason=reason_val),
+                            text=build_stateful_notify_message(
+                                row,
+                                delay_reason=reason_val,
+                                notes=notes_val,
+                            ),
                         )
                         if ok:
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+                            append_notification_history(
+                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']}"
+                            )
                         else:
                             st.error(f"Failed: {err}")
+
+    notification_entries = load_notification_history(limit=50)
+    with st.expander("Notification history (shared)", expanded=False):
+        if notification_entries:
+            st.caption("Shared across users of this Streamlit deployment.")
+            for entry in notification_entries:
+                st.text(entry)
+        else:
+            st.caption("No notifications have been sent yet.")
 
 # -------- end Quick Notify panel --------
 
 
 
-if delayed_view:
-    st.caption("Delayed View: showing only **RED** (≥30m) and **YELLOW** (15–29m) flights.")
-else:
-    st.caption(
-        "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
-        "Cell accents: red = variance (Takeoff (FA)>Off-Block Sched, ETA(FA)>On-Block Sched, Landing (FA)>On-Block Sched). "
-        "EDCT shows in purple in Takeoff (FA) until a Departure email is received."
-    )
+st.caption(
+    "Row colors (operational): **yellow** = 15–29 min late without matching email, **red** = ≥30 min late. "
+    "Cell accents: red = variance (Takeoff (FA)>Off-Block Sched, ETA(FA)>On-Block Sched, Landing (FA)>On-Block Sched). "
+    "EDCT shows in purple in Takeoff (FA) until a Departure email is received."
+)
 
 # ----------------- end schedule render -----------------
 
@@ -4591,11 +5380,8 @@ IMAP_USER = _resolve_secret("IMAP_USER")
 IMAP_PASS = _resolve_secret("IMAP_PASS")
 IMAP_FOLDER = _resolve_secret("IMAP_FOLDER", default="INBOX") or "INBOX"
 IMAP_SENDER = _resolve_secret("IMAP_SENDER")  # e.g., alerts@flightaware.com
-IMAP_EDCT_ONLY_DEFAULT = _secret_bool(_resolve_secret("IMAP_EDCT_ONLY"), default=False)
-
-
 # 2) Define the polling function BEFORE the UI uses it
-def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: bool = False) -> int:
+def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: bool = True) -> int:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         return 0
 
@@ -4606,12 +5392,12 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
             M.login(IMAP_USER, IMAP_PASS)
         except imaplib.IMAP4.error as e:
             st.error(f"IMAP login failed: {e}")
-            return 0
+            return -1
 
         typ, _ = M.select(IMAP_FOLDER)
         if typ != "OK":
             st.error(f"Could not open folder {IMAP_FOLDER}")
-            return 0
+            return -1
 
         # --- search new UIDs
         last_uid = get_last_uid(IMAP_USER + ":" + IMAP_FOLDER)
@@ -4626,7 +5412,7 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
 
         if typ != "OK":
             st.error("IMAP search failed")
-            return 0
+            return -1
 
         uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
         if not uids:
@@ -4878,50 +5664,44 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
             pass
 
 
-# 3) Now the UI that uses the function
+# 3) Now the indicator that reflects the polling status
 st.markdown("### Mailbox Polling")
 if IMAP_SENDER:
     st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
 else:
     st.caption("IMAP filter: **From = ALL senders**")
 
-enable_poll = st.checkbox(
-    "Enable IMAP polling",
-    value=False,
-    help="Poll the mailbox for FlightAware/FlightBridge alerts and auto-apply updates.",
-)
+imap_poll_enabled = _secret_bool(_resolve_secret("IMAP_POLL_ENABLED"), default=True)
+imap_debug = _secret_bool(_resolve_secret("IMAP_DEBUG"), default=False)
 
-if enable_poll:
-    if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
-        st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+_max_per_poll_secret = _resolve_secret("IMAP_MAX_PER_POLL")
+max_per_poll = 200
+if _max_per_poll_secret not in (None, ""):
+    try:
+        max_candidate = int(_max_per_poll_secret)
+    except (TypeError, ValueError):
+        st.warning("Invalid IMAP_MAX_PER_POLL value; defaulting to 200 emails per poll.")
     else:
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            debug_poll = st.checkbox("Debug IMAP (verbose)", value=False)
-        with c2:
-            poll_on_refresh = st.checkbox("Poll automatically on refresh", value=True)
-        with c3:
-            if st.button("Reset IMAP cursor only", key="reset_imap_cursor", help="Sets the last processed UID to 0; saved statuses remain."):
-                set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, 0)
-                st.success("IMAP cursor reset to 0 (statuses preserved).")
+        if 10 <= max_candidate <= 1000:
+            max_per_poll = max_candidate
+        else:
+            st.warning("IMAP_MAX_PER_POLL must be between 10 and 1000; defaulting to 200 emails per poll.")
 
-        imap_edct_only = st.checkbox(
-            "Only process EDCT emails",
-            value=IMAP_EDCT_ONLY_DEFAULT,
-            key="imap_edct_only",
-            help="Ignore Departure/Arrival alerts and only process EDCT-specific messages.",
-        )
+st.caption("IMAP polling processes EDCT notifications only; FlightAware alerts are handled via webhook integration.")
 
-        max_per_poll = st.number_input("Max emails per poll", min_value=10, max_value=1000, value=200, step=10)
-
-        if st.button("Poll now", key="poll_now"):
-            applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll, edct_only=imap_edct_only)
-            st.success(f"Applied {applied} update(s) from mailbox.")
-
-        if poll_on_refresh:
-            try:
-                applied = imap_poll_once(max_to_process=int(max_per_poll), debug=debug_poll, edct_only=imap_edct_only)
-                if applied:
-                    st.info(f"Auto-poll applied {applied} update(s).")
-            except Exception as e:
-                st.error(f"Auto-poll error: {e}")
+if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
+    st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+elif not imap_poll_enabled:
+    st.info("IMAP polling is disabled via the IMAP_POLL_ENABLED setting.")
+else:
+    try:
+        applied = imap_poll_once(max_to_process=int(max_per_poll), debug=imap_debug)
+    except Exception as e:
+        st.error(f"IMAP polling error: {e}")
+    else:
+        if applied < 0:
+            st.error("IMAP polling encountered an error. See messages above for details.")
+        elif applied == 0:
+            st.success("IMAP polling operational (no new emails detected on this refresh).")
+        else:
+            st.success(f"IMAP polling operational – applied {applied} update(s) this refresh.")
