@@ -5220,6 +5220,26 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
 
 schedule_buckets = categorize_dataframe_by_phase(df_display)
 
+# Surface active EDCT flights inline without introducing another persistent section.
+_required_edct_columns = {"_EDCT_ts", "_DepActual_ts", "Booking", "Aircraft", "Route", "ETD_UTC"}
+if _required_edct_columns.issubset(view_df.columns):
+    active_edct_mask = view_df["_EDCT_ts"].notna() & view_df["_DepActual_ts"].isna()
+    active_edct_df = view_df.loc[active_edct_mask].copy()
+    if not active_edct_df.empty:
+        edct_preview = active_edct_df[["Booking", "Aircraft", "Route", "ETD_UTC", "_EDCT_ts"]].copy()
+        edct_preview = edct_preview.rename(columns={
+            "ETD_UTC": "Scheduled OUT (UTC)",
+            "_EDCT_ts": "Active EDCT (UTC)",
+        })
+        edct_preview["Scheduled OUT (UTC)"] = edct_preview["Scheduled OUT (UTC)"].apply(fmt_dt_utc)
+        edct_preview["Active EDCT (UTC)"] = edct_preview["Active EDCT (UTC)"].apply(fmt_dt_utc)
+
+        st.info(
+            f"🟪 Active EDCT monitor: {len(edct_preview)} flight{'s' if len(edct_preview) != 1 else ''} currently "
+            "show an EDCT and no confirmed departure."
+        )
+        st.dataframe(edct_preview, hide_index=True, width="stretch")
+
 for phase, title, description, expanded in SCHEDULE_PHASES:
     with st.expander(title, expanded=expanded):
         if description:
