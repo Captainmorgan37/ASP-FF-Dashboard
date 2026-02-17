@@ -5164,6 +5164,7 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         # Time overrides for selected columns
         for col, event_type, status_label, planned_col in [
             ("Takeoff (FA)", "Departure", "🟢 DEPARTED", "ETD_UTC"),
+            ("EDCT (UTC)", "EDCT", "🟪 EDCT", "ETD_UTC"),
             ("ETA (FA)", "ArrivalForecast", "🟦 ARRIVING SOON", "ETA_UTC"),
             ("Landing (FA)", "Arrival", "🟣 ARRIVED", "ETA_UTC"),
         ]:
@@ -5305,16 +5306,24 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
     if editable_source.empty:
         st.info("No flights available for inline edits.")
     else:
-        inline_editor = editable_source[["Booking", "_LegKey", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
-        inline_editor = inline_editor.rename(columns={
+        inline_editor = editable_source[["Booking", "_LegKey", "Aircraft"]].copy()
+        inline_time_columns = {
             "_DepActual_ts": "Takeoff (FA)",
+            "_EDCT_ts": "EDCT (UTC)",
             "_ETA_FA_ts": "ETA (FA)",
             "_ArrActual_ts": "Landing (FA)",
-        })
+        }
+        for source_col in inline_time_columns:
+            if source_col in editable_source.columns:
+                inline_editor[source_col] = editable_source[source_col]
+            else:
+                inline_editor[source_col] = pd.NaT
+
+        inline_editor = inline_editor.rename(columns=inline_time_columns)
         inline_editor["Booking"] = inline_editor["Booking"].astype(str)
         inline_editor["_LegKey"] = inline_editor["_LegKey"].astype(str)
         inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
-        for col in ["Takeoff (FA)", "ETA (FA)", "Landing (FA)"]:
+        for col in ["Takeoff (FA)", "EDCT (UTC)", "ETA (FA)", "Landing (FA)"]:
             inline_editor[col] = inline_editor[col].apply(_format_editor_datetime)
 
         inline_original = inline_editor.copy(deep=True)
@@ -5325,7 +5334,7 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
             hide_index=True,
             num_rows="fixed",
             width="stretch",
-            column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "ETA (FA)", "Landing (FA)"],
+            column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "EDCT (UTC)", "ETA (FA)", "Landing (FA)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
                 "_LegKey": st.column_config.Column(
@@ -5343,6 +5352,14 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
                     help=(
                         "FlightAware departure (UTC). Enter HHMM (24h), HH:MM, or phrases like "
                         "'4pm'. The scheduled day is used unless you specify a date."
+                    ),
+                    max_chars=32,
+                ),
+                "EDCT (UTC)": st.column_config.TextColumn(
+                    "EDCT (UTC)",
+                    help=(
+                        "Expected Departure Clearance Time (UTC). Enter HHMM (24h), HH:MM, or phrases like "
+                        "'4pm'. New EDCT emails overwrite this value automatically."
                     ),
                     max_chars=32,
                 ),
