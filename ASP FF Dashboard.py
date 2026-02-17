@@ -22,6 +22,8 @@ import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 import requests
 
+from services.ringcentral_tasks import RingCentralConfigError, create_note, create_task
+
 try:
     import boto3
     from boto3.dynamodb.conditions import Key
@@ -5397,6 +5399,54 @@ def _top_reason(idx) -> tuple[str, int]:
         return (f"🔴 **FlightAware takeoff** was {m} {_min_word(m)} later than **scheduled**.", m)
     return ("Delay detected by rules, details not classifiable.", 0)
 
+def _quick_notify_team() -> str | None:
+    telus_hooks = _read_streamlit_secret("TELUS_WEBHOOKS")
+    if isinstance(telus_hooks, Mapping):
+        teams = list(telus_hooks.keys())
+    else:
+        teams = []
+    return teams[0] if teams else None
+
+
+def _send_quick_notify(
+    row: pd.Series,
+    delay_reason: str,
+    notes: str,
+    mode: str,
+    task_title: str,
+) -> tuple[bool, str]:
+    message = build_stateful_notify_message(row, delay_reason=delay_reason, notes=notes)
+    booking = str(row.get("Booking") or "")
+    aircraft = str(row.get("Aircraft") or "")
+
+    if mode == "task":
+        subject = task_title.strip() or f"Delay update · {booking}"
+        try:
+            create_task(subject=subject, description=message)
+            return True, "Task posted to RingCentral."
+        except Exception as exc:
+            return False, f"Task send failed: {exc}"
+
+    # Note mode: prefer RingCentral post, fallback to existing TELUS webhook flow.
+    try:
+        create_note(message)
+        return True, "Note posted to RingCentral."
+    except RingCentralConfigError:
+        pass
+    except Exception as exc:
+        fallback_hint = f"RingCentral note failed ({exc}); trying TELUS webhook."
+        st.info(fallback_hint)
+
+    team = _quick_notify_team()
+    if not team:
+        return False, "No TELUS teams configured in secrets, and RingCentral note failed."
+
+    ok, err = post_to_telus_team(team=team, text=message)
+    if ok:
+        return True, f"Note posted to TELUS ({team})."
+    return False, f"TELUS post failed: {err}"
+
+
 with st.expander("Quick Notify (cell-level delays only)", expanded=False):
     if _delayed.empty:
         st.caption("No triggered cell-level delays right now 🎉")
@@ -5428,33 +5478,44 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                     height=80,
                 )
             with btn_col:
-                btn_key = f"notify_{booking_str}_{idx}"
-                if st.button("📣 Notify", key=btn_key):
-                    telus_hooks = _read_streamlit_secret("TELUS_WEBHOOKS")
-                    if isinstance(telus_hooks, Mapping):
-                        teams = list(telus_hooks.keys())
-                    else:
-                        teams = []
-                    if not teams:
-                        st.error("No TELUS teams configured in secrets.")
-                    else:
-                        reason_val = st.session_state.get(reason_key, "")
-                        notes_val = st.session_state.get(notes_key, "")
-                        ok, err = post_to_telus_team(
-                            team=teams[0],
-                            text=build_stateful_notify_message(
-                                row,
-                                delay_reason=reason_val,
-                                notes=notes_val,
-                            ),
+                mode_key = f"notify_mode_{booking_str}_{idx}"
+                title_key = f"notify_task_title_{booking_str}_{idx}"
+                send_key = f"notify_send_{booking_str}_{idx}"
+
+                with st.popover("📣 Notify", use_container_width=True):
+                    st.caption("Send as a RingCentral task or note")
+                    mode = st.radio(
+                        "Notify as",
+                        options=["note", "task"],
+                        format_func=lambda x: "Note" if x == "note" else "Task",
+                        key=mode_key,
+                        horizontal=True,
+                    )
+                    if mode == "task":
+                        st.text_input(
+                            "Task title",
+                            key=title_key,
+                            placeholder=f"Delay update · {booking_str}",
+                        )
+
+                    if st.button("Send", key=send_key, use_container_width=True):
+                        reason_val = str(st.session_state.get(reason_key, ""))
+                        notes_val = str(st.session_state.get(notes_key, ""))
+                        task_title = str(st.session_state.get(title_key, ""))
+                        ok, result = _send_quick_notify(
+                            row=row,
+                            delay_reason=reason_val,
+                            notes=notes_val,
+                            mode=str(mode),
+                            task_title=task_title,
                         )
                         if ok:
-                            st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+                            st.success(f"Notified {row['Booking']} ({row['Aircraft']}) · {result}")
                             append_notification_history(
-                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']}"
+                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · {result}"
                             )
                         else:
-                            st.error(f"Failed: {err}")
+                            st.error(f"Failed: {result}")
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
