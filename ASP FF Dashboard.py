@@ -4741,6 +4741,22 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
 
     visible_columns = filtered_columns_for_phase(phase, df_subset.columns)
     view = df_subset.loc[:, visible_columns]
+    column_config: dict[str, Any] = {}
+
+    if "Aircraft" in view.columns:
+        def _flightaware_tail_link(value: Any) -> str:
+            tail = ("" if value is None else str(value)).strip().upper()
+            if not tail or not is_real_tail(tail):
+                return ""
+            return f"https://flightaware.com/live/flight/{tail.replace('-', '')}"
+
+        view = view.copy()
+        view["Aircraft"] = view["Aircraft"].apply(_flightaware_tail_link)
+        column_config["Aircraft"] = st.column_config.LinkColumn(
+            "Aircraft",
+            help="Click tail to open FlightAware in a new tab.",
+            display_text=r"https://flightaware\.com/live/flight/([A-Z0-9]+)",
+        )
 
     styler = view.style
     if hasattr(styler, "hide_index"):
@@ -4751,14 +4767,14 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     try:
         active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
         styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
-        st.dataframe(styler, width="stretch")
+        st.dataframe(styler, width="stretch", column_config=column_config)
     except Exception:
         st.warning("Styling disabled (env compatibility). Showing plain table.")
         tmp = view.copy()
         for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
             if c in tmp.columns:
                 tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-        st.dataframe(tmp, width="stretch")
+        st.dataframe(tmp, width="stretch", column_config=column_config)
 
 def _normalize_booking_value(value) -> str:
     if value is None:
