@@ -22,7 +22,7 @@ import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 import requests
 
-from services.ringcentral_tasks import RingCentralConfigError, create_note, create_task
+from services.ringcentral_tasks import RingCentralConfigError, create_note, create_task, get_diagnostics
 
 try:
     import boto3
@@ -5516,6 +5516,14 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                             )
                         else:
                             st.error(f"Failed: {result}")
+
+    with st.expander("RingCentral diagnostics", expanded=False):
+        st.caption("Shows non-secret config + endpoint paths used by Quick Notify.")
+        try:
+            diagnostics = get_diagnostics()
+            st.json(diagnostics)
+        except Exception as exc:
+            st.error(f"Unable to build diagnostics: {exc}")
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
