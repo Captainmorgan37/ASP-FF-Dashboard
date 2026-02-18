@@ -176,3 +176,45 @@ def test_inline_editor_edct_updates_and_is_persisted_by_leg_key():
     assert status_calls["delete"] == []
     assert tail_calls == {"upsert": [], "delete": []}
     assert st_stub._rerun_called is True
+
+
+def test_inline_editor_clears_widget_state_after_applying_change():
+    namespace, st_stub, tail_calls, status_calls = _load_inline_editor_helpers()
+    apply_updates = namespace["_apply_inline_editor_updates"]
+
+    original_df = pd.DataFrame(
+        {
+            "Booking": ["B3"],
+            "_LegKey": ["B3#L1"],
+            "Aircraft": ["C-GABC"],
+            "Takeoff (FA)": [""],
+            "EDCT (UTC)": [""],
+            "ETA (FA)": [""],
+            "Landing (FA)": [""],
+        }
+    )
+
+    edited_df = original_df.copy()
+    edited_df.loc[0, "EDCT (UTC)"] = "2024-01-03 09:30"
+
+    base_df = pd.DataFrame(
+        {
+            "Booking": ["B3"],
+            "_LegKey": ["B3#L1"],
+            "Aircraft": ["C-GABC"],
+            "_DepActual_ts": [pd.NaT],
+            "_EDCT_ts": [pd.NaT],
+            "_ETA_FA_ts": [pd.NaT],
+            "_ArrActual_ts": [pd.NaT],
+            "ETD_UTC": [pd.Timestamp("2024-01-03 08:30", tz="UTC")],
+            "ETA_UTC": [pd.Timestamp("2024-01-03 10:30", tz="UTC")],
+        }
+    )
+
+    st_stub.session_state["schedule_inline_editor"] = {"edited_rows": {0: {"EDCT (UTC)": "2024-01-03 09:30"}}}
+
+    apply_updates(original_df, edited_df, base_df)
+
+    assert ("B3#L1", "EDCT", "🟪 EDCT", "2024-01-03T09:30:00+00:00", 60) in status_calls["upsert"]
+    assert "schedule_inline_editor" not in st_stub.session_state
+    assert st_stub._rerun_called is True

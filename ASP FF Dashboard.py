@@ -5151,6 +5151,8 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
             new_tail = ""
         orig_tail_raw = orig_row.get("Aircraft", "")
         orig_tail = "" if orig_tail_raw is None else str(orig_tail_raw).strip()
+        if orig_tail.lower() == "nan":
+            orig_tail = ""
 
         if new_tail != orig_tail:
             if new_tail:
@@ -5215,6 +5217,10 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
 
         summary = ", ".join(parts)
         st.session_state["inline_edit_toast"] = f"Inline edits applied: {summary}."
+        # Reset editor widget state so already-applied changes do not get
+        # re-submitted on the next script run (which can otherwise trigger a
+        # rerun loop).
+        st.session_state.pop("schedule_inline_editor", None)
         st.rerun()
 
 # ----------------- Schedule render with inline Notify -----------------
