@@ -3697,7 +3697,7 @@ if not df.empty:
     ]
 
     if fl3xx_flights_payload:
-        actual_map: dict[str, list[dict[str, str | None]]] = defaultdict(list)
+        actual_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for flight in fl3xx_flights_payload:
             if not isinstance(flight, dict):
                 continue
@@ -3709,7 +3709,19 @@ if not df.empty:
             )
             booking_str = str(booking_key)
             off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
-            on_iso = flight.get("_OnBlock_UTC") or flight.get("realDateIN") or flight.get("realDateIn")
+            on_iso = (
+                flight.get("_OnBlock_UTC")
+                or flight.get("realDateIN")
+                or flight.get("realDateIn")
+                or flight.get("realDateInUTC")
+            )
+            sched_off_iso = (
+                flight.get("blockOffEstUTC")
+                or flight.get("dateOUT")
+                or flight.get("dateOut")
+                or flight.get("schedDateOUT")
+                or flight.get("scheduledDateOUT")
+            )
             status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
             delay_reasons_raw = flight.get("delayOffBlockReasons")
             delay_reasons: list[str] = []
@@ -3723,24 +3735,57 @@ if not df.empty:
                 "on": on_iso,
                 "status": status_val,
                 "delay_reasons": " | ".join(delay_reasons) if delay_reasons else "",
+                "from": str(flight.get("airportFrom") or "").strip().upper(),
+                "to": str(flight.get("airportTo") or "").strip().upper(),
+                "sched_off": pd.to_datetime(sched_off_iso, utc=True, errors="coerce"),
             })
-
-        booking_seq = defaultdict(int)
+        booking_used_indexes: dict[str, set[int]] = defaultdict(set)
         off_vals: list[str | None] = []
         on_vals: list[str | None] = []
         status_vals: list[str] = []
         delay_reason_vals: list[str] = []
 
-        for booking in df["Booking"]:
-            seq_idx = booking_seq[booking]
-            booking_seq[booking] += 1
+        for booking, from_icao, to_icao, etd in zip(df["Booking"], df["From_ICAO"], df["To_ICAO"], df["ETD_UTC"]):
             entries = actual_map.get(booking, [])
             off_iso = None
             on_iso = None
             status_val = ""
             delay_reasons_text = ""
-            if seq_idx < len(entries):
-                payload = entries[seq_idx]
+
+            remaining = [
+                (idx, entry)
+                for idx, entry in enumerate(entries)
+                if idx not in booking_used_indexes[booking]
+            ]
+            payload = None
+
+            # First preference: exact route and closest scheduled off-block timestamp.
+            route_matches = [
+                (idx, entry)
+                for idx, entry in remaining
+                if str(entry.get("from") or "") == str(from_icao or "")
+                and str(entry.get("to") or "") == str(to_icao or "")
+            ]
+            if route_matches:
+                if pd.notna(etd):
+                    payload_idx, payload = min(
+                        route_matches,
+                        key=lambda pair: abs(
+                            (
+                                pair[1].get("sched_off") - etd
+                                if pd.notna(pair[1].get("sched_off"))
+                                else pd.Timedelta.max
+                            )
+                        ),
+                    )
+                else:
+                    payload_idx, payload = route_matches[0]
+                booking_used_indexes[booking].add(payload_idx)
+            elif remaining:
+                payload_idx, payload = remaining[0]
+                booking_used_indexes[booking].add(payload_idx)
+
+            if payload is not None:
                 off_iso = payload.get("off")
                 on_iso = payload.get("on")
                 status_val = (payload.get("status") or "").strip()
