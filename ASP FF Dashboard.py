@@ -3697,6 +3697,19 @@ if not df.empty:
     ]
 
     if fl3xx_flights_payload:
+        def _first_valid_time(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+            for key in keys:
+                value = payload.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    text_value = value.strip()
+                    if not text_value or text_value.lower() in {"none", "null", "nan"}:
+                        continue
+                    return text_value
+                return value
+            return None
+
         actual_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for flight in fl3xx_flights_payload:
             if not isinstance(flight, dict):
@@ -3708,19 +3721,17 @@ if not df.empty:
                 or ""
             )
             booking_str = str(booking_key)
-            off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
-            on_iso = (
-                flight.get("_OnBlock_UTC")
-                or flight.get("realDateIN")
-                or flight.get("realDateIn")
-                or flight.get("realDateInUTC")
+            off_iso = _first_valid_time(
+                flight,
+                ("_OffBlock_UTC", "realDateOUT", "realDateOut", "realDateOutUTC", "blockOffActualUTC"),
             )
-            sched_off_iso = (
-                flight.get("blockOffEstUTC")
-                or flight.get("dateOUT")
-                or flight.get("dateOut")
-                or flight.get("schedDateOUT")
-                or flight.get("scheduledDateOUT")
+            on_iso = _first_valid_time(
+                flight,
+                ("_OnBlock_UTC", "realDateIN", "realDateIn", "realDateInUTC", "blockOnActualUTC"),
+            )
+            sched_off_iso = _first_valid_time(
+                flight,
+                ("blockOffEstUTC", "dateOUT", "dateOut", "schedDateOUT", "scheduledDateOUT"),
             )
             status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
             delay_reasons_raw = flight.get("delayOffBlockReasons")
