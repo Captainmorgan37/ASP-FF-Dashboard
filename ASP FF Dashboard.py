@@ -3697,20 +3697,7 @@ if not df.empty:
     ]
 
     if fl3xx_flights_payload:
-        def _first_valid_time(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
-            for key in keys:
-                value = payload.get(key)
-                if value is None:
-                    continue
-                if isinstance(value, str):
-                    text_value = value.strip()
-                    if not text_value or text_value.lower() in {"none", "null", "nan"}:
-                        continue
-                    return text_value
-                return value
-            return None
-
-        actual_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        actual_map: dict[str, list[dict[str, str | None]]] = defaultdict(list)
         for flight in fl3xx_flights_payload:
             if not isinstance(flight, dict):
                 continue
@@ -3721,18 +3708,8 @@ if not df.empty:
                 or ""
             )
             booking_str = str(booking_key)
-            off_iso = _first_valid_time(
-                flight,
-                ("_OffBlock_UTC", "realDateOUT", "realDateOut", "realDateOutUTC", "blockOffActualUTC"),
-            )
-            on_iso = _first_valid_time(
-                flight,
-                ("_OnBlock_UTC", "realDateIN", "realDateIn", "realDateInUTC", "blockOnActualUTC"),
-            )
-            sched_off_iso = _first_valid_time(
-                flight,
-                ("blockOffEstUTC", "dateOUT", "dateOut", "schedDateOUT", "scheduledDateOUT"),
-            )
+            off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
+            on_iso = flight.get("_OnBlock_UTC") or flight.get("realDateIN") or flight.get("realDateIn")
             status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
             delay_reasons_raw = flight.get("delayOffBlockReasons")
             delay_reasons: list[str] = []
@@ -3746,57 +3723,24 @@ if not df.empty:
                 "on": on_iso,
                 "status": status_val,
                 "delay_reasons": " | ".join(delay_reasons) if delay_reasons else "",
-                "from": str(flight.get("airportFrom") or "").strip().upper(),
-                "to": str(flight.get("airportTo") or "").strip().upper(),
-                "sched_off": pd.to_datetime(sched_off_iso, utc=True, errors="coerce"),
             })
-        booking_used_indexes: dict[str, set[int]] = defaultdict(set)
+
+        booking_seq = defaultdict(int)
         off_vals: list[str | None] = []
         on_vals: list[str | None] = []
         status_vals: list[str] = []
         delay_reason_vals: list[str] = []
 
-        for booking, from_icao, to_icao, etd in zip(df["Booking"], df["From_ICAO"], df["To_ICAO"], df["ETD_UTC"]):
+        for booking in df["Booking"]:
+            seq_idx = booking_seq[booking]
+            booking_seq[booking] += 1
             entries = actual_map.get(booking, [])
             off_iso = None
             on_iso = None
             status_val = ""
             delay_reasons_text = ""
-
-            remaining = [
-                (idx, entry)
-                for idx, entry in enumerate(entries)
-                if idx not in booking_used_indexes[booking]
-            ]
-            payload = None
-
-            # First preference: exact route and closest scheduled off-block timestamp.
-            route_matches = [
-                (idx, entry)
-                for idx, entry in remaining
-                if str(entry.get("from") or "") == str(from_icao or "")
-                and str(entry.get("to") or "") == str(to_icao or "")
-            ]
-            if route_matches:
-                if pd.notna(etd):
-                    payload_idx, payload = min(
-                        route_matches,
-                        key=lambda pair: abs(
-                            (
-                                pair[1].get("sched_off") - etd
-                                if pd.notna(pair[1].get("sched_off"))
-                                else pd.Timedelta.max
-                            )
-                        ),
-                    )
-                else:
-                    payload_idx, payload = route_matches[0]
-                booking_used_indexes[booking].add(payload_idx)
-            elif remaining:
-                payload_idx, payload = remaining[0]
-                booking_used_indexes[booking].add(payload_idx)
-
-            if payload is not None:
+            if seq_idx < len(entries):
+                payload = entries[seq_idx]
                 off_iso = payload.get("off")
                 on_iso = payload.get("on")
                 status_val = (payload.get("status") or "").strip()
@@ -3910,23 +3854,6 @@ def _events_for_leg(leg_key: str, booking: str) -> dict:
     if rec:
         return rec
     return events_map.get(booking, {})
-
-if "_OnBlock_UTC" in df.columns and not df.empty:
-    onblock_fallback: list[datetime | None] = []
-    for leg_key, booking, existing_on in zip(df["_LegKey"], df["Booking"], df["_OnBlock_UTC"]):
-        if pd.notna(existing_on):
-            onblock_fallback.append(None)
-            continue
-
-        rec = _events_for_leg(str(leg_key), str(booking))
-        onblock_evt = rec.get("OnBlock", {}) if isinstance(rec, dict) else {}
-        onblock_ts = parse_iso_to_utc(onblock_evt.get("actual_time_utc")) if isinstance(onblock_evt, dict) else None
-        onblock_fallback.append(onblock_ts)
-
-    fallback_series = pd.to_datetime(pd.Series(onblock_fallback, index=df.index), utc=True, errors="coerce")
-    missing_mask = df["_OnBlock_UTC"].isna() & fallback_series.notna()
-    if missing_mask.any():
-        df.loc[missing_mask, "_OnBlock_UTC"] = fallback_series[missing_mask]
 
 def _compute_event_presence(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """Return boolean Series indicating which legs have departure/arrival events."""
