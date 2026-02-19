@@ -22,6 +22,8 @@ import tzlocal  # for local-time HHMM in the notify message
 import pytz  # NEW: for airport-local ETA conversion
 import requests
 
+from services.ringcentral_tasks import RingCentralConfigError, create_note, create_task
+
 try:
     import boto3
     from boto3.dynamodb.conditions import Key
@@ -35,6 +37,7 @@ from fl3xx_client import (
     Fl3xxApiConfig,
     compute_flights_digest,
     enrich_flights_with_crew,
+    enrich_flights_with_postflight_delay_codes,
     fetch_flights,
 )
 from flightaware_status import (
@@ -373,6 +376,7 @@ init_db()
 # ============================
 FL3XX_REFRESH_MINUTES = 5
 FL3XX_CREW_REFRESH_MINUTES = 60
+FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES = 15
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -1490,6 +1494,33 @@ def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
             upsert_status(booking_str, "OnBlock", "On Block", _to_iso8601_z(on_dt), None)
 
 
+
+
+def _apply_cached_postflight_delay(
+    flights: list[dict[str, Any]],
+    cached_flights: list[dict[str, Any]] | None,
+) -> None:
+    if not flights or not cached_flights:
+        return
+    cached_by_id: dict[str, dict[str, Any]] = {}
+    for cached in cached_flights:
+        flight_id = cached.get("flightId") or cached.get("id")
+        if flight_id is None:
+            continue
+        cached_by_id[str(flight_id)] = cached
+    if not cached_by_id:
+        return
+    for flight in flights:
+        flight_id = flight.get("flightId") or flight.get("id")
+        if flight_id is None:
+            continue
+        cached = cached_by_id.get(str(flight_id))
+        if not cached:
+            continue
+        for key in ("delayOffBlockReasons", "delayOffBlockReason", "postflightFetchedAt", "postflightAttemptedAt"):
+            if cached.get(key) and not flight.get(key):
+                flight[key] = cached.get(key)
+
 def _apply_cached_crew(
     flights: list[dict[str, Any]],
     cached_flights: list[dict[str, Any]] | None,
@@ -1549,6 +1580,14 @@ def _get_fl3xx_schedule(
         else:
             crew_summary = {"fetched": 0, "errors": [], "updated": False}
             _apply_cached_crew(flights, cache_entry.get("flights") if cache_entry else None)
+
+        _apply_cached_postflight_delay(flights, cache_entry.get("flights") if cache_entry else None)
+        postflight_summary = enrich_flights_with_postflight_delay_codes(
+            config,
+            flights,
+            delay_threshold_minutes=FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES,
+        )
+
         digest = compute_flights_digest(flights)
         _ingest_fl3xx_actuals(flights)
         changed = cache_entry is None or cache_entry.get("hash") != digest
@@ -1573,6 +1612,10 @@ def _get_fl3xx_schedule(
                 "crew_fetch_count": crew_summary["fetched"],
                 "crew_fetch_errors": crew_summary["errors"],
                 "crew_updated": crew_summary["updated"],
+                "postflight_fetch_count": postflight_summary["fetched"],
+                "postflight_eligible_count": postflight_summary["eligible"],
+                "postflight_fetch_errors": postflight_summary["errors"],
+                "postflight_updated": postflight_summary["updated"],
             }
         )
         return flights, metadata
@@ -1582,6 +1625,11 @@ def _get_fl3xx_schedule(
         flights, metadata = fetch_flights(config, now=current_time)
         crew_summary = enrich_flights_with_crew(config, flights, force=True)
         crew_fetched_at = metadata.get("fetched_at")
+        postflight_summary = enrich_flights_with_postflight_delay_codes(
+            config,
+            flights,
+            delay_threshold_minutes=FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES,
+        )
         digest = compute_flights_digest(flights)
         _ingest_fl3xx_actuals(flights)
         save_fl3xx_cache(
@@ -1607,6 +1655,10 @@ def _get_fl3xx_schedule(
                 "crew_fetch_count": crew_summary["fetched"],
                 "crew_fetch_errors": crew_summary["errors"],
                 "crew_updated": crew_summary["updated"],
+                "postflight_fetch_count": postflight_summary["fetched"],
+                "postflight_eligible_count": postflight_summary["eligible"],
+                "postflight_fetch_errors": postflight_summary["errors"],
+                "postflight_updated": postflight_summary["updated"],
             }
         )
         return flights, metadata
@@ -1619,9 +1671,16 @@ def _get_fl3xx_schedule(
         crew_fetched_at = _to_iso8601_z(current_time)
     else:
         crew_summary = {"fetched": 0, "errors": [], "updated": False}
+
+    postflight_summary = enrich_flights_with_postflight_delay_codes(
+        config,
+        flights,
+        delay_threshold_minutes=FL3XX_POSTFLIGHT_DELAY_THRESHOLD_MINUTES,
+    )
+
     digest = compute_flights_digest(flights) if flights else cache_entry.get("hash") or ""
 
-    if flights and (crew_summary["updated"] or crew_refresh_due):
+    if flights and (crew_summary["updated"] or crew_refresh_due or postflight_summary["updated"] or postflight_summary["fetched"] > 0):
         fetched_at = cache_entry.get("fetched_at") or _to_iso8601_z(last_fetch) or _to_iso8601_z(current_time)
         save_fl3xx_cache(
             flights,
@@ -1661,6 +1720,10 @@ def _get_fl3xx_schedule(
         "crew_fetch_count": crew_summary["fetched"],
         "crew_fetch_errors": crew_summary["errors"],
         "crew_updated": crew_summary["updated"],
+        "postflight_fetch_count": postflight_summary["fetched"],
+        "postflight_eligible_count": postflight_summary["eligible"],
+        "postflight_fetch_errors": postflight_summary["errors"],
+        "postflight_updated": postflight_summary["updated"],
     }
 
     return flights, metadata
@@ -3486,6 +3549,16 @@ def _render_fl3xx_status(metadata: dict) -> None:
     elif crew_errors is not None:
         status_bits.append("No crew fetch errors.")
 
+    postflight_count = metadata.get("postflight_fetch_count")
+    if postflight_count is not None:
+        status_bits.append(f"Postflight pulls: {postflight_count}.")
+    postflight_eligible = metadata.get("postflight_eligible_count")
+    if postflight_eligible is not None:
+        status_bits.append(f"Postflight-eligible flights: {postflight_eligible}.")
+    postflight_errors = metadata.get("postflight_fetch_errors")
+    if postflight_errors:
+        status_bits.append(f"{len(postflight_errors)} postflight pull error(s).")
+
     st.caption(" ".join(status_bits))
 
     if crew_errors:
@@ -3530,6 +3603,10 @@ except Exception as exc:
             "crew_fetch_count": 0,
             "crew_fetch_errors": [],
             "crew_updated": False,
+            "postflight_fetch_count": 0,
+            "postflight_eligible_count": 0,
+            "postflight_fetch_errors": [],
+            "postflight_updated": False,
         }
         flights = cache_entry.get("flights", [])
         fl3xx_flights_payload = flights
@@ -3634,16 +3711,25 @@ if not df.empty:
             off_iso = flight.get("_OffBlock_UTC") or flight.get("realDateOUT") or flight.get("realDateOut")
             on_iso = flight.get("_OnBlock_UTC") or flight.get("realDateIN") or flight.get("realDateIn")
             status_val = (flight.get("_FlightStatus") or flight.get("flightStatus") or "").strip()
+            delay_reasons_raw = flight.get("delayOffBlockReasons")
+            delay_reasons: list[str] = []
+            if isinstance(delay_reasons_raw, list):
+                delay_reasons = [str(item).strip() for item in delay_reasons_raw if str(item).strip()]
+            elif delay_reasons_raw:
+                delay_reasons = [str(delay_reasons_raw).strip()]
+
             actual_map[booking_str].append({
                 "off": off_iso,
                 "on": on_iso,
                 "status": status_val,
+                "delay_reasons": " | ".join(delay_reasons) if delay_reasons else "",
             })
 
         booking_seq = defaultdict(int)
         off_vals: list[str | None] = []
         on_vals: list[str | None] = []
         status_vals: list[str] = []
+        delay_reason_vals: list[str] = []
 
         for booking in df["Booking"]:
             seq_idx = booking_seq[booking]
@@ -3652,18 +3738,22 @@ if not df.empty:
             off_iso = None
             on_iso = None
             status_val = ""
+            delay_reasons_text = ""
             if seq_idx < len(entries):
                 payload = entries[seq_idx]
                 off_iso = payload.get("off")
                 on_iso = payload.get("on")
                 status_val = (payload.get("status") or "").strip()
+                delay_reasons_text = (payload.get("delay_reasons") or "").strip()
             off_vals.append(off_iso)
             on_vals.append(on_iso)
             status_vals.append(status_val)
+            delay_reason_vals.append(delay_reasons_text)
 
         df["_OffBlock_UTC"] = pd.to_datetime(off_vals, utc=True, errors="coerce")
         df["_OnBlock_UTC"] = pd.to_datetime(on_vals, utc=True, errors="coerce")
         df["_FlightStatusRaw"] = status_vals
+        df["Off Block Delay Codes"] = delay_reason_vals
 else:
     df["_LegKey"] = pd.Series(dtype=str, index=df.index)
 
@@ -3678,6 +3768,7 @@ else:
     df["_OnBlock_UTC"] = pd.to_datetime(pd.Series(pd.NaT, index=df.index), utc=True, errors="coerce")
 
 df["_FlightStatusRaw"] = df.get("_FlightStatusRaw", pd.Series("", index=df.index)).fillna("").astype(str)
+df["Off Block Delay Codes"] = df.get("Off Block Delay Codes", pd.Series("", index=df.index)).fillna("").astype(str)
 
 if _tail_override_map and not df.empty:
     df["Aircraft"] = [
@@ -4225,7 +4316,7 @@ display_cols = [
     "Off Block (UTC)", "Takeoff (UTC)", "Landing (UTC)", "On Block (UTC)", "Stage Progress",
     "Off-Block (Sched)", "ETA (FA)",
     "On-Block (Sched)",
-    "Early/Late?",
+    "Early/Late?", "Off Block Delay Codes",
     "Departs In", "Arrives In", "Turn Time", "Downline Risk",
     "PIC", "SIC", "Workflow", "Status"
 ]
@@ -4652,6 +4743,22 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
 
     visible_columns = filtered_columns_for_phase(phase, df_subset.columns)
     view = df_subset.loc[:, visible_columns]
+    column_config: dict[str, Any] = {}
+
+    if "Aircraft" in view.columns:
+        def _flightaware_tail_link(value: Any) -> str:
+            tail = ("" if value is None else str(value)).strip().upper()
+            if not tail or not is_real_tail(tail):
+                return ""
+            return f"https://flightaware.com/live/flight/{tail.replace('-', '')}"
+
+        view = view.copy()
+        view["Aircraft"] = view["Aircraft"].apply(_flightaware_tail_link)
+        column_config["Aircraft"] = st.column_config.LinkColumn(
+            "Aircraft",
+            help="Click tail to open FlightAware in a new tab.",
+            display_text=r"https://flightaware\.com/live/flight/([A-Z0-9]+)",
+        )
 
     styler = view.style
     if hasattr(styler, "hide_index"):
@@ -4662,14 +4769,14 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     try:
         active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
         styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
-        st.dataframe(styler, width="stretch")
+        st.dataframe(styler, width="stretch", column_config=column_config)
     except Exception:
         st.warning("Styling disabled (env compatibility). Showing plain table.")
         tmp = view.copy()
         for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
             if c in tmp.columns:
                 tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-        st.dataframe(tmp, width="stretch")
+        st.dataframe(tmp, width="stretch", column_config=column_config)
 
 def _normalize_booking_value(value) -> str:
     if value is None:
@@ -5044,6 +5151,8 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
             new_tail = ""
         orig_tail_raw = orig_row.get("Aircraft", "")
         orig_tail = "" if orig_tail_raw is None else str(orig_tail_raw).strip()
+        if orig_tail.lower() == "nan":
+            orig_tail = ""
 
         if new_tail != orig_tail:
             if new_tail:
@@ -5057,6 +5166,7 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
         # Time overrides for selected columns
         for col, event_type, status_label, planned_col in [
             ("Takeoff (FA)", "Departure", "🟢 DEPARTED", "ETD_UTC"),
+            ("EDCT (UTC)", "EDCT", "🟪 EDCT", "ETD_UTC"),
             ("ETA (FA)", "ArrivalForecast", "🟦 ARRIVING SOON", "ETA_UTC"),
             ("Landing (FA)", "Arrival", "🟣 ARRIVED", "ETA_UTC"),
         ]:
@@ -5107,11 +5217,35 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
 
         summary = ", ".join(parts)
         st.session_state["inline_edit_toast"] = f"Inline edits applied: {summary}."
+        # Reset editor widget state so already-applied changes do not get
+        # re-submitted on the next script run (which can otherwise trigger a
+        # rerun loop).
+        st.session_state.pop("schedule_inline_editor", None)
         st.rerun()
 
 # ----------------- Schedule render with inline Notify -----------------
 
 schedule_buckets = categorize_dataframe_by_phase(df_display)
+
+# Surface active EDCT flights inline without introducing another persistent section.
+_required_edct_columns = {"_EDCT_ts", "_DepActual_ts", "Booking", "Aircraft", "Route", "ETD_UTC"}
+if _required_edct_columns.issubset(view_df.columns):
+    active_edct_mask = view_df["_EDCT_ts"].notna() & view_df["_DepActual_ts"].isna()
+    active_edct_df = view_df.loc[active_edct_mask].copy()
+    if not active_edct_df.empty:
+        edct_preview = active_edct_df[["Booking", "Aircraft", "Route", "ETD_UTC", "_EDCT_ts"]].copy()
+        edct_preview = edct_preview.rename(columns={
+            "ETD_UTC": "Scheduled OUT (UTC)",
+            "_EDCT_ts": "Active EDCT (UTC)",
+        })
+        edct_preview["Scheduled OUT (UTC)"] = edct_preview["Scheduled OUT (UTC)"].apply(fmt_dt_utc)
+        edct_preview["Active EDCT (UTC)"] = edct_preview["Active EDCT (UTC)"].apply(fmt_dt_utc)
+
+        st.info(
+            f"🟪 Active EDCT monitor: {len(edct_preview)} flight{'s' if len(edct_preview) != 1 else ''} currently "
+            "show an EDCT and no confirmed departure."
+        )
+        st.dataframe(edct_preview, hide_index=True, width="stretch")
 
 for phase, title, description, expanded in SCHEDULE_PHASES:
     with st.expander(title, expanded=expanded):
@@ -5180,16 +5314,24 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
     if editable_source.empty:
         st.info("No flights available for inline edits.")
     else:
-        inline_editor = editable_source[["Booking", "_LegKey", "Aircraft", "_DepActual_ts", "_ETA_FA_ts", "_ArrActual_ts"]].copy()
-        inline_editor = inline_editor.rename(columns={
+        inline_editor = editable_source[["Booking", "_LegKey", "Aircraft"]].copy()
+        inline_time_columns = {
             "_DepActual_ts": "Takeoff (FA)",
+            "_EDCT_ts": "EDCT (UTC)",
             "_ETA_FA_ts": "ETA (FA)",
             "_ArrActual_ts": "Landing (FA)",
-        })
+        }
+        for source_col in inline_time_columns:
+            if source_col in editable_source.columns:
+                inline_editor[source_col] = editable_source[source_col]
+            else:
+                inline_editor[source_col] = pd.NaT
+
+        inline_editor = inline_editor.rename(columns=inline_time_columns)
         inline_editor["Booking"] = inline_editor["Booking"].astype(str)
         inline_editor["_LegKey"] = inline_editor["_LegKey"].astype(str)
         inline_editor["Aircraft"] = inline_editor["Aircraft"].fillna("").astype(str)
-        for col in ["Takeoff (FA)", "ETA (FA)", "Landing (FA)"]:
+        for col in ["Takeoff (FA)", "EDCT (UTC)", "ETA (FA)", "Landing (FA)"]:
             inline_editor[col] = inline_editor[col].apply(_format_editor_datetime)
 
         inline_original = inline_editor.copy(deep=True)
@@ -5200,7 +5342,7 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
             hide_index=True,
             num_rows="fixed",
             width="stretch",
-            column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "ETA (FA)", "Landing (FA)"],
+            column_order=["Booking", "_LegKey", "Aircraft", "Takeoff (FA)", "EDCT (UTC)", "ETA (FA)", "Landing (FA)"],
             column_config={
                 "Booking": st.column_config.Column("Booking", disabled=True, help="Booking reference (read-only)."),
                 "_LegKey": st.column_config.Column(
@@ -5218,6 +5360,14 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
                     help=(
                         "FlightAware departure (UTC). Enter HHMM (24h), HH:MM, or phrases like "
                         "'4pm'. The scheduled day is used unless you specify a date."
+                    ),
+                    max_chars=32,
+                ),
+                "EDCT (UTC)": st.column_config.TextColumn(
+                    "EDCT (UTC)",
+                    help=(
+                        "Expected Departure Clearance Time (UTC). Enter HHMM (24h), HH:MM, or phrases like "
+                        "'4pm'. New EDCT emails overwrite this value automatically."
                     ),
                     max_chars=32,
                 ),
@@ -5292,6 +5442,54 @@ def _top_reason(idx) -> tuple[str, int]:
         return (f"🔴 **FlightAware takeoff** was {m} {_min_word(m)} later than **scheduled**.", m)
     return ("Delay detected by rules, details not classifiable.", 0)
 
+def _quick_notify_team() -> str | None:
+    telus_hooks = _read_streamlit_secret("TELUS_WEBHOOKS")
+    if isinstance(telus_hooks, Mapping):
+        teams = list(telus_hooks.keys())
+    else:
+        teams = []
+    return teams[0] if teams else None
+
+
+def _send_quick_notify(
+    row: pd.Series,
+    delay_reason: str,
+    notes: str,
+    mode: str,
+    task_title: str,
+) -> tuple[bool, str]:
+    message = build_stateful_notify_message(row, delay_reason=delay_reason, notes=notes)
+    booking = str(row.get("Booking") or "")
+    aircraft = str(row.get("Aircraft") or "")
+
+    if mode == "task":
+        subject = task_title.strip() or f"Delay update · {booking}"
+        try:
+            create_task(subject=subject, description=message)
+            return True, "Task posted to RingCentral."
+        except Exception as exc:
+            return False, f"Task send failed: {exc}"
+
+    # Note mode: prefer RingCentral post, fallback to existing TELUS webhook flow.
+    try:
+        create_note(message)
+        return True, "Note posted to RingCentral."
+    except RingCentralConfigError:
+        pass
+    except Exception as exc:
+        fallback_hint = f"RingCentral note failed ({exc}); trying TELUS webhook."
+        st.info(fallback_hint)
+
+    team = _quick_notify_team()
+    if not team:
+        return False, "No TELUS teams configured in secrets, and RingCentral note failed."
+
+    ok, err = post_to_telus_team(team=team, text=message)
+    if ok:
+        return True, f"Note posted to TELUS ({team})."
+    return False, f"TELUS post failed: {err}"
+
+
 with st.expander("Quick Notify (cell-level delays only)", expanded=False):
     if _delayed.empty:
         st.caption("No triggered cell-level delays right now 🎉")
@@ -5311,6 +5509,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                 )
             with reason_col:
                 reason_key = f"delay_reason_{booking_str}_{idx}"
+                auto_reason = str(row.get("Off Block Delay Codes") or "").strip()
+                if auto_reason and not str(st.session_state.get(reason_key, "")).strip():
+                    st.session_state[reason_key] = auto_reason
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
                 notes_key = f"delay_notes_{booking_str}_{idx}"
                 st.text_area(
@@ -5320,33 +5521,44 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                     height=80,
                 )
             with btn_col:
-                btn_key = f"notify_{booking_str}_{idx}"
-                if st.button("📣 Notify", key=btn_key):
-                    telus_hooks = _read_streamlit_secret("TELUS_WEBHOOKS")
-                    if isinstance(telus_hooks, Mapping):
-                        teams = list(telus_hooks.keys())
-                    else:
-                        teams = []
-                    if not teams:
-                        st.error("No TELUS teams configured in secrets.")
-                    else:
-                        reason_val = st.session_state.get(reason_key, "")
-                        notes_val = st.session_state.get(notes_key, "")
-                        ok, err = post_to_telus_team(
-                            team=teams[0],
-                            text=build_stateful_notify_message(
-                                row,
-                                delay_reason=reason_val,
-                                notes=notes_val,
-                            ),
+                mode_key = f"notify_mode_{booking_str}_{idx}"
+                title_key = f"notify_task_title_{booking_str}_{idx}"
+                send_key = f"notify_send_{booking_str}_{idx}"
+
+                with st.popover("📣 Notify", use_container_width=True):
+                    st.caption("Send as a RingCentral task or note")
+                    mode = st.radio(
+                        "Notify as",
+                        options=["note", "task"],
+                        format_func=lambda x: "Note" if x == "note" else "Task",
+                        key=mode_key,
+                        horizontal=True,
+                    )
+                    if mode == "task":
+                        st.text_input(
+                            "Task title",
+                            key=title_key,
+                            placeholder=f"Delay update · {booking_str}",
+                        )
+
+                    if st.button("Send", key=send_key, use_container_width=True):
+                        reason_val = str(st.session_state.get(reason_key, ""))
+                        notes_val = str(st.session_state.get(notes_key, ""))
+                        task_title = str(st.session_state.get(title_key, ""))
+                        ok, result = _send_quick_notify(
+                            row=row,
+                            delay_reason=reason_val,
+                            notes=notes_val,
+                            mode=str(mode),
+                            task_title=task_title,
                         )
                         if ok:
-                            st.success(f"Notified {row['Booking']} ({row['Aircraft']})")
+                            st.success(f"Notified {row['Booking']} ({row['Aircraft']}) · {result}")
                             append_notification_history(
-                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']}"
+                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · {result}"
                             )
                         else:
-                            st.error(f"Failed: {err}")
+                            st.error(f"Failed: {result}")
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):

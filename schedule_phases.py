@@ -118,6 +118,7 @@ PHASE_COLUMN_EXCLUDES: dict[str, tuple[str, ...]] = {
         "On-Block (Sched)",
         "On Block (Sched)",
         "Early/Late?",
+        "Off Block Delay Codes",
     ),
 }
 

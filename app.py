@@ -33,6 +33,7 @@ from threading import Lock
 from types import SimpleNamespace
 from typing import Iterable
 from secrets_diagnostics import SecretSection, collect_secret_diagnostics
+from services.ringcentral_tasks import RingCentralConfigError, create_note, create_task
 
 
 # --- pandas guard (never crash the process if it’s missing) ---
@@ -698,19 +699,73 @@ def _append_notification_history(entry: str) -> None:
     _write_notification_history(history)
 
 
-def send_notification(message_box: ui.textarea) -> None:
+def send_notification(message_box: ui.textarea, mode: str = "note", task_title: str = "") -> None:
     message = (message_box.value or "").strip()
     if not message:
         ui.notify("Add a message before sending a notification", type="warning")
         return
 
+    normalized_mode = mode if mode in {"note", "task"} else "note"
+    if normalized_mode == "task":
+        title = (task_title or "").strip() or "FF Dashboard Task"
+    else:
+        title = ""
+
+    ringcentral_posted = False
+    try:
+        if normalized_mode == "task":
+            create_task(subject=title, description=message)
+            ringcentral_posted = True
+        else:
+            create_note(message)
+            ringcentral_posted = True
+    except RingCentralConfigError as exc:
+        ui.notify(f"RingCentral not configured: {exc}", type="warning")
+    except Exception as exc:  # pragma: no cover - runtime safety net
+        ui.notify(f"RingCentral send failed: {exc}", type="warning")
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    entry = f"{timestamp} · {message}"
+    mode_label = "TASK" if normalized_mode == "task" else "NOTE"
+    suffix = " (posted to RingCentral)" if ringcentral_posted else " (saved locally only)"
+    entry = f"{timestamp} · [{mode_label}] {message}{suffix}"
     _append_notification_history(entry)
 
     ui.notify("Notification sent ✅", type="positive")
     if notification_log is not None:
         notification_log.push(entry)
+
+
+def open_notification_dialog(message_box: ui.textarea) -> None:
+    with ui.dialog() as dialog, ui.card().classes("w-96 gap-3"):
+        ui.label("Send notification as").classes("text-base font-medium")
+
+        mode_toggle = ui.toggle(
+            {"note": "Note", "task": "Task"},
+            value="note",
+        ).props("unelevated")
+
+        title_box = ui.input("Task title").props("clearable")
+        title_box.visible = False
+
+        def _on_mode_change(event) -> None:
+            title_box.visible = getattr(event, "value", "note") == "task"
+
+        mode_toggle.on_value_change(_on_mode_change)
+
+        with ui.row().classes("justify-end w-full gap-2"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+
+            def _send() -> None:
+                send_notification(
+                    message_box,
+                    mode=str(mode_toggle.value or "note"),
+                    task_title=str(title_box.value or ""),
+                )
+                dialog.close()
+
+            ui.button("Send", on_click=_send).props("color=secondary")
+
+    dialog.open()
 
 
 def _restore_notification_history() -> None:
@@ -970,7 +1025,7 @@ with ui.column().classes("w-full max-w-6xl mx-auto gap-6 py-4"):
             message_box = ui.textarea("Notification message").props("rows=3 auto-grow")
             ui.button(
                 "Send inline notification",
-                on_click=lambda: send_notification(message_box),
+                on_click=lambda: open_notification_dialog(message_box),
             ).props("color=secondary")
 
         with ui.expansion("Notification history", icon="notifications").classes("w-full"):
