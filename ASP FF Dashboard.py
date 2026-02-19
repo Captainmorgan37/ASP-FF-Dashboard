@@ -3911,6 +3911,23 @@ def _events_for_leg(leg_key: str, booking: str) -> dict:
         return rec
     return events_map.get(booking, {})
 
+if "_OnBlock_UTC" in df.columns and not df.empty:
+    onblock_fallback: list[datetime | None] = []
+    for leg_key, booking, existing_on in zip(df["_LegKey"], df["Booking"], df["_OnBlock_UTC"]):
+        if pd.notna(existing_on):
+            onblock_fallback.append(None)
+            continue
+
+        rec = _events_for_leg(str(leg_key), str(booking))
+        onblock_evt = rec.get("OnBlock", {}) if isinstance(rec, dict) else {}
+        onblock_ts = parse_iso_to_utc(onblock_evt.get("actual_time_utc")) if isinstance(onblock_evt, dict) else None
+        onblock_fallback.append(onblock_ts)
+
+    fallback_series = pd.to_datetime(pd.Series(onblock_fallback, index=df.index), utc=True, errors="coerce")
+    missing_mask = df["_OnBlock_UTC"].isna() & fallback_series.notna()
+    if missing_mask.any():
+        df.loc[missing_mask, "_OnBlock_UTC"] = fallback_series[missing_mask]
+
 def _compute_event_presence(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """Return boolean Series indicating which legs have departure/arrival events."""
     has_dep_flags = [
