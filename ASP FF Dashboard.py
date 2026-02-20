@@ -408,6 +408,11 @@ def save_fl3xx_cache(
 init_db()
 
 current_ff_assignee, current_ff_updated_at = load_ff_assignment()
+ff_edit_key = "ff_assignment_edit_mode"
+ff_toast_key = "ff_assignment_toast"
+if ff_edit_key not in st.session_state:
+    st.session_state[ff_edit_key] = False
+
 with ff_header_center:
     st.markdown(
         f"<p style='text-align:center; margin:0 0 0.25rem 0;'><strong>{current_ff_assignee or 'Unassigned'}</strong></p>",
@@ -416,18 +421,34 @@ with ff_header_center:
     if current_ff_updated_at:
         st.caption(f"Last updated (UTC): {current_ff_updated_at}")
 
-    with st.form("ff_assignment_form", clear_on_submit=False):
-        ff_assignee_input = st.text_input(
-            "Who is FF?",
-            value=current_ff_assignee,
-            placeholder="Enter current FF assignee",
-        )
-        ff_submit = st.form_submit_button("Update FF")
+    if ff_toast_key in st.session_state:
+        st.success(st.session_state.pop(ff_toast_key))
 
-    if ff_submit:
-        upsert_ff_assignment(ff_assignee_input)
-        st.success("Flight Following assignment updated.")
-        st.rerun()
+    if not st.session_state[ff_edit_key]:
+        if st.button("New FF", key="ff_assignment_open", use_container_width=False):
+            st.session_state[ff_edit_key] = True
+            st.rerun()
+    else:
+        with st.form("ff_assignment_form", clear_on_submit=False):
+            ff_assignee_input = st.text_input(
+                "Who is FF?",
+                value=current_ff_assignee,
+                placeholder="Enter current FF assignee",
+                label_visibility="collapsed",
+            )
+            save_col, cancel_col, _ = st.columns([1, 1, 4])
+            ff_submit = save_col.form_submit_button("Save")
+            ff_cancel = cancel_col.form_submit_button("Cancel")
+
+        if ff_submit:
+            upsert_ff_assignment(ff_assignee_input)
+            st.session_state[ff_edit_key] = False
+            st.session_state[ff_toast_key] = "Flight Following assignment updated."
+            st.rerun()
+
+        if ff_cancel:
+            st.session_state[ff_edit_key] = False
+            st.rerun()
 
 # ============================
 # Helpers
