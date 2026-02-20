@@ -424,31 +424,33 @@ with ff_header_center:
     if ff_toast_key in st.session_state:
         st.success(st.session_state.pop(ff_toast_key))
 
-    if not st.session_state[ff_edit_key]:
-        if st.button("New FF", key="ff_assignment_open", use_container_width=False):
-            st.session_state[ff_edit_key] = True
-            st.rerun()
-    else:
-        with st.form("ff_assignment_form", clear_on_submit=False):
-            ff_assignee_input = st.text_input(
-                "Who is FF?",
-                value=current_ff_assignee,
-                placeholder="Enter current FF assignee",
-                label_visibility="collapsed",
-            )
-            save_col, cancel_col, _ = st.columns([1, 1, 4])
-            ff_submit = save_col.form_submit_button("Save")
-            ff_cancel = cancel_col.form_submit_button("Cancel")
+    _, ff_controls_col, _ = st.columns([2, 3, 2])
+    with ff_controls_col:
+        if not st.session_state[ff_edit_key]:
+            if st.button("New FF", key="ff_assignment_open", use_container_width=True):
+                st.session_state[ff_edit_key] = True
+                st.rerun()
+        else:
+            with st.form("ff_assignment_form", clear_on_submit=False):
+                ff_assignee_input = st.text_input(
+                    "Who is FF?",
+                    value=current_ff_assignee,
+                    placeholder="Enter current FF assignee",
+                    label_visibility="collapsed",
+                )
+                save_col, cancel_col = st.columns(2)
+                ff_submit = save_col.form_submit_button("Save", use_container_width=True)
+                ff_cancel = cancel_col.form_submit_button("Cancel", use_container_width=True)
 
-        if ff_submit:
-            upsert_ff_assignment(ff_assignee_input)
-            st.session_state[ff_edit_key] = False
-            st.session_state[ff_toast_key] = "Flight Following assignment updated."
-            st.rerun()
+            if ff_submit:
+                upsert_ff_assignment(ff_assignee_input)
+                st.session_state[ff_edit_key] = False
+                st.session_state[ff_toast_key] = "Flight Following assignment updated."
+                st.rerun()
 
-        if ff_cancel:
-            st.session_state[ff_edit_key] = False
-            st.rerun()
+            if ff_cancel:
+                st.session_state[ff_edit_key] = False
+                st.rerun()
 
 # ============================
 # Helpers
