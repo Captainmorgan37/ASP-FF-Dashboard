@@ -66,6 +66,10 @@ LOCAL_TZ = tzlocal.get_localzone()
 st.set_page_config(page_title="Daily Ops Dashboard (Schedule + Status)", layout="wide")
 st.title("Daily Ops Dashboard (Schedule + Status)")
 
+_, ff_header_center, _ = st.columns([1, 2, 1])
+with ff_header_center:
+    st.markdown("<p style='text-align:center; font-size:1.25rem; font-weight:700; margin-bottom:0.2rem;'>Flight Following</p>", unsafe_allow_html=True)
+
 st.caption(
     "Times shown in **UTC**. Some airports may be blank (non-ICAO). "
     "Rows with non-tail placeholders (e.g., “Remove OCS”, “Add EMB”) are hidden."
@@ -170,6 +174,13 @@ def init_db() -> bool:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sent_at_utc TEXT NOT NULL,
             entry_text TEXT NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ff_assignment (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            assignee TEXT,
+            updated_at TEXT NOT NULL
         )
         """)
         _ensure_fl3xx_cache_columns(conn)
@@ -312,6 +323,31 @@ def load_notification_history(limit: int = 50) -> list[str]:
     rows.reverse()
     return [f"{sent_at} · {entry}" for sent_at, entry in rows]
 
+
+def load_ff_assignment() -> tuple[str, str]:
+    with _connect_db() as conn:
+        row = conn.execute(
+            "SELECT assignee, updated_at FROM ff_assignment WHERE id=1"
+        ).fetchone()
+    if not row:
+        return "", ""
+    assignee, updated_at = row
+    return str(assignee or "").strip(), str(updated_at or "").strip()
+
+
+def upsert_ff_assignment(assignee: str) -> None:
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO ff_assignment (id, assignee, updated_at)
+            VALUES (1, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                assignee=excluded.assignee,
+                updated_at=datetime('now')
+            """,
+            (assignee.strip(),),
+        )
+
 def load_fl3xx_cache():
     with _connect_db() as conn:
         try:
@@ -370,6 +406,49 @@ def save_fl3xx_cache(
 
 
 init_db()
+
+current_ff_assignee, current_ff_updated_at = load_ff_assignment()
+ff_edit_key = "ff_assignment_edit_mode"
+ff_toast_key = "ff_assignment_toast"
+if ff_edit_key not in st.session_state:
+    st.session_state[ff_edit_key] = False
+
+with ff_header_center:
+    st.markdown(
+        f"<p style='text-align:center; margin:0 0 0.25rem 0;'><strong>{current_ff_assignee or 'Unassigned'}</strong></p>",
+        unsafe_allow_html=True,
+    )
+    if current_ff_updated_at:
+        st.caption(f"Last updated (UTC): {current_ff_updated_at}")
+
+    if ff_toast_key in st.session_state:
+        st.success(st.session_state.pop(ff_toast_key))
+
+    if not st.session_state[ff_edit_key]:
+        if st.button("New FF", key="ff_assignment_open", use_container_width=False):
+            st.session_state[ff_edit_key] = True
+            st.rerun()
+    else:
+        with st.form("ff_assignment_form", clear_on_submit=False):
+            ff_assignee_input = st.text_input(
+                "Who is FF?",
+                value=current_ff_assignee,
+                placeholder="Enter current FF assignee",
+                label_visibility="collapsed",
+            )
+            save_col, cancel_col, _ = st.columns([1, 1, 4])
+            ff_submit = save_col.form_submit_button("Save")
+            ff_cancel = cancel_col.form_submit_button("Cancel")
+
+        if ff_submit:
+            upsert_ff_assignment(ff_assignee_input)
+            st.session_state[ff_edit_key] = False
+            st.session_state[ff_toast_key] = "Flight Following assignment updated."
+            st.rerun()
+
+        if ff_cancel:
+            st.session_state[ff_edit_key] = False
+            st.rerun()
 
 # ============================
 # Helpers
