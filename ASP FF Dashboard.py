@@ -93,11 +93,9 @@ if "inline_edit_toast" in st.session_state:
     st.success(st.session_state.pop("inline_edit_toast"))
 
 # ============================
-# Auto-refresh controls (no page reload fallback)
+# Auto-refresh (fixed interval)
 # ============================
-refresh_sec = st.number_input(
-    "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
-)
+refresh_sec = 180
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -184,6 +182,7 @@ def init_db() -> bool:
         )
         """)
         _ensure_fl3xx_cache_columns(conn)
+        _ensure_notification_history_columns(conn)
     return True
 
 
@@ -195,6 +194,18 @@ def _ensure_fl3xx_cache_columns(conn: sqlite3.Connection) -> None:
     }
     if "crew_fetched_at" not in cols:
         conn.execute("ALTER TABLE fl3xx_cache ADD COLUMN crew_fetched_at TEXT")
+
+
+def _ensure_notification_history_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(notification_history)").fetchall()
+        if row and len(row) > 1
+    }
+    if "booking" not in cols:
+        conn.execute("ALTER TABLE notification_history ADD COLUMN booking TEXT")
+    if "notify_mode" not in cols:
+        conn.execute("ALTER TABLE notification_history ADD COLUMN notify_mode TEXT")
 
 def load_status_map() -> dict:
     with _connect_db() as conn:
@@ -287,15 +298,35 @@ def delete_tail_override(booking: str):
         conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
 
-def append_notification_history(entry_text: str) -> None:
+def append_notification_history(entry_text: str, booking: str = "", notify_mode: str = "") -> None:
     with _connect_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO notification_history (sent_at_utc, entry_text)
-            VALUES (?, ?)
-            """,
-            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), entry_text),
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO notification_history (sent_at_utc, entry_text, booking, notify_mode)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    entry_text,
+                    str(booking or "").strip(),
+                    str(notify_mode or "").strip().lower(),
+                ),
+            )
+        except sqlite3.OperationalError:
+            _ensure_notification_history_columns(conn)
+            conn.execute(
+                """
+                INSERT INTO notification_history (sent_at_utc, entry_text, booking, notify_mode)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    entry_text,
+                    str(booking or "").strip(),
+                    str(notify_mode or "").strip().lower(),
+                ),
+            )
         conn.execute(
             """
             DELETE FROM notification_history
@@ -322,6 +353,37 @@ def load_notification_history(limit: int = 50) -> list[str]:
         ).fetchall()
     rows.reverse()
     return [f"{sent_at} · {entry}" for sent_at, entry in rows]
+
+
+def load_flight_notification_updates(booking: str, limit: int = 5) -> list[str]:
+    booking_key = str(booking or "").strip()
+    if not booking_key:
+        return []
+
+    with _connect_db() as conn:
+        try:
+            rows = conn.execute(
+                """
+                SELECT sent_at_utc, notify_mode
+                FROM notification_history
+                WHERE booking = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (booking_key, int(limit)),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            _ensure_notification_history_columns(conn)
+            return []
+
+    entries: list[str] = []
+    for sent_at_utc, notify_mode in rows:
+        mode = str(notify_mode or "").strip().lower()
+        mode_text = "Task" if mode == "task" else "Note"
+        sent_text = str(sent_at_utc or "").strip() or "Unknown time"
+        entries.append(f"🔔 {mode_text} posted at {sent_text} UTC")
+    entries.reverse()
+    return entries
 
 
 def load_ff_assignment() -> tuple[str, str]:
@@ -3557,19 +3619,6 @@ def apply_flightaware_webhook_updates(
 # ============================
 # Schedule data source selection
 # ============================
-btn_cols = st.columns([1, 3, 1])
-with btn_cols[0]:
-    if st.button("Reset data & clear cache"):
-        for k in ("csv_bytes", "csv_name", "csv_uploaded_at", "status_updates"):
-            st.session_state.pop(k, None)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM status_events")
-            conn.execute("DELETE FROM csv_store")
-            conn.execute("DELETE FROM email_cursor")
-            conn.execute("DELETE FROM tail_overrides")
-            conn.execute("DELETE FROM fl3xx_cache")
-        st.rerun()
-
 schedule_payload: ScheduleData | None = None
 schedule_metadata: dict[str, Any] = {}
 fl3xx_flights_payload: list[dict[str, Any]] | None = None
@@ -3597,51 +3646,7 @@ if not config.auth_header and not config.api_token:
 cache_entry = load_fl3xx_cache()
 
 def _render_fl3xx_status(metadata: dict) -> None:
-    status_bits = [
-        "FL3XX flights fetched at",
-        (metadata.get("fetched_at") or "unknown time"),
-        "UTC.",
-    ]
-    if metadata.get("used_cache"):
-        status_bits.append("Using cached schedule data.")
-    else:
-        status_bits.append("Latest API response loaded.")
-    if metadata.get("changed"):
-        status_bits.append("Changes detected since previous fetch.")
-    else:
-        status_bits.append("No schedule changes detected.")
-    next_refresh = metadata.get("next_refresh_after")
-    if next_refresh:
-        status_bits.append(f"Next refresh after {next_refresh}.")
-
-    crew_fetch_count = metadata.get("crew_fetch_count")
-    if crew_fetch_count is not None:
-        status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
-
-    crew_updated = metadata.get("crew_updated")
-    if crew_updated is True:
-        status_bits.append("Crew roster updated.")
-    elif crew_updated is False:
-        status_bits.append("Crew roster unchanged.")
-
     crew_errors = metadata.get("crew_fetch_errors")
-    if crew_errors:
-        status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
-    elif crew_errors is not None:
-        status_bits.append("No crew fetch errors.")
-
-    postflight_count = metadata.get("postflight_fetch_count")
-    if postflight_count is not None:
-        status_bits.append(f"Postflight pulls: {postflight_count}.")
-    postflight_eligible = metadata.get("postflight_eligible_count")
-    if postflight_eligible is not None:
-        status_bits.append(f"Postflight-eligible flights: {postflight_eligible}.")
-    postflight_errors = metadata.get("postflight_fetch_errors")
-    if postflight_errors:
-        status_bits.append(f"{len(postflight_errors)} postflight pull error(s).")
-
-    st.caption(" ".join(status_bits))
-
     if crew_errors:
         st.warning(
             "One or more crew fetch errors occurred while refreshing crew data."
@@ -3874,20 +3879,11 @@ df_clean = df.copy()
 # FlightAware webhook integration
 # ============================
 
-webhook_status_placeholder = st.empty()
-webhook_diag_placeholder = st.empty()
 webhook_config = build_flightaware_webhook_config()
 try:
     webhook_diag_ok, webhook_diag_msg = _diag_flightaware_webhook()
 except Exception as diag_exc:  # pragma: no cover - defensive fallback
     webhook_diag_ok, webhook_diag_msg = False, f"Diagnostics failed: {diag_exc}"
-
-if webhook_diag_ok:
-    webhook_diag_placeholder.success("FlightAware webhook integration detected.")
-else:
-    webhook_diag_placeholder.warning(
-        f"FlightAware webhook integration unavailable: {webhook_diag_msg}"
-    )
 
 use_webhook_alerts = bool(webhook_config)
 
@@ -3911,24 +3907,8 @@ if should_fetch_webhook:
             webhook_records = fetch_flightaware_webhook_events(webhook_idents, webhook_config)
             if use_webhook_alerts:
                 applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
-        except Exception as exc:
-            if use_webhook_alerts:
-                webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
-        else:
-            if use_webhook_alerts:
-                if applied_webhook:
-                    webhook_status_placeholder.info(
-                        f"FlightAware webhook applied {applied_webhook} update(s)."
-                    )
-                else:
-                    webhook_status_placeholder.caption(
-                        "FlightAware webhook returned no new updates for the current schedule."
-                    )
-    else:
-        if use_webhook_alerts:
-            webhook_status_placeholder.caption(
-                "FlightAware webhook has no mapped ASP callsigns for the current schedule."
-            )
+        except Exception:
+            pass
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
     rec = events_map.get(leg_key)
@@ -4302,14 +4282,8 @@ if window_hours and not df.empty:
 # ============================
 # Post-arrival visibility controls
 # ============================
-v1, v2 = st.columns([1, 1])
-with v1:
-    # highlight toggle removed; green overlay always applied
-    auto_hide_on_block = st.checkbox("Auto-hide on block", value=True)
-with v2:
-    hide_hours = st.number_input(
-        "Hide on block after (hours)", min_value=1, max_value=24, value=1, step=1
-    )
+auto_hide_on_block = True
+hide_hours = 1
 
 # Hide legs that have been on block more than N hours ago (if enabled)
 now_utc = datetime.now(timezone.utc)
@@ -5532,6 +5506,26 @@ def _quick_notify_team() -> str | None:
     return teams[0] if teams else None
 
 
+def _format_task_delta_label(delta_minutes: int) -> str:
+    direction = "Late" if delta_minutes >= 0 else "Early"
+    return f"{direction}: {abs(int(delta_minutes))} MINUTES"
+
+
+def _default_task_title(row: pd.Series) -> str:
+    tail_raw = str(row.get("Aircraft") or "").strip()
+    tail = tail_raw.replace("-", "").upper() or "UNKNOWN TAIL"
+
+    booking_raw = str(row.get("Booking") or "").strip()
+    booking = booking_raw.upper() or "UNKNOWN BOOKING"
+
+    account_val = row.get("Account")
+    account_raw = str(format_account_value(account_val) or "").strip()
+    account = account_raw.upper() if account_raw and account_raw != "—" else "UNKNOWN ACCOUNT"
+
+    delta_minutes = _default_minutes_delta(row)
+    return f"{tail} - {booking} - {account} - {_format_task_delta_label(delta_minutes)}"
+
+
 def _send_quick_notify(
     row: pd.Series,
     delay_reason: str,
@@ -5540,11 +5534,9 @@ def _send_quick_notify(
     task_title: str,
 ) -> tuple[bool, str]:
     message = build_stateful_notify_message(row, delay_reason=delay_reason, notes=notes)
-    booking = str(row.get("Booking") or "")
-    aircraft = str(row.get("Aircraft") or "")
 
     if mode == "task":
-        subject = task_title.strip() or f"Delay update · {booking}"
+        subject = task_title.strip() or _default_task_title(row)
         try:
             create_task(subject=subject, description=message)
             return True, "Task posted to RingCentral."
@@ -5571,7 +5563,7 @@ def _send_quick_notify(
     return False, f"TELUS post failed: {err}"
 
 
-with st.expander("Quick Notify (cell-level delays only)", expanded=False):
+with st.expander("Quick Notify - Testing Currently - Will not post to Telus", expanded=False):
     if _delayed.empty:
         st.caption("No triggered cell-level delays right now 🎉")
     else:
@@ -5588,6 +5580,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                     f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}  \n"
                     f"{reason_text}"
                 )
+                flight_updates = load_flight_notification_updates(booking_str, limit=5)
+                for update_text in flight_updates:
+                    st.caption(update_text)
             with reason_col:
                 reason_key = f"delay_reason_{booking_str}_{idx}"
                 auto_reason = str(row.get("Off Block Delay Codes") or "").strip()
@@ -5619,7 +5614,7 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                         st.text_input(
                             "Task title",
                             key=title_key,
-                            placeholder=f"Delay update · {booking_str}",
+                            placeholder=_default_task_title(row),
                         )
 
                     if st.button("Send", key=send_key, use_container_width=True):
@@ -5636,7 +5631,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                         if ok:
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']}) · {result}")
                             append_notification_history(
-                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · {result}"
+                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · {result}",
+                                booking=booking_str,
+                                notify_mode=str(mode),
                             )
                         else:
                             st.error(f"Failed: {result}")
@@ -5957,13 +5954,6 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
             pass
 
 
-# 3) Now the indicator that reflects the polling status
-st.markdown("### Mailbox Polling")
-if IMAP_SENDER:
-    st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
-else:
-    st.caption("IMAP filter: **From = ALL senders**")
-
 imap_poll_enabled = _secret_bool(_resolve_secret("IMAP_POLL_ENABLED"), default=True)
 imap_debug = _secret_bool(_resolve_secret("IMAP_DEBUG"), default=False)
 
@@ -5973,28 +5963,19 @@ if _max_per_poll_secret not in (None, ""):
     try:
         max_candidate = int(_max_per_poll_secret)
     except (TypeError, ValueError):
-        st.warning("Invalid IMAP_MAX_PER_POLL value; defaulting to 200 emails per poll.")
+        pass
     else:
         if 10 <= max_candidate <= 1000:
             max_per_poll = max_candidate
         else:
-            st.warning("IMAP_MAX_PER_POLL must be between 10 and 1000; defaulting to 200 emails per poll.")
-
-st.caption("IMAP polling processes EDCT notifications only; FlightAware alerts are handled via webhook integration.")
+            pass
 
 if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
-    st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+    pass
 elif not imap_poll_enabled:
-    st.info("IMAP polling is disabled via the IMAP_POLL_ENABLED setting.")
+    pass
 else:
     try:
-        applied = imap_poll_once(max_to_process=int(max_per_poll), debug=imap_debug)
-    except Exception as e:
-        st.error(f"IMAP polling error: {e}")
-    else:
-        if applied < 0:
-            st.error("IMAP polling encountered an error. See messages above for details.")
-        elif applied == 0:
-            st.success("IMAP polling operational (no new emails detected on this refresh).")
-        else:
-            st.success(f"IMAP polling operational – applied {applied} update(s) this refresh.")
+        imap_poll_once(max_to_process=int(max_per_poll), debug=imap_debug)
+    except Exception:
+        pass
