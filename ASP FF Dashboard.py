@@ -3582,51 +3582,7 @@ if not config.auth_header and not config.api_token:
 cache_entry = load_fl3xx_cache()
 
 def _render_fl3xx_status(metadata: dict) -> None:
-    status_bits = [
-        "FL3XX flights fetched at",
-        (metadata.get("fetched_at") or "unknown time"),
-        "UTC.",
-    ]
-    if metadata.get("used_cache"):
-        status_bits.append("Using cached schedule data.")
-    else:
-        status_bits.append("Latest API response loaded.")
-    if metadata.get("changed"):
-        status_bits.append("Changes detected since previous fetch.")
-    else:
-        status_bits.append("No schedule changes detected.")
-    next_refresh = metadata.get("next_refresh_after")
-    if next_refresh:
-        status_bits.append(f"Next refresh after {next_refresh}.")
-
-    crew_fetch_count = metadata.get("crew_fetch_count")
-    if crew_fetch_count is not None:
-        status_bits.append(f"Crew fetch attempts: {crew_fetch_count}.")
-
-    crew_updated = metadata.get("crew_updated")
-    if crew_updated is True:
-        status_bits.append("Crew roster updated.")
-    elif crew_updated is False:
-        status_bits.append("Crew roster unchanged.")
-
     crew_errors = metadata.get("crew_fetch_errors")
-    if crew_errors:
-        status_bits.append(f"{len(crew_errors)} crew fetch error(s).")
-    elif crew_errors is not None:
-        status_bits.append("No crew fetch errors.")
-
-    postflight_count = metadata.get("postflight_fetch_count")
-    if postflight_count is not None:
-        status_bits.append(f"Postflight pulls: {postflight_count}.")
-    postflight_eligible = metadata.get("postflight_eligible_count")
-    if postflight_eligible is not None:
-        status_bits.append(f"Postflight-eligible flights: {postflight_eligible}.")
-    postflight_errors = metadata.get("postflight_fetch_errors")
-    if postflight_errors:
-        status_bits.append(f"{len(postflight_errors)} postflight pull error(s).")
-
-    st.caption(" ".join(status_bits))
-
     if crew_errors:
         st.warning(
             "One or more crew fetch errors occurred while refreshing crew data."
