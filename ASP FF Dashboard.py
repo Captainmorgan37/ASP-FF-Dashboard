@@ -93,11 +93,9 @@ if "inline_edit_toast" in st.session_state:
     st.success(st.session_state.pop("inline_edit_toast"))
 
 # ============================
-# Auto-refresh controls (no page reload fallback)
+# Auto-refresh (fixed interval)
 # ============================
-refresh_sec = st.number_input(
-    "Refresh every (sec)", min_value=5, max_value=600, value=180, step=5
-)
+refresh_sec = 180
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -3557,19 +3555,6 @@ def apply_flightaware_webhook_updates(
 # ============================
 # Schedule data source selection
 # ============================
-btn_cols = st.columns([1, 3, 1])
-with btn_cols[0]:
-    if st.button("Reset data & clear cache"):
-        for k in ("csv_bytes", "csv_name", "csv_uploaded_at", "status_updates"):
-            st.session_state.pop(k, None)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM status_events")
-            conn.execute("DELETE FROM csv_store")
-            conn.execute("DELETE FROM email_cursor")
-            conn.execute("DELETE FROM tail_overrides")
-            conn.execute("DELETE FROM fl3xx_cache")
-        st.rerun()
-
 schedule_payload: ScheduleData | None = None
 schedule_metadata: dict[str, Any] = {}
 fl3xx_flights_payload: list[dict[str, Any]] | None = None
@@ -3874,20 +3859,11 @@ df_clean = df.copy()
 # FlightAware webhook integration
 # ============================
 
-webhook_status_placeholder = st.empty()
-webhook_diag_placeholder = st.empty()
 webhook_config = build_flightaware_webhook_config()
 try:
     webhook_diag_ok, webhook_diag_msg = _diag_flightaware_webhook()
 except Exception as diag_exc:  # pragma: no cover - defensive fallback
     webhook_diag_ok, webhook_diag_msg = False, f"Diagnostics failed: {diag_exc}"
-
-if webhook_diag_ok:
-    webhook_diag_placeholder.success("FlightAware webhook integration detected.")
-else:
-    webhook_diag_placeholder.warning(
-        f"FlightAware webhook integration unavailable: {webhook_diag_msg}"
-    )
 
 use_webhook_alerts = bool(webhook_config)
 
@@ -3911,24 +3887,8 @@ if should_fetch_webhook:
             webhook_records = fetch_flightaware_webhook_events(webhook_idents, webhook_config)
             if use_webhook_alerts:
                 applied_webhook = apply_flightaware_webhook_updates(webhook_records, events_map=events_map)
-        except Exception as exc:
-            if use_webhook_alerts:
-                webhook_status_placeholder.error(f"FlightAware webhook error: {exc}")
-        else:
-            if use_webhook_alerts:
-                if applied_webhook:
-                    webhook_status_placeholder.info(
-                        f"FlightAware webhook applied {applied_webhook} update(s)."
-                    )
-                else:
-                    webhook_status_placeholder.caption(
-                        "FlightAware webhook returned no new updates for the current schedule."
-                    )
-    else:
-        if use_webhook_alerts:
-            webhook_status_placeholder.caption(
-                "FlightAware webhook has no mapped ASP callsigns for the current schedule."
-            )
+        except Exception:
+            pass
 
 def _events_for_leg(leg_key: str, booking: str) -> dict:
     rec = events_map.get(leg_key)
@@ -4302,14 +4262,8 @@ if window_hours and not df.empty:
 # ============================
 # Post-arrival visibility controls
 # ============================
-v1, v2 = st.columns([1, 1])
-with v1:
-    # highlight toggle removed; green overlay always applied
-    auto_hide_on_block = st.checkbox("Auto-hide on block", value=True)
-with v2:
-    hide_hours = st.number_input(
-        "Hide on block after (hours)", min_value=1, max_value=24, value=1, step=1
-    )
+auto_hide_on_block = True
+hide_hours = 1
 
 # Hide legs that have been on block more than N hours ago (if enabled)
 now_utc = datetime.now(timezone.utc)
@@ -5957,13 +5911,6 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
             pass
 
 
-# 3) Now the indicator that reflects the polling status
-st.markdown("### Mailbox Polling")
-if IMAP_SENDER:
-    st.caption(f'IMAP filter: **From = {IMAP_SENDER}**')
-else:
-    st.caption("IMAP filter: **From = ALL senders**")
-
 imap_poll_enabled = _secret_bool(_resolve_secret("IMAP_POLL_ENABLED"), default=True)
 imap_debug = _secret_bool(_resolve_secret("IMAP_DEBUG"), default=False)
 
@@ -5973,28 +5920,19 @@ if _max_per_poll_secret not in (None, ""):
     try:
         max_candidate = int(_max_per_poll_secret)
     except (TypeError, ValueError):
-        st.warning("Invalid IMAP_MAX_PER_POLL value; defaulting to 200 emails per poll.")
+        pass
     else:
         if 10 <= max_candidate <= 1000:
             max_per_poll = max_candidate
         else:
-            st.warning("IMAP_MAX_PER_POLL must be between 10 and 1000; defaulting to 200 emails per poll.")
-
-st.caption("IMAP polling processes EDCT notifications only; FlightAware alerts are handled via webhook integration.")
+            pass
 
 if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
-    st.warning("Set IMAP_HOST / IMAP_USER / IMAP_PASS (and optionally IMAP_SENDER/IMAP_FOLDER) in Streamlit secrets.")
+    pass
 elif not imap_poll_enabled:
-    st.info("IMAP polling is disabled via the IMAP_POLL_ENABLED setting.")
+    pass
 else:
     try:
-        applied = imap_poll_once(max_to_process=int(max_per_poll), debug=imap_debug)
-    except Exception as e:
-        st.error(f"IMAP polling error: {e}")
-    else:
-        if applied < 0:
-            st.error("IMAP polling encountered an error. See messages above for details.")
-        elif applied == 0:
-            st.success("IMAP polling operational (no new emails detected on this refresh).")
-        else:
-            st.success(f"IMAP polling operational – applied {applied} update(s) this refresh.")
+        imap_poll_once(max_to_process=int(max_per_poll), debug=imap_debug)
+    except Exception:
+        pass
