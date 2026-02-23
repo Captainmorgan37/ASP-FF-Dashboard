@@ -5506,6 +5506,24 @@ def _quick_notify_team() -> str | None:
     return teams[0] if teams else None
 
 
+def _format_task_delta_label(delta_minutes: int) -> str:
+    direction = "Late" if delta_minutes >= 0 else "Early"
+    return f"{direction}: {abs(int(delta_minutes))} MINUTES"
+
+
+def _default_task_title(row: pd.Series) -> str:
+    flight_date = row.get("ETD_UTC")
+    if pd.notna(flight_date):
+        date_txt = pd.Timestamp(flight_date).strftime("%d%b%y").upper()
+    else:
+        date_txt = pd.Timestamp.now(tz="UTC").strftime("%d%b%y").upper()
+
+    aircraft = str(row.get("Aircraft") or "UNKNOWN AIRCRAFT").strip() or "UNKNOWN AIRCRAFT"
+    booking = str(row.get("Booking") or "UNKNOWN BOOKING").strip() or "UNKNOWN BOOKING"
+    delta_minutes = _default_minutes_delta(row)
+    return f"{date_txt} - {aircraft} - {booking} - {_format_task_delta_label(delta_minutes)}"
+
+
 def _send_quick_notify(
     row: pd.Series,
     delay_reason: str,
@@ -5514,11 +5532,9 @@ def _send_quick_notify(
     task_title: str,
 ) -> tuple[bool, str]:
     message = build_stateful_notify_message(row, delay_reason=delay_reason, notes=notes)
-    booking = str(row.get("Booking") or "")
-    aircraft = str(row.get("Aircraft") or "")
 
     if mode == "task":
-        subject = task_title.strip() or f"Delay update · {booking}"
+        subject = task_title.strip() or _default_task_title(row)
         try:
             create_task(subject=subject, description=message)
             return True, "Task posted to RingCentral."
@@ -5596,7 +5612,7 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                         st.text_input(
                             "Task title",
                             key=title_key,
-                            placeholder=f"Delay update · {booking_str}",
+                            placeholder=_default_task_title(row),
                         )
 
                     if st.button("Send", key=send_key, use_container_width=True):
