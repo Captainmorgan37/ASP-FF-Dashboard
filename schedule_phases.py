@@ -17,13 +17,13 @@ SCHEDULE_PHASES: tuple[tuple[str, str, str, bool], ...] = (
         SCHEDULE_PHASE_LANDED,
         "Landed flights",
         "Flights that have already landed or parked on the blocks.",
-        False,
+        True,
     ),
     (
         SCHEDULE_PHASE_ENROUTE,
         "Enroute flights",
         "Flights that are airborne or have already gone blocks off.",
-        False,
+        True,
     ),
     (
         SCHEDULE_PHASE_TO_DEPART,
