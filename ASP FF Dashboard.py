@@ -182,6 +182,7 @@ def init_db() -> bool:
         )
         """)
         _ensure_fl3xx_cache_columns(conn)
+        _ensure_notification_history_columns(conn)
     return True
 
 
@@ -193,6 +194,18 @@ def _ensure_fl3xx_cache_columns(conn: sqlite3.Connection) -> None:
     }
     if "crew_fetched_at" not in cols:
         conn.execute("ALTER TABLE fl3xx_cache ADD COLUMN crew_fetched_at TEXT")
+
+
+def _ensure_notification_history_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(notification_history)").fetchall()
+        if row and len(row) > 1
+    }
+    if "booking" not in cols:
+        conn.execute("ALTER TABLE notification_history ADD COLUMN booking TEXT")
+    if "notify_mode" not in cols:
+        conn.execute("ALTER TABLE notification_history ADD COLUMN notify_mode TEXT")
 
 def load_status_map() -> dict:
     with _connect_db() as conn:
@@ -285,15 +298,35 @@ def delete_tail_override(booking: str):
         conn.execute("DELETE FROM tail_overrides WHERE booking=?", (booking,))
 
 
-def append_notification_history(entry_text: str) -> None:
+def append_notification_history(entry_text: str, booking: str = "", notify_mode: str = "") -> None:
     with _connect_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO notification_history (sent_at_utc, entry_text)
-            VALUES (?, ?)
-            """,
-            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), entry_text),
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO notification_history (sent_at_utc, entry_text, booking, notify_mode)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    entry_text,
+                    str(booking or "").strip(),
+                    str(notify_mode or "").strip().lower(),
+                ),
+            )
+        except sqlite3.OperationalError:
+            _ensure_notification_history_columns(conn)
+            conn.execute(
+                """
+                INSERT INTO notification_history (sent_at_utc, entry_text, booking, notify_mode)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    entry_text,
+                    str(booking or "").strip(),
+                    str(notify_mode or "").strip().lower(),
+                ),
+            )
         conn.execute(
             """
             DELETE FROM notification_history
@@ -320,6 +353,37 @@ def load_notification_history(limit: int = 50) -> list[str]:
         ).fetchall()
     rows.reverse()
     return [f"{sent_at} · {entry}" for sent_at, entry in rows]
+
+
+def load_flight_notification_updates(booking: str, limit: int = 5) -> list[str]:
+    booking_key = str(booking or "").strip()
+    if not booking_key:
+        return []
+
+    with _connect_db() as conn:
+        try:
+            rows = conn.execute(
+                """
+                SELECT sent_at_utc, notify_mode
+                FROM notification_history
+                WHERE booking = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (booking_key, int(limit)),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            _ensure_notification_history_columns(conn)
+            return []
+
+    entries: list[str] = []
+    for sent_at_utc, notify_mode in rows:
+        mode = str(notify_mode or "").strip().lower()
+        mode_text = "Task" if mode == "task" else "Note"
+        sent_text = str(sent_at_utc or "").strip() or "Unknown time"
+        entries.append(f"🔔 {mode_text} posted at {sent_text} UTC")
+    entries.reverse()
+    return entries
 
 
 def load_ff_assignment() -> tuple[str, str]:
@@ -5498,6 +5562,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                     f"· **ETD** {etd_txt} · **ETA** {eta_local} · {row['Status']}  \n"
                     f"{reason_text}"
                 )
+                flight_updates = load_flight_notification_updates(booking_str, limit=5)
+                for update_text in flight_updates:
+                    st.caption(update_text)
             with reason_col:
                 reason_key = f"delay_reason_{booking_str}_{idx}"
                 auto_reason = str(row.get("Off Block Delay Codes") or "").strip()
@@ -5546,7 +5613,9 @@ with st.expander("Quick Notify (cell-level delays only)", expanded=False):
                         if ok:
                             st.success(f"Notified {row['Booking']} ({row['Aircraft']}) · {result}")
                             append_notification_history(
-                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · {result}"
+                                f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · {result}",
+                                booking=booking_str,
+                                notify_mode=str(mode),
                             )
                         else:
                             st.error(f"Failed: {result}")
