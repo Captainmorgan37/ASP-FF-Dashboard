@@ -5512,16 +5512,18 @@ def _format_task_delta_label(delta_minutes: int) -> str:
 
 
 def _default_task_title(row: pd.Series) -> str:
-    flight_date = row.get("ETD_UTC")
-    if pd.notna(flight_date):
-        date_txt = pd.Timestamp(flight_date).strftime("%d%b%y").upper()
-    else:
-        date_txt = pd.Timestamp.now(tz="UTC").strftime("%d%b%y").upper()
+    tail_raw = str(row.get("Aircraft") or "").strip()
+    tail = tail_raw.replace("-", "").upper() or "UNKNOWN TAIL"
 
-    aircraft = str(row.get("Aircraft") or "UNKNOWN AIRCRAFT").strip() or "UNKNOWN AIRCRAFT"
-    booking = str(row.get("Booking") or "UNKNOWN BOOKING").strip() or "UNKNOWN BOOKING"
+    booking_raw = str(row.get("Booking") or "").strip()
+    booking = booking_raw.upper() or "UNKNOWN BOOKING"
+
+    account_val = row.get("Account")
+    account_raw = str(format_account_value(account_val) or "").strip()
+    account = account_raw.upper() if account_raw and account_raw != "—" else "UNKNOWN ACCOUNT"
+
     delta_minutes = _default_minutes_delta(row)
-    return f"{date_txt} - {aircraft} - {booking} - {_format_task_delta_label(delta_minutes)}"
+    return f"{tail} - {booking} - {account} - {_format_task_delta_label(delta_minutes)}"
 
 
 def _send_quick_notify(
@@ -5561,7 +5563,7 @@ def _send_quick_notify(
     return False, f"TELUS post failed: {err}"
 
 
-with st.expander("Quick Notify (cell-level delays only)", expanded=False):
+with st.expander("Quick Notify - Testing Currently - Will not post to Telus", expanded=False):
     if _delayed.empty:
         st.caption("No triggered cell-level delays right now 🎉")
     else:
