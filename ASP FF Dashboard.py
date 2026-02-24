@@ -2715,6 +2715,10 @@ SUBJ_PATTERNS = {
         r"\bdiverted\s+to\b.*?(?:\(|\b)(?P<to>[A-Z]{3,4})\b",
         re.I,
     ),
+    "EDCT": re.compile(
+        r"\b(?P<from>[A-Z]{3,4})\s+to\s+(?P<to>[A-Z]{3,4})\b.*\bEDCT\b",
+        re.I,
+    ),
 }
 
 SUBJ_DIVERSION_FROM_PAREN_RE = re.compile(
@@ -2776,6 +2780,13 @@ def parse_subject_line(subject: str, now_utc: datetime):
                 from_token = m_from.group("code")
         if from_token:
             result["from_airport"] = from_token.strip().upper()
+        return result
+
+    m = SUBJ_PATTERNS["EDCT"].search(subject)
+    if m:
+        result["event_type"] = "EDCT"
+        result["from_airport"] = m.group("from")
+        result["to_airport"] = m.group("to")
         return result
 
     return result
@@ -5764,6 +5775,12 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
                 if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
                     event = "EDCT"
 
+                if event == "EDCT":
+                    if edct_info.get("from") and not subj_info.get("from_airport"):
+                        subj_info["from_airport"] = edct_info.get("from")
+                    if edct_info.get("to") and not subj_info.get("to_airport"):
+                        subj_info["to_airport"] = edct_info.get("to")
+
                 if edct_only and event != "EDCT":
                     set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                     continue
@@ -5813,9 +5830,15 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
                         or now_utc
                     )
                 elif event == "EDCT":
-                    match_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt
+                    match_dt_utc = (
+                        edct_info.get("original_dep_utc")
+                        or edct_info.get("edct_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                    )
                     actual_dt_utc = (
                         edct_info.get("edct_time_utc")
+                        or edct_info.get("original_dep_utc")
                         or explicit_dt
                         or hdr_dt
                         or now_utc
