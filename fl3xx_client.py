@@ -465,6 +465,47 @@ def enrich_flights_with_postflight_delay_codes(
     return summary
 
 
+def sync_postflight_takeoff_if_empty(
+    config: Fl3xxApiConfig,
+    flight_id: Any,
+    takeoff_unix_ms: int,
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Set postflight ``time.dep.takeOff`` only when currently empty.
+
+    Returns a small summary describing whether the payload was updated or skipped.
+    """
+
+    postflight_payload = fetch_flight_postflight(config, flight_id, session=session)
+    existing_takeoff = (
+        postflight_payload.get("time", {}).get("dep", {}).get("takeOff")
+        if isinstance(postflight_payload, MutableMapping)
+        else None
+    )
+
+    if existing_takeoff not in (None, ""):
+        return {
+            "updated": False,
+            "reason": "existing_takeoff",
+            "existing_takeoff": existing_takeoff,
+            "flight_id": flight_id,
+        }
+
+    payload_to_post = build_postflight_takeoff_payload(
+        postflight_payload,
+        int(takeoff_unix_ms),
+    )
+    post_flight_postflight(config, flight_id, payload_to_post, session=session)
+    return {
+        "updated": True,
+        "reason": "posted",
+        "existing_takeoff": existing_takeoff,
+        "flight_id": flight_id,
+        "takeoff_unix_ms": int(takeoff_unix_ms),
+    }
+
+
 
 def _select_crew_member(crew: Iterable[Dict[str, Any]], role: str) -> Optional[Dict[str, Any]]:
     for member in crew:
@@ -558,6 +599,7 @@ __all__ = [
     "fetch_flights",
     "fetch_flight_crew",
     "fetch_flight_postflight",
+    "sync_postflight_takeoff_if_empty",
     "enrich_flights_with_crew",
     "enrich_flights_with_postflight_delay_codes",
 ]

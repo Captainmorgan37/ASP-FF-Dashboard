@@ -12,6 +12,7 @@ from fl3xx_client import (
     fetch_flight_postflight,
     fetch_flights,
     post_flight_postflight,
+    sync_postflight_takeoff_if_empty,
 )
 
 
@@ -380,6 +381,42 @@ def test_enrich_flights_with_postflight_delay_codes_only_attempts_once_when_no_r
     assert len(session.calls) == 1
     assert flights[0]["postflightAttemptedAt"]
     assert flights[0]["delayOffBlockReasons"] == []
+
+
+
+
+def test_sync_postflight_takeoff_if_empty_skips_when_takeoff_exists():
+    expected_url = "https://app.fl3xx.us/api/external/flight/321/postflight"
+    payload = {"time": {"dep": {"takeOff": 1770000000000}}}
+    session = FakeSession(response_map={expected_url: FakeResponse(payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+
+    result = sync_postflight_takeoff_if_empty(config, 321, 1772250300000, session=session)
+
+    assert result["updated"] is False
+    assert result["reason"] == "existing_takeoff"
+    assert len(session.calls) == 1
+    assert session.calls[0]["url"] == expected_url
+
+
+def test_sync_postflight_takeoff_if_empty_posts_when_takeoff_missing():
+    expected_url = "https://app.fl3xx.us/api/external/flight/1114918/postflight"
+    session = FakeSession(
+        response_map={
+            expected_url: FakeResponse({"time": {"dep": {"takeOff": None}}}),
+        }
+    )
+    config = Fl3xxApiConfig(api_token="token123")
+
+    result = sync_postflight_takeoff_if_empty(config, 1114918, 1772250300000, session=session)
+
+    assert result["updated"] is True
+    assert result["reason"] == "posted"
+    assert len(session.calls) == 2
+    assert session.calls[0]["url"] == expected_url
+    assert session.calls[1]["method"] == "POST"
+    assert session.calls[1]["url"] == expected_url
+    assert session.calls[1]["json"]["time"]["dep"]["takeOff"] == 1772250300000
 
 
 def test_build_postflight_takeoff_payload_removes_tail_and_aircraft_and_sets_takeoff():
