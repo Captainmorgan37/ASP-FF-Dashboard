@@ -42,6 +42,7 @@ from fl3xx_client import (
     fetch_flight_postflight,
     fetch_flights,
     post_flight_postflight,
+    sync_postflight_takeoff_if_empty,
 )
 from flightaware_status import (
     DEFAULT_AEROAPI_BASE_URL,
@@ -2873,6 +2874,90 @@ def parse_takeoff_input_to_unix_ms(raw_value: str) -> tuple[int | None, datetime
     unix_ms = int(parsed_utc.timestamp() * 1000)
     return unix_ms, parsed_utc, None
 
+
+def _sync_automated_takeoff_to_fl3xx_postflight(
+    config: Fl3xxApiConfig,
+    frame: pd.DataFrame,
+    *,
+    enabled_tails: set[str],
+    events_lookup: Any = None,
+    recent_departure_window_minutes: int = 20,
+) -> dict[str, Any]:
+    """Push FlightAware departure times into FL3XX postflight when empty.
+
+    Scope is limited to flights that are actively enroute and recently departed:
+    - has a hydrated departure timestamp,
+    - has no landing or on-block timestamp yet,
+    - has a recent Departure event (when event metadata is available).
+    """
+
+    summary: dict[str, Any] = {"attempted": 0, "updated": 0, "skipped": 0, "errors": []}
+    if frame.empty:
+        return summary
+
+    now_utc = datetime.now(timezone.utc)
+    window = timedelta(minutes=max(0, int(recent_departure_window_minutes)))
+
+    for _, row in frame.iterrows():
+        raw_tail = str(row.get("Aircraft") or "").strip().replace("-", "").upper()
+        if raw_tail not in enabled_tails:
+            continue
+
+        flight_id = row.get("_Fl3xxFlightId")
+        dep_actual = row.get("_DepActual_ts")
+        arr_actual = row.get("_ArrActual_ts")
+        on_block = row.get("_OnBlock_UTC")
+
+        if not flight_id or dep_actual is None or pd.isna(dep_actual):
+            continue
+
+        # Only process truly enroute flights (not yet landed or blocked in).
+        if arr_actual is not None and not pd.isna(arr_actual):
+            continue
+        if on_block is not None and not pd.isna(on_block):
+            continue
+
+        # Only process flights with a recent departure event, if metadata is available.
+        if events_lookup is not None:
+            leg_key = str(row.get("_LegKey") or "")
+            booking = str(row.get("Booking") or "")
+            leg_events = events_lookup(leg_key, booking)
+            dep_event = leg_events.get("Departure") if isinstance(leg_events, dict) else None
+            received_at = _parse_iso8601(dep_event.get("received_at")) if isinstance(dep_event, dict) else None
+            if received_at is None or (now_utc - received_at.astimezone(timezone.utc)) > window:
+                continue
+
+        if isinstance(dep_actual, pd.Timestamp):
+            dep_actual = dep_actual.to_pydatetime()
+        if dep_actual.tzinfo is None:
+            dep_actual = dep_actual.replace(tzinfo=timezone.utc)
+        dep_actual = dep_actual.astimezone(timezone.utc)
+        takeoff_unix_ms = int(dep_actual.timestamp() * 1000)
+
+        summary["attempted"] += 1
+        try:
+            result = sync_postflight_takeoff_if_empty(
+                config,
+                flight_id,
+                takeoff_unix_ms,
+            )
+        except Exception as exc:  # pragma: no cover - network-dependent
+            summary["errors"].append(
+                {
+                    "flight_id": flight_id,
+                    "tail": raw_tail,
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        if result.get("updated"):
+            summary["updated"] += 1
+        else:
+            summary["skipped"] += 1
+
+    return summary
+
 # Email Date header → UTC
 def get_email_date_utc(msg) -> datetime | None:
     try:
@@ -3861,6 +3946,7 @@ if not df.empty:
                 "on": on_iso,
                 "status": status_val,
                 "delay_reasons": " | ".join(delay_reasons) if delay_reasons else "",
+                "flight_id": str(flight.get("flightId") or flight.get("id") or "").strip() or None,
             })
 
         booking_seq = defaultdict(int)
@@ -3868,6 +3954,7 @@ if not df.empty:
         on_vals: list[str | None] = []
         status_vals: list[str] = []
         delay_reason_vals: list[str] = []
+        flight_id_vals: list[str | None] = []
 
         for booking in df["Booking"]:
             seq_idx = booking_seq[booking]
@@ -3883,15 +3970,20 @@ if not df.empty:
                 on_iso = payload.get("on")
                 status_val = (payload.get("status") or "").strip()
                 delay_reasons_text = (payload.get("delay_reasons") or "").strip()
+                flight_id = payload.get("flight_id")
+            else:
+                flight_id = None
             off_vals.append(off_iso)
             on_vals.append(on_iso)
             status_vals.append(status_val)
             delay_reason_vals.append(delay_reasons_text)
+            flight_id_vals.append(flight_id)
 
         df["_OffBlock_UTC"] = pd.to_datetime(off_vals, utc=True, errors="coerce")
         df["_OnBlock_UTC"] = pd.to_datetime(on_vals, utc=True, errors="coerce")
         df["_FlightStatusRaw"] = status_vals
         df["Off Block Delay Codes"] = delay_reason_vals
+        df["_Fl3xxFlightId"] = flight_id_vals
 else:
     df["_LegKey"] = pd.Series(dtype=str, index=df.index)
 
@@ -4210,6 +4302,16 @@ df["_DepActual_ts"] = pd.to_datetime(dep_actual_list, utc=True)     # True actua
 df["_ETA_FA_ts"]    = pd.to_datetime(eta_fore_list,   utc=True)
 df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
 df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
+
+if "_Fl3xxFlightId" not in df.columns:
+    df["_Fl3xxFlightId"] = pd.Series("", index=df.index, dtype="object")
+
+_sync_automated_takeoff_to_fl3xx_postflight(
+    config,
+    df,
+    enabled_tails={"CFASF"},
+    events_lookup=_events_for_leg,
+)
 
 if not df.empty:
     eta_fa_series = df["_ETA_FA_ts"]
