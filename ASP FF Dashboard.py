@@ -2880,12 +2880,23 @@ def _sync_automated_takeoff_to_fl3xx_postflight(
     frame: pd.DataFrame,
     *,
     enabled_tails: set[str],
+    events_lookup: Any = None,
+    recent_departure_window_minutes: int = 20,
 ) -> dict[str, Any]:
-    """Push FlightAware departure times into FL3XX postflight when empty."""
+    """Push FlightAware departure times into FL3XX postflight when empty.
+
+    Scope is limited to flights that are actively enroute and recently departed:
+    - has a hydrated departure timestamp,
+    - has no landing or on-block timestamp yet,
+    - has a recent Departure event (when event metadata is available).
+    """
 
     summary: dict[str, Any] = {"attempted": 0, "updated": 0, "skipped": 0, "errors": []}
     if frame.empty:
         return summary
+
+    now_utc = datetime.now(timezone.utc)
+    window = timedelta(minutes=max(0, int(recent_departure_window_minutes)))
 
     for _, row in frame.iterrows():
         raw_tail = str(row.get("Aircraft") or "").strip().replace("-", "").upper()
@@ -2894,9 +2905,27 @@ def _sync_automated_takeoff_to_fl3xx_postflight(
 
         flight_id = row.get("_Fl3xxFlightId")
         dep_actual = row.get("_DepActual_ts")
+        arr_actual = row.get("_ArrActual_ts")
+        on_block = row.get("_OnBlock_UTC")
 
         if not flight_id or dep_actual is None or pd.isna(dep_actual):
             continue
+
+        # Only process truly enroute flights (not yet landed or blocked in).
+        if arr_actual is not None and not pd.isna(arr_actual):
+            continue
+        if on_block is not None and not pd.isna(on_block):
+            continue
+
+        # Only process flights with a recent departure event, if metadata is available.
+        if events_lookup is not None:
+            leg_key = str(row.get("_LegKey") or "")
+            booking = str(row.get("Booking") or "")
+            leg_events = events_lookup(leg_key, booking)
+            dep_event = leg_events.get("Departure") if isinstance(leg_events, dict) else None
+            received_at = _parse_iso8601(dep_event.get("received_at")) if isinstance(dep_event, dict) else None
+            if received_at is None or (now_utc - received_at.astimezone(timezone.utc)) > window:
+                continue
 
         if isinstance(dep_actual, pd.Timestamp):
             dep_actual = dep_actual.to_pydatetime()
@@ -4281,6 +4310,7 @@ _sync_automated_takeoff_to_fl3xx_postflight(
     config,
     df,
     enabled_tails={"CFASF"},
+    events_lookup=_events_for_leg,
 )
 
 if not df.empty:
