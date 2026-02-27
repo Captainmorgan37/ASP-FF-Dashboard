@@ -2837,16 +2837,35 @@ def parse_any_dt_string_to_utc(s: str) -> datetime | None:
 
 
 def parse_takeoff_input_to_unix_ms(raw_value: str) -> tuple[int | None, datetime | None, str | None]:
-    """Parse a user supplied takeoff timestamp into FL3XX unix milliseconds."""
+    """Parse a user supplied takeoff timestamp into FL3XX unix milliseconds.
+
+    Supports full datetime strings and 24-hour HHMM shorthand (e.g., "0530").
+    For HHMM shorthand we choose the datetime closest to "now" in UTC across
+    yesterday/today/tomorrow.
+    """
 
     text = str(raw_value or "").strip()
     if not text:
         return None, None, "Enter a takeoff time to continue."
 
+    hhmm_match = re.fullmatch(r"([01]\d|2[0-3])([0-5]\d)", text)
+    if hhmm_match:
+        hour = int(hhmm_match.group(1))
+        minute = int(hhmm_match.group(2))
+        now_utc = datetime.now(timezone.utc)
+        candidates = [
+            datetime.combine(now_utc.date() + timedelta(days=offset), datetime.min.time(), tzinfo=timezone.utc)
+            .replace(hour=hour, minute=minute, second=0, microsecond=0)
+            for offset in (-1, 0, 1)
+        ]
+        parsed_utc = min(candidates, key=lambda dt: abs((dt - now_utc).total_seconds()))
+        unix_ms = int(parsed_utc.timestamp() * 1000)
+        return unix_ms, parsed_utc, None
+
     try:
         parsed = dateparse.parse(text, fuzzy=True, tzinfos=TZINFOS)
     except Exception:
-        return None, None, "Could not parse the takeoff time. Include date and timezone when possible."
+        return None, None, "Could not parse the takeoff time. Include date/time, or use HHMM like 0530."
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -5483,14 +5502,15 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
 with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
     st.caption(
         "Manual tester for posting one takeoff time to FL3XX postflight. "
-        "Workflow: GET payload → confirm takeoff is empty → POST with updated unix milliseconds value."
+        "Workflow: GET payload → confirm takeoff is empty → POST with updated unix milliseconds value. "
+        "Tip: enter HHMM (e.g., 0530) to auto-pick the nearest UTC date (yesterday/today/tomorrow)."
     )
 
     flight_id_input = st.text_input("Flight ID", key="postflight_tester_flight_id", placeholder="1114918")
     takeoff_input = st.text_input(
-        "Takeoff time (UTC unless timezone supplied)",
+        "Takeoff time (UTC unless timezone supplied, or HHMM like 0530)",
         key="postflight_tester_takeoff_input",
-        placeholder="2026-03-01 15:05 UTC",
+        placeholder="0530",
     )
 
     fetch_col, clear_col = st.columns([2, 1])
@@ -5499,7 +5519,7 @@ with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
     with clear_col:
         if st.button("Clear cached payload", key="postflight_tester_clear"):
             st.session_state.pop("postflight_tester_payload", None)
-            st.session_state.pop("postflight_tester_flight_id", None)
+            st.session_state.pop("postflight_tester_cached_flight_id", None)
             st.success("Cached postflight payload cleared.")
 
     if fetch_clicked:
@@ -5510,7 +5530,7 @@ with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
             try:
                 fetched_payload = fetch_flight_postflight(config, flight_id_raw)
                 st.session_state["postflight_tester_payload"] = fetched_payload
-                st.session_state["postflight_tester_flight_id"] = flight_id_raw
+                st.session_state["postflight_tester_cached_flight_id"] = flight_id_raw
                 takeoff_current = (
                     fetched_payload.get("time", {})
                     .get("dep", {})
@@ -5522,7 +5542,7 @@ with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
                 st.error(f"Unable to fetch postflight payload: {exc}")
 
     cached_payload = st.session_state.get("postflight_tester_payload")
-    cached_flight_id = st.session_state.get("postflight_tester_flight_id")
+    cached_flight_id = st.session_state.get("postflight_tester_cached_flight_id")
 
     if cached_payload and cached_flight_id:
         current_takeoff = cached_payload.get("time", {}).get("dep", {}).get("takeOff")
