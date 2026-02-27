@@ -4,12 +4,14 @@ import pytest
 
 from fl3xx_client import (
     Fl3xxApiConfig,
+    build_postflight_takeoff_payload,
     compute_fetch_dates,
     enrich_flights_with_crew,
     enrich_flights_with_postflight_delay_codes,
     fetch_flight_crew,
     fetch_flight_postflight,
     fetch_flights,
+    post_flight_postflight,
 )
 
 
@@ -25,6 +27,10 @@ class FakeResponse:
         if not (200 <= self.status_code < 300):
             raise RuntimeError("HTTP error")
 
+    @property
+    def content(self):
+        return b"{}" if self._payload is not None else b""
+
 
 class FakeSession:
     def __init__(self, response=None, response_map=None):
@@ -37,6 +43,25 @@ class FakeSession:
             {
                 "url": url,
                 "params": params,
+                "headers": headers,
+                "timeout": timeout,
+                "verify": verify,
+            }
+        )
+        if self.response_map:
+            if url not in self.response_map:
+                raise AssertionError(f"Unexpected URL requested: {url}")
+            return self.response_map[url]
+        if self.response is None:
+            raise AssertionError("No response configured for FakeSession")
+        return self.response
+
+    def post(self, url, json=None, headers=None, timeout=None, verify=None):
+        self.calls.append(
+            {
+                "method": "POST",
+                "url": url,
+                "json": json,
                 "headers": headers,
                 "timeout": timeout,
                 "verify": verify,
@@ -356,3 +381,42 @@ def test_enrich_flights_with_postflight_delay_codes_only_attempts_once_when_no_r
     assert flights[0]["postflightAttemptedAt"]
     assert flights[0]["delayOffBlockReasons"] == []
 
+
+def test_build_postflight_takeoff_payload_removes_tail_and_aircraft_and_sets_takeoff():
+    payload = {
+        "tailNumber": "C-GABC",
+        "aircraftId": 123,
+        "time": {"dep": {"takeOff": None}},
+    }
+
+    updated = build_postflight_takeoff_payload(payload, 1772250300000)
+
+    assert "tailNumber" not in updated
+    assert "aircraftId" not in updated
+    assert updated["time"]["dep"]["takeOff"] == 1772250300000
+    assert payload["time"]["dep"]["takeOff"] is None
+
+
+def test_build_postflight_takeoff_payload_rejects_non_empty_takeoff_by_default():
+    payload = {"time": {"dep": {"takeOff": 1770000000000}}}
+
+    with pytest.raises(ValueError, match="already includes a takeOff value"):
+        build_postflight_takeoff_payload(payload, 1772250300000)
+
+
+def test_post_flight_postflight_uses_expected_endpoint_and_payload():
+    response_payload = {"status": "OK"}
+    expected_url = "https://app.fl3xx.us/api/external/flight/1114918/postflight"
+    session = FakeSession(response_map={expected_url: FakeResponse(response_payload)})
+    config = Fl3xxApiConfig(api_token="token123")
+    payload = {"time": {"dep": {"takeOff": 1772250300000}}}
+
+    posted = post_flight_postflight(config, 1114918, payload, session=session)
+
+    assert posted == response_payload
+    assert len(session.calls) == 1
+    call = session.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"] == expected_url
+    assert call["json"] == payload
+    assert call["headers"]["Authorization"] == "Bearer token123"

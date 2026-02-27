@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -271,6 +272,74 @@ def fetch_flight_postflight(
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, MutableMapping) else {}
+    finally:
+        if close_session:
+            try:
+                http.close()
+            except AttributeError:
+                pass
+
+
+def build_postflight_takeoff_payload(
+    postflight_payload: Dict[str, Any],
+    takeoff_unix_ms: int,
+    *,
+    require_empty_takeoff: bool = True,
+) -> Dict[str, Any]:
+    """Return a FL3XX postflight payload updated with a departure takeoff time.
+
+    The FL3XX postflight endpoint expects payloads in the same shape returned by
+    the corresponding GET request. During manual testing we intentionally remove
+    top-level ``tailNumber`` and ``aircraftId`` before posting the payload back.
+    """
+
+    if not isinstance(postflight_payload, MutableMapping):
+        raise ValueError("postflight payload must be a mapping")
+
+    payload = deepcopy(postflight_payload)
+    payload.pop("tailNumber", None)
+    payload.pop("aircraftId", None)
+
+    time_section = payload.get("time")
+    if not isinstance(time_section, MutableMapping):
+        raise ValueError("postflight payload is missing a 'time' object")
+
+    dep_section = time_section.get("dep")
+    if not isinstance(dep_section, MutableMapping):
+        raise ValueError("postflight payload is missing a 'time.dep' object")
+
+    existing_takeoff = dep_section.get("takeOff")
+    if require_empty_takeoff and existing_takeoff not in (None, ""):
+        raise ValueError("postflight payload already includes a takeOff value")
+
+    dep_section["takeOff"] = int(takeoff_unix_ms)
+    return payload
+
+
+def post_flight_postflight(
+    config: Fl3xxApiConfig,
+    flight_id: Any,
+    payload: Dict[str, Any],
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Submit a postflight payload for a specific flight."""
+
+    http = session or requests.Session()
+    close_session = session is None
+    try:
+        response = http.post(
+            _build_postflight_endpoint(config.base_url, flight_id),
+            headers=config.build_headers(),
+            json=payload,
+            timeout=config.timeout,
+            verify=config.verify_ssl,
+        )
+        response.raise_for_status()
+        if not response.content:
+            return {}
+        parsed = response.json()
+        return parsed if isinstance(parsed, MutableMapping) else {}
     finally:
         if close_session:
             try:
