@@ -35,10 +35,14 @@ from data_sources import ScheduleData, ScheduleSource, load_schedule
 from fl3xx_client import (
     DEFAULT_FL3XX_BASE_URL,
     Fl3xxApiConfig,
+    build_postflight_takeoff_payload,
     compute_flights_digest,
     enrich_flights_with_crew,
     enrich_flights_with_postflight_delay_codes,
+    fetch_flight_postflight,
     fetch_flights,
+    post_flight_postflight,
+    sync_postflight_takeoff_if_empty,
 )
 from flightaware_status import (
     DEFAULT_AEROAPI_BASE_URL,
@@ -165,6 +169,13 @@ def init_db() -> bool:
             from_date TEXT,
             to_date TEXT,
             crew_fetched_at TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS postflight_sync_leases (
+            flight_id TEXT PRIMARY KEY,
+            lease_until_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
         )
         """)
         conn.execute("""
@@ -465,6 +476,45 @@ def save_fl3xx_cache(
             """,
             (payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at),
         )
+
+
+def _acquire_postflight_sync_lease(flight_id: Any, *, now: datetime | None = None, ttl_seconds: int = 45) -> bool:
+    flight_key = str(flight_id or "").strip()
+    if not flight_key:
+        return False
+
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lease_until = current_time + timedelta(seconds=max(1, int(ttl_seconds)))
+    now_iso = _to_iso8601_z(current_time)
+    lease_until_iso = _to_iso8601_z(lease_until)
+    if not now_iso or not lease_until_iso:
+        return False
+
+    with _connect_db() as conn:
+        conn.execute(
+            "DELETE FROM postflight_sync_leases WHERE lease_until_utc <= ?",
+            (now_iso,),
+        )
+        row = conn.execute(
+            "SELECT lease_until_utc FROM postflight_sync_leases WHERE flight_id=?",
+            (flight_key,),
+        ).fetchone()
+        if row:
+            existing_until = _parse_iso8601(row[0])
+            if existing_until and existing_until > current_time:
+                return False
+
+        conn.execute(
+            """
+            INSERT INTO postflight_sync_leases (flight_id, lease_until_utc, updated_at_utc)
+            VALUES (?, ?, ?)
+            ON CONFLICT(flight_id) DO UPDATE SET
+                lease_until_utc=excluded.lease_until_utc,
+                updated_at_utc=excluded.updated_at_utc
+            """,
+            (flight_key, lease_until_iso, now_iso),
+        )
+    return True
 
 
 init_db()
@@ -2515,6 +2565,8 @@ def build_downline_risk_map(
                 if delay_minutes >= 5 and not has_departed:
                     from_icao = str(row.get("From_ICAO") or "").strip().upper()
                     local_date, date_label, day_delta = _local_departure_date_parts(sched_dep, from_icao)
+                    if day_delta < 0:
+                        continue
                     next_account = str(row.get("Account") or "").strip()
                     next_workflow = str(row.get("Workflow") or "").strip()
                     next_service_type = _infer_service_type(next_workflow, next_account)
@@ -2527,6 +2579,10 @@ def build_downline_risk_map(
                         "delay_minutes": delay_minutes,
                         "arrival_label": prev_arrival_label or "—",
                         "arrival_source": prev_arrival_source or "",
+                        "required_turn_min": int(required_turn_min),
+                        "earliest_dep_label": _format_turn_timestamp(
+                            (prev_projected_arrival + required_turn_td) if prev_projected_arrival is not None else sched_dep
+                        ),
                         "scheduled_etd_label": _format_turn_timestamp(sched_dep),
                         "projected_etd_label": _format_turn_timestamp(projected_dep),
                         "next_route": str(row.get("Route") or "").strip(),
@@ -2715,6 +2771,10 @@ SUBJ_PATTERNS = {
         r"\bdiverted\s+to\b.*?(?:\(|\b)(?P<to>[A-Z]{3,4})\b",
         re.I,
     ),
+    "EDCT": re.compile(
+        r"\b(?P<from>[A-Z]{3,4})\s+to\s+(?P<to>[A-Z]{3,4})\b.*\bEDCT\b",
+        re.I,
+    ),
 }
 
 SUBJ_DIVERSION_FROM_PAREN_RE = re.compile(
@@ -2778,6 +2838,13 @@ def parse_subject_line(subject: str, now_utc: datetime):
             result["from_airport"] = from_token.strip().upper()
         return result
 
+    m = SUBJ_PATTERNS["EDCT"].search(subject)
+    if m:
+        result["event_type"] = "EDCT"
+        result["from_airport"] = m.group("from")
+        result["to_airport"] = m.group("to")
+        return result
+
     return result
 
 # ---- Parse explicit datetime anywhere in text ----
@@ -2820,6 +2887,137 @@ def parse_any_dt_string_to_utc(s: str) -> datetime | None:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def parse_takeoff_input_to_unix_ms(raw_value: str) -> tuple[int | None, datetime | None, str | None]:
+    """Parse a user supplied takeoff timestamp into FL3XX unix milliseconds.
+
+    Supports full datetime strings and 24-hour HHMM shorthand (e.g., "0530").
+    For HHMM shorthand we choose the datetime closest to "now" in UTC across
+    yesterday/today/tomorrow.
+    """
+
+    text = str(raw_value or "").strip()
+    if not text:
+        return None, None, "Enter a takeoff time to continue."
+
+    hhmm_match = re.fullmatch(r"([01]\d|2[0-3])([0-5]\d)", text)
+    if hhmm_match:
+        hour = int(hhmm_match.group(1))
+        minute = int(hhmm_match.group(2))
+        now_utc = datetime.now(timezone.utc)
+        candidates = [
+            datetime.combine(now_utc.date() + timedelta(days=offset), datetime.min.time(), tzinfo=timezone.utc)
+            .replace(hour=hour, minute=minute, second=0, microsecond=0)
+            for offset in (-1, 0, 1)
+        ]
+        parsed_utc = min(candidates, key=lambda dt: abs((dt - now_utc).total_seconds()))
+        unix_ms = int(parsed_utc.timestamp() * 1000)
+        return unix_ms, parsed_utc, None
+
+    try:
+        parsed = dateparse.parse(text, fuzzy=True, tzinfos=TZINFOS)
+    except Exception:
+        return None, None, "Could not parse the takeoff time. Include date/time, or use HHMM like 0530."
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed_utc = parsed.astimezone(timezone.utc)
+    unix_ms = int(parsed_utc.timestamp() * 1000)
+    return unix_ms, parsed_utc, None
+
+
+def _sync_automated_takeoff_to_fl3xx_postflight(
+    config: Fl3xxApiConfig,
+    frame: pd.DataFrame,
+    *,
+    enabled_tails: set[str],
+    events_lookup: Any = None,
+    recent_departure_window_minutes: int = 20,
+    lease_ttl_seconds: int = 45,
+) -> dict[str, Any]:
+    """Push FlightAware departure times into FL3XX postflight when empty.
+
+    Scope is limited to flights that are actively enroute and recently departed:
+    - has a hydrated departure timestamp,
+    - has no landing or on-block timestamp yet,
+    - has a recent Departure event (when event metadata is available).
+    """
+
+    summary: dict[str, Any] = {"attempted": 0, "updated": 0, "skipped": 0, "errors": []}
+    if frame.empty:
+        return summary
+
+    now_utc = datetime.now(timezone.utc)
+    window = timedelta(minutes=max(0, int(recent_departure_window_minutes)))
+
+    for _, row in frame.iterrows():
+        raw_tail = str(row.get("Aircraft") or "").strip().replace("-", "").upper()
+        if raw_tail not in enabled_tails:
+            continue
+
+        flight_id = row.get("_Fl3xxFlightId")
+        dep_actual = row.get("_DepActual_ts")
+        arr_actual = row.get("_ArrActual_ts")
+        on_block = row.get("_OnBlock_UTC")
+
+        if not flight_id or dep_actual is None or pd.isna(dep_actual):
+            continue
+
+        # Only process truly enroute flights (not yet landed or blocked in).
+        if arr_actual is not None and not pd.isna(arr_actual):
+            continue
+        if on_block is not None and not pd.isna(on_block):
+            continue
+
+        # Only process flights with a recent departure event, if metadata is available.
+        if events_lookup is not None:
+            leg_key = str(row.get("_LegKey") or "")
+            booking = str(row.get("Booking") or "")
+            leg_events = events_lookup(leg_key, booking)
+            dep_event = leg_events.get("Departure") if isinstance(leg_events, dict) else None
+            received_at = _parse_iso8601(dep_event.get("received_at")) if isinstance(dep_event, dict) else None
+            if received_at is None or (now_utc - received_at.astimezone(timezone.utc)) > window:
+                continue
+
+        if isinstance(dep_actual, pd.Timestamp):
+            dep_actual = dep_actual.to_pydatetime()
+        if dep_actual.tzinfo is None:
+            dep_actual = dep_actual.replace(tzinfo=timezone.utc)
+        dep_actual = dep_actual.astimezone(timezone.utc)
+        takeoff_unix_ms = int(dep_actual.timestamp() * 1000)
+
+        if not _acquire_postflight_sync_lease(
+            flight_id,
+            now=now_utc,
+            ttl_seconds=lease_ttl_seconds,
+        ):
+            summary["skipped"] += 1
+            continue
+
+        summary["attempted"] += 1
+        try:
+            result = sync_postflight_takeoff_if_empty(
+                config,
+                flight_id,
+                takeoff_unix_ms,
+            )
+        except Exception as exc:  # pragma: no cover - network-dependent
+            summary["errors"].append(
+                {
+                    "flight_id": flight_id,
+                    "tail": raw_tail,
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        if result.get("updated"):
+            summary["updated"] += 1
+        else:
+            summary["skipped"] += 1
+
+    return summary
 
 # Email Date header → UTC
 def get_email_date_utc(msg) -> datetime | None:
@@ -3033,6 +3231,29 @@ def _airport_token_variants(code: str) -> set[str]:
         if mapped_icao:
             tokens.add(mapped_icao)
     return tokens
+
+
+def _airport_codes_equivalent(*codes: Any) -> bool:
+    """Return True when any provided airport codes resolve to the same token set."""
+
+    token_sets: list[set[str]] = []
+    for code in codes:
+        code_text = str(code or "").strip().upper()
+        if not code_text:
+            continue
+        tokens = _airport_token_variants(code_text)
+        if not tokens:
+            tokens = {code_text}
+        token_sets.append(tokens)
+
+    if len(token_sets) < 2:
+        return False
+
+    base = token_sets[0]
+    for current in token_sets[1:]:
+        if base & current:
+            return True
+    return False
 
 
 def _parse_route_mismatch_status(status_text: str):
@@ -3551,6 +3772,19 @@ def apply_flightaware_webhook_updates(
                 if sched_dt is not None:
                     delta_min = int(round((event_dt - sched_dt).total_seconds() / 60.0))
 
+                scheduled_to_icao = str(match_row.get("To_ICAO") or "").strip().upper()
+                scheduled_to_iata = str(match_row.get("To_IATA") or "").strip().upper()
+
+                if event_type == "Diversion" and _airport_codes_equivalent(
+                    destination,
+                    scheduled_to_icao,
+                    scheduled_to_iata,
+                ):
+                    # Guard against FlightAware diversion alerts that only flip
+                    # between equivalent ICAO/IATA representations of the same
+                    # airport (for example CYCK vs YCK).
+                    continue
+
                 if event_type == "Arrival":
                     status_label = "🟣 ARRIVED"
                 elif event_type == "Departure":
@@ -3809,6 +4043,7 @@ if not df.empty:
                 "on": on_iso,
                 "status": status_val,
                 "delay_reasons": " | ".join(delay_reasons) if delay_reasons else "",
+                "flight_id": str(flight.get("flightId") or flight.get("id") or "").strip() or None,
             })
 
         booking_seq = defaultdict(int)
@@ -3816,6 +4051,7 @@ if not df.empty:
         on_vals: list[str | None] = []
         status_vals: list[str] = []
         delay_reason_vals: list[str] = []
+        flight_id_vals: list[str | None] = []
 
         for booking in df["Booking"]:
             seq_idx = booking_seq[booking]
@@ -3831,15 +4067,20 @@ if not df.empty:
                 on_iso = payload.get("on")
                 status_val = (payload.get("status") or "").strip()
                 delay_reasons_text = (payload.get("delay_reasons") or "").strip()
+                flight_id = payload.get("flight_id")
+            else:
+                flight_id = None
             off_vals.append(off_iso)
             on_vals.append(on_iso)
             status_vals.append(status_val)
             delay_reason_vals.append(delay_reasons_text)
+            flight_id_vals.append(flight_id)
 
         df["_OffBlock_UTC"] = pd.to_datetime(off_vals, utc=True, errors="coerce")
         df["_OnBlock_UTC"] = pd.to_datetime(on_vals, utc=True, errors="coerce")
         df["_FlightStatusRaw"] = status_vals
         df["Off Block Delay Codes"] = delay_reason_vals
+        df["_Fl3xxFlightId"] = flight_id_vals
 else:
     df["_LegKey"] = pd.Series(dtype=str, index=df.index)
 
@@ -4159,6 +4400,16 @@ df["_ETA_FA_ts"]    = pd.to_datetime(eta_fore_list,   utc=True)
 df["_ArrActual_ts"] = pd.to_datetime(arr_actual_list, utc=True)
 df["_EDCT_ts"]      = pd.to_datetime(edct_list,       utc=True)
 
+if "_Fl3xxFlightId" not in df.columns:
+    df["_Fl3xxFlightId"] = pd.Series("", index=df.index, dtype="object")
+
+_sync_automated_takeoff_to_fl3xx_postflight(
+    config,
+    df,
+    enabled_tails={"CFASF"},
+    events_lookup=_events_for_leg,
+)
+
 if not df.empty:
     eta_fa_series = df["_ETA_FA_ts"]
     eta_countdown_source = eta_fa_series.combine_first(df["ETA_UTC"])
@@ -4226,13 +4477,18 @@ def _format_downline_risk_text(booking_val: str) -> str:
         return "—"
 
     minutes = payload.get("delay_minutes")
-    minutes_txt = f"+{int(minutes)}m" if minutes is not None and not pd.isna(minutes) else "+0m"
+    minutes_val = int(minutes) if minutes is not None and not pd.isna(minutes) else 0
+    if minutes_val >= 15:
+        severity = "🔴"
+    elif minutes_val >= 6:
+        severity = "🟠"
+    else:
+        severity = "🟢"
+    minutes_txt = f"+{minutes_val}m"
     source_booking = payload.get("source_booking") or "previous leg"
-    window_txt = ""
-    if payload.get("arrival_label") != "—" or payload.get("projected_etd_label") != "—":
-        window_txt = f" ({payload.get('arrival_label')} → {payload.get('projected_etd_label')})"
+    dep_txt = payload.get("projected_etd_label") or "—"
 
-    return f"Carry-forward delay from {source_booking}: {minutes_txt}{window_txt}".strip()
+    return f"{severity} {minutes_txt} · Inbound {source_booking} · Dep {dep_txt}".strip()
 
 
 df["Downline Risk"] = df["Booking"].map(_format_downline_risk_text)
@@ -4396,6 +4652,10 @@ if show_account_column and "Account" in view_df.columns:
 
 view_df["_GapRow"] = False
 view_df = insert_gap_notice_rows(view_df)
+
+# Keep a unique, monotonic index so Styler mask alignment via ``reindex``
+# remains stable when operators adjust the schedule look-ahead window.
+view_df = view_df.reset_index(drop=True)
 
 # Ensure gap flag remains boolean after any transforms
 if "_GapRow" in view_df.columns:
@@ -5314,7 +5574,7 @@ for phase, title, description, expanded in SCHEDULE_PHASES:
 st.markdown("### Downline risk monitor")
 if downline_risk_summary:
     st.caption(
-        "Next legs on the same tail projected to depart late after enforcing a 45 minute minimum turn. "
+        "Heads-up view for projected downline delays. Delay impact is shown first, then the inbound cause and turn logic. "
         "Grouped by local departure date (today expanded; future days collapsed)."
     )
     for entry in downline_risk_summary:
@@ -5326,31 +5586,22 @@ if downline_risk_summary:
                 st.caption("No downline legs in this date bucket.")
                 continue
             for tail_entry in tails:
-                st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
                 for leg in tail_entry.get("legs", []):
-                    route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
-                    service_type = leg.get("next_service_type") or "—"
-                    service_txt = service_type
-                    if service_type == "PAX":
-                        account_txt = format_account_value(leg.get("next_account"))
-                        if account_txt != "—":
-                            service_txt = f"{service_type} · {account_txt}"
-                    if service_txt != "—":
-                        service_txt = f" · {service_txt}"
-                    arrival_label = leg.get("arrival_label") or "—"
-                    arrival_source = leg.get("arrival_source")
-                    if arrival_source:
-                        arrival_label = (
-                            f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
-                        )
-                    next_window = f"{arrival_label} → {leg.get('projected_etd_label') or '—'}"
+                    route_txt = leg.get("next_route") or "—"
                     minutes_txt = leg.get("delay_minutes")
-                    minutes_txt = (
-                        f"+{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "+0m"
-                    )
+                    minutes_val = int(minutes_txt) if minutes_txt is not None and not pd.isna(minutes_txt) else 0
+                    if minutes_val >= 15:
+                        severity_icon = "🔴"
+                    elif minutes_val >= 6:
+                        severity_icon = "🟠"
+                    else:
+                        severity_icon = "🟢"
+
                     st.markdown(
-                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}: {minutes_txt} "
-                        f"delay from {leg.get('source_booking') or 'previous leg'} ({next_window})"
+                        f"{severity_icon} **{leg.get('aircraft') or 'Unknown tail'} | {route_txt}**  \n"
+                        f"Delay: **+{minutes_val}m**  \n"
+                        f"Reason: Inbound **{leg.get('source_booking') or 'previous leg'}**  \n"
+                        f"Departs: **{leg.get('projected_etd_label') or '—'}**"
                     )
 else:
     st.caption("No downline legs currently flagged for carry-forward delays.")
@@ -5447,8 +5698,203 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
 
         _apply_inline_editor_updates(inline_original, edited_inline, editable_source)
 
+
+def _is_postflight_tester_ui_enabled() -> bool:
+    """Allow manual FL3XX tester UI only when explicitly enabled."""
+    return _secret_bool(_resolve_secret("ENABLE_POSTFLIGHT_TESTER_UI"), default=False)
+
+if _is_postflight_tester_ui_enabled():
+    with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
+        st.caption(
+            "Manual tester for posting one takeoff time to FL3XX postflight. "
+            "Workflow: GET payload → confirm takeoff is empty → POST with updated unix milliseconds value. "
+            "Tip: enter HHMM (e.g., 0530) to auto-pick the nearest UTC date (yesterday/today/tomorrow)."
+        )
+
+        flight_id_input = st.text_input("Flight ID", key="postflight_tester_flight_id", placeholder="1114918")
+        takeoff_input = st.text_input(
+            "Takeoff time (UTC unless timezone supplied, or HHMM like 0530)",
+            key="postflight_tester_takeoff_input",
+            placeholder="0530",
+        )
+
+        fetch_col, clear_col = st.columns([2, 1])
+        with fetch_col:
+            fetch_clicked = st.button("Fetch postflight payload", key="postflight_tester_fetch")
+        with clear_col:
+            if st.button("Clear cached payload", key="postflight_tester_clear"):
+                st.session_state.pop("postflight_tester_payload", None)
+                st.session_state.pop("postflight_tester_cached_flight_id", None)
+                st.success("Cached postflight payload cleared.")
+
+        if fetch_clicked:
+            flight_id_raw = str(flight_id_input or "").strip()
+            if not flight_id_raw:
+                st.error("Provide a flight ID before fetching postflight data.")
+            else:
+                try:
+                    fetched_payload = fetch_flight_postflight(config, flight_id_raw)
+                    st.session_state["postflight_tester_payload"] = fetched_payload
+                    st.session_state["postflight_tester_cached_flight_id"] = flight_id_raw
+                    takeoff_current = (
+                        fetched_payload.get("time", {})
+                        .get("dep", {})
+                        .get("takeOff")
+                    )
+                    st.success(f"Fetched postflight payload for flight {flight_id_raw}.")
+                    st.caption(f"Current takeOff value: {takeoff_current!r}")
+                except Exception as exc:
+                    st.error(f"Unable to fetch postflight payload: {exc}")
+
+        cached_payload = st.session_state.get("postflight_tester_payload")
+        cached_flight_id = st.session_state.get("postflight_tester_cached_flight_id")
+
+        if cached_payload and cached_flight_id:
+            current_takeoff = cached_payload.get("time", {}).get("dep", {}).get("takeOff")
+            st.info(f"Cached payload ready for flight {cached_flight_id}. Current takeOff: {current_takeoff!r}")
+
+            if st.button("POST updated takeoff", key="postflight_tester_post"):
+                unix_ms, parsed_utc, parse_error = parse_takeoff_input_to_unix_ms(takeoff_input)
+                if parse_error:
+                    st.error(parse_error)
+                elif unix_ms is None or parsed_utc is None:
+                    st.error("Unable to convert takeoff value to unix milliseconds.")
+                else:
+                    try:
+                        payload_to_post = build_postflight_takeoff_payload(cached_payload, unix_ms)
+                    except ValueError as exc:
+                        st.error(f"Cannot post update: {exc}")
+                    else:
+                        try:
+                            post_flight_postflight(config, cached_flight_id, payload_to_post)
+                            verify_payload = fetch_flight_postflight(config, cached_flight_id)
+                            verified_takeoff = verify_payload.get("time", {}).get("dep", {}).get("takeOff")
+
+                            if verified_takeoff == unix_ms:
+                                st.success(
+                                    "POST succeeded and was verified by a follow-up GET. "
+                                    f"takeOff={verified_takeoff} ({parsed_utc.strftime('%Y-%m-%d %H:%M:%SZ')})."
+                                )
+                                st.session_state["postflight_tester_payload"] = verify_payload
+                            else:
+                                st.warning(
+                                    "POST request completed, but verification GET returned a different takeOff value: "
+                                    f"{verified_takeoff!r}."
+                                )
+                        except Exception as exc:
+                            st.error(f"Postflight update failed: {exc}")
+
+        with st.expander("Preview cached payload", expanded=False):
+            if cached_payload:
+                st.json(cached_payload)
+            else:
+                st.caption("No payload cached yet. Fetch a flight first.")
+
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = df  # NOTE: keep original index; do NOT reset here
+
+def _eta_hhmm_local(row: pd.Series) -> str:
+    eta_label = str(get_local_eta_str(row) or "").upper()
+    hhmm = "".join(ch for ch in eta_label if ch.isdigit())[:4]
+    if len(hhmm) == 4:
+        return f"{hhmm}LT"
+    return ""
+
+
+def _quick_note_outline(
+    row: pd.Series,
+    delay_reason: str = "",
+    action_text: str = "",
+    note_text: str = "",
+) -> str:
+    tail = str(row.get("Aircraft") or "").replace("-", "").strip().upper() or "NA"
+    booking = str(row.get("Booking") or "").strip().upper() or "NA"
+
+    delta_minutes = int(_default_minutes_delta(row))
+    timing_label = "LATE" if delta_minutes >= 0 else "EARLY"
+    timing_value = f"{abs(delta_minutes)}MINS"
+
+    eta_text = _eta_hhmm_local(row)
+    reason_text = str(delay_reason or "").strip().upper()
+    action_value = str(action_text or "").strip().upper() or "NA"
+    note_value = str(note_text or "").strip().upper() or "NA"
+
+    lines = [
+        f"TAIL: {tail} // {booking}",
+        f"{timing_label}: {timing_value}",
+        f"UPDATED ETA: {eta_text}",
+    ]
+
+    if reason_text:
+        lines.append(f"REASON: {reason_text}")
+
+    lines.extend([
+        f"ACTION: {action_value}",
+        f"NOTE: {note_value}",
+    ])
+
+    return "\n".join(lines)
+
+
+with st.expander("Copy Telus outline (any row)", expanded=False):
+    gap_mask = _show["_GapRow"] if "_GapRow" in _show.columns else pd.Series(False, index=_show.index)
+    copy_source = _show[~gap_mask].copy()
+
+    if copy_source.empty:
+        st.caption("No rows available to generate an outline.")
+    else:
+        row_options = list(copy_source.index)
+
+        def _row_picker_label(row_idx) -> str:
+            row_item = copy_source.loc[row_idx]
+            booking = str(row_item.get("Booking") or "—")
+            aircraft = str(row_item.get("Aircraft") or "—")
+            route = str(row_item.get("Route") or "—")
+            status = str(row_item.get("Status") or "").strip()
+            return f"{booking} · {aircraft} · {route}{(' · ' + status) if status else ''}"
+
+        selected_idx = st.selectbox(
+            "Choose row",
+            options=row_options,
+            format_func=_row_picker_label,
+            key="any_row_outline_picker",
+        )
+        selected_row = copy_source.loc[selected_idx]
+
+        any_reason_key = "any_row_outline_reason"
+        any_reason_row_key = "any_row_outline_reason_row_idx"
+        auto_reason = str(selected_row.get("Off Block Delay Codes") or "").strip()
+        prev_selected_idx = st.session_state.get(any_reason_row_key)
+        if prev_selected_idx != selected_idx:
+            st.session_state[any_reason_key] = auto_reason
+            st.session_state[any_reason_row_key] = selected_idx
+        elif auto_reason and not str(st.session_state.get(any_reason_key, "")).strip():
+            st.session_state[any_reason_key] = auto_reason
+
+        c_reason, c_action, c_note = st.columns(3)
+        with c_reason:
+            any_reason = st.text_input(
+                "Reason (optional)",
+                key=any_reason_key,
+                placeholder="Leave blank if unknown",
+            )
+        with c_action:
+            any_action = st.text_input(
+                "Action (optional)",
+                key="any_row_outline_action",
+                placeholder="Defaults to NA if blank",
+            )
+        with c_note:
+            any_note = st.text_input(
+                "Note (optional)",
+                key="any_row_outline_note",
+                placeholder="Defaults to NA if blank",
+            )
+
+        st.code(
+            _quick_note_outline(selected_row, delay_reason=any_reason, action_text=any_action, note_text=any_note),
+            language="text",
+        )
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
@@ -5526,6 +5972,8 @@ def _default_task_title(row: pd.Series) -> str:
     return f"{tail} - {booking} - {account} - {_format_task_delta_label(delta_minutes)}"
 
 
+
+
 def _send_quick_notify(
     row: pd.Series,
     delay_reason: str,
@@ -5589,11 +6037,17 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                 if auto_reason and not str(st.session_state.get(reason_key, "")).strip():
                     st.session_state[reason_key] = auto_reason
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
+                action_key = f"delay_action_{booking_str}_{idx}"
+                st.text_input(
+                    "Action",
+                    key=action_key,
+                    placeholder="Defaults to NA in copied outline",
+                )
                 notes_key = f"delay_notes_{booking_str}_{idx}"
                 st.text_area(
                     "Notes",
                     key=notes_key,
-                    placeholder="Optional context shared at the end of the Telus post",
+                    placeholder="Defaults to NA in copied outline",
                     height=80,
                 )
             with btn_col:
@@ -5637,6 +6091,16 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                             )
                         else:
                             st.error(f"Failed: {result}")
+
+                with st.popover("🧾 Copy outline", use_container_width=True):
+                    reason_val = str(st.session_state.get(reason_key, ""))
+                    action_val = str(st.session_state.get(action_key, ""))
+                    notes_val = str(st.session_state.get(notes_key, ""))
+                    st.caption("Generate + copy a Telus-ready text block. Blank ACTION/NOTE default to NA.")
+                    st.code(
+                        _quick_note_outline(row, delay_reason=reason_val, action_text=action_val, note_text=notes_val),
+                        language="text",
+                    )
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
@@ -5764,6 +6228,12 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
                 if not event and (edct_info.get("edct_time_utc") or re.search(r"\bEDCT\b|Expected Departure Clearance Time", text, re.I)):
                     event = "EDCT"
 
+                if event == "EDCT":
+                    if edct_info.get("from") and not subj_info.get("from_airport"):
+                        subj_info["from_airport"] = edct_info.get("from")
+                    if edct_info.get("to") and not subj_info.get("to_airport"):
+                        subj_info["to_airport"] = edct_info.get("to")
+
                 if edct_only and event != "EDCT":
                     set_last_uid(IMAP_USER + ":" + IMAP_FOLDER, uid)
                     continue
@@ -5813,9 +6283,15 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
                         or now_utc
                     )
                 elif event == "EDCT":
-                    match_dt_utc = edct_info.get("edct_time_utc") or explicit_dt or hdr_dt
+                    match_dt_utc = (
+                        edct_info.get("original_dep_utc")
+                        or edct_info.get("edct_time_utc")
+                        or explicit_dt
+                        or hdr_dt
+                    )
                     actual_dt_utc = (
                         edct_info.get("edct_time_utc")
+                        or edct_info.get("original_dep_utc")
                         or explicit_dt
                         or hdr_dt
                         or now_utc
@@ -5956,6 +6432,7 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
 
 imap_poll_enabled = _secret_bool(_resolve_secret("IMAP_POLL_ENABLED"), default=True)
 imap_debug = _secret_bool(_resolve_secret("IMAP_DEBUG"), default=False)
+
 
 _max_per_poll_secret = _resolve_secret("IMAP_MAX_PER_POLL")
 max_per_poll = 200

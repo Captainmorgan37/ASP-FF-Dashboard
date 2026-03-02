@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -279,6 +280,74 @@ def fetch_flight_postflight(
                 pass
 
 
+def build_postflight_takeoff_payload(
+    postflight_payload: Dict[str, Any],
+    takeoff_unix_ms: int,
+    *,
+    require_empty_takeoff: bool = True,
+) -> Dict[str, Any]:
+    """Return a FL3XX postflight payload updated with a departure takeoff time.
+
+    The FL3XX postflight endpoint expects payloads in the same shape returned by
+    the corresponding GET request. During manual testing we intentionally remove
+    top-level ``tailNumber`` and ``aircraftId`` before posting the payload back.
+    """
+
+    if not isinstance(postflight_payload, MutableMapping):
+        raise ValueError("postflight payload must be a mapping")
+
+    payload = deepcopy(postflight_payload)
+    payload.pop("tailNumber", None)
+    payload.pop("aircraftId", None)
+
+    time_section = payload.get("time")
+    if not isinstance(time_section, MutableMapping):
+        raise ValueError("postflight payload is missing a 'time' object")
+
+    dep_section = time_section.get("dep")
+    if not isinstance(dep_section, MutableMapping):
+        raise ValueError("postflight payload is missing a 'time.dep' object")
+
+    existing_takeoff = dep_section.get("takeOff")
+    if require_empty_takeoff and existing_takeoff not in (None, ""):
+        raise ValueError("postflight payload already includes a takeOff value")
+
+    dep_section["takeOff"] = int(takeoff_unix_ms)
+    return payload
+
+
+def post_flight_postflight(
+    config: Fl3xxApiConfig,
+    flight_id: Any,
+    payload: Dict[str, Any],
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Submit a postflight payload for a specific flight."""
+
+    http = session or requests.Session()
+    close_session = session is None
+    try:
+        response = http.post(
+            _build_postflight_endpoint(config.base_url, flight_id),
+            headers=config.build_headers(),
+            json=payload,
+            timeout=config.timeout,
+            verify=config.verify_ssl,
+        )
+        response.raise_for_status()
+        if not response.content:
+            return {}
+        parsed = response.json()
+        return parsed if isinstance(parsed, MutableMapping) else {}
+    finally:
+        if close_session:
+            try:
+                http.close()
+            except AttributeError:
+                pass
+
+
 def _extract_delay_off_block_reasons(payload: Dict[str, Any]) -> List[str]:
     if not isinstance(payload, MutableMapping):
         return []
@@ -396,6 +465,47 @@ def enrich_flights_with_postflight_delay_codes(
     return summary
 
 
+def sync_postflight_takeoff_if_empty(
+    config: Fl3xxApiConfig,
+    flight_id: Any,
+    takeoff_unix_ms: int,
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Set postflight ``time.dep.takeOff`` only when currently empty.
+
+    Returns a small summary describing whether the payload was updated or skipped.
+    """
+
+    postflight_payload = fetch_flight_postflight(config, flight_id, session=session)
+    existing_takeoff = (
+        postflight_payload.get("time", {}).get("dep", {}).get("takeOff")
+        if isinstance(postflight_payload, MutableMapping)
+        else None
+    )
+
+    if existing_takeoff not in (None, ""):
+        return {
+            "updated": False,
+            "reason": "existing_takeoff",
+            "existing_takeoff": existing_takeoff,
+            "flight_id": flight_id,
+        }
+
+    payload_to_post = build_postflight_takeoff_payload(
+        postflight_payload,
+        int(takeoff_unix_ms),
+    )
+    post_flight_postflight(config, flight_id, payload_to_post, session=session)
+    return {
+        "updated": True,
+        "reason": "posted",
+        "existing_takeoff": existing_takeoff,
+        "flight_id": flight_id,
+        "takeoff_unix_ms": int(takeoff_unix_ms),
+    }
+
+
 
 def _select_crew_member(crew: Iterable[Dict[str, Any]], role: str) -> Optional[Dict[str, Any]]:
     for member in crew:
@@ -489,6 +599,7 @@ __all__ = [
     "fetch_flights",
     "fetch_flight_crew",
     "fetch_flight_postflight",
+    "sync_postflight_takeoff_if_empty",
     "enrich_flights_with_crew",
     "enrich_flights_with_postflight_delay_codes",
 ]
