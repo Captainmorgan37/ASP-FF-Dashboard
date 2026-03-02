@@ -5795,7 +5795,12 @@ def _eta_hhmm_local(row: pd.Series) -> str:
     return ""
 
 
-def _quick_note_outline(row: pd.Series, delay_reason: str = "", note_text: str = "") -> str:
+def _quick_note_outline(
+    row: pd.Series,
+    delay_reason: str = "",
+    action_text: str = "",
+    note_text: str = "",
+) -> str:
     tail = str(row.get("Aircraft") or "").replace("-", "").strip().upper() or "NA"
     booking = str(row.get("Booking") or "").strip().upper() or "NA"
 
@@ -5805,7 +5810,8 @@ def _quick_note_outline(row: pd.Series, delay_reason: str = "", note_text: str =
 
     eta_text = _eta_hhmm_local(row)
     reason_text = str(delay_reason or "").strip().upper()
-    note_value = str(note_text or "").strip().upper()
+    action_value = str(action_text or "").strip().upper() or "NA"
+    note_value = str(note_text or "").strip().upper() or "NA"
 
     lines = [
         f"TAIL: {tail} // {booking}",
@@ -5817,7 +5823,7 @@ def _quick_note_outline(row: pd.Series, delay_reason: str = "", note_text: str =
         lines.append(f"REASON: {reason_text}")
 
     lines.extend([
-        "ACTION: ",
+        f"ACTION: {action_value}",
         f"NOTE: {note_value}",
     ])
 
@@ -5849,21 +5855,30 @@ with st.expander("Copy Telus outline (any row)", expanded=False):
         )
         selected_row = copy_source.loc[selected_idx]
 
-        c_reason, c_note = st.columns(2)
+        c_reason, c_action, c_note = st.columns(3)
         with c_reason:
             any_reason = st.text_input(
                 "Reason (optional)",
                 key="any_row_outline_reason",
                 placeholder="Leave blank if unknown",
             )
+        with c_action:
+            any_action = st.text_input(
+                "Action (optional)",
+                key="any_row_outline_action",
+                placeholder="Defaults to NA if blank",
+            )
         with c_note:
             any_note = st.text_input(
                 "Note (optional)",
                 key="any_row_outline_note",
-                placeholder="Leave blank if unknown",
+                placeholder="Defaults to NA if blank",
             )
 
-        st.code(_quick_note_outline(selected_row, delay_reason=any_reason, note_text=any_note), language="text")
+        st.code(
+            _quick_note_outline(selected_row, delay_reason=any_reason, action_text=any_action, note_text=any_note),
+            language="text",
+        )
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
@@ -6006,11 +6021,17 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                 if auto_reason and not str(st.session_state.get(reason_key, "")).strip():
                     st.session_state[reason_key] = auto_reason
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
+                action_key = f"delay_action_{booking_str}_{idx}"
+                st.text_input(
+                    "Action",
+                    key=action_key,
+                    placeholder="Defaults to NA in copied outline",
+                )
                 notes_key = f"delay_notes_{booking_str}_{idx}"
                 st.text_area(
                     "Notes",
                     key=notes_key,
-                    placeholder="Optional context shared at the end of the Telus post",
+                    placeholder="Defaults to NA in copied outline",
                     height=80,
                 )
             with btn_col:
@@ -6057,9 +6078,13 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
 
                 with st.popover("🧾 Copy outline", use_container_width=True):
                     reason_val = str(st.session_state.get(reason_key, ""))
+                    action_val = str(st.session_state.get(action_key, ""))
                     notes_val = str(st.session_state.get(notes_key, ""))
-                    st.caption("Generate + copy a Telus-ready text block.")
-                    st.code(_quick_note_outline(row, delay_reason=reason_val, note_text=notes_val), language="text")
+                    st.caption("Generate + copy a Telus-ready text block. Blank ACTION/NOTE default to NA.")
+                    st.code(
+                        _quick_note_outline(row, delay_reason=reason_val, action_text=action_val, note_text=notes_val),
+                        language="text",
+                    )
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
