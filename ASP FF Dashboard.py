@@ -3363,6 +3363,16 @@ def choose_booking_for_event(
                 route_filter_hit = True
                 return cdf[icao_mask]
 
+            # FL3XX can sometimes place a 3-character token (typically IATA, but
+            # occasionally FAA/LID style values) in the ICAO column. Resolve those
+            # aliases through the airport metadata map so FlightAware ICAO values
+            # (e.g. 07FA) can still match schedule rows that carry OCA.
+            icao_alias_series = icao_series.where(icao_series.str.len() == 3, "").map(IATA_TO_ICAO_MAP)
+            alias_mask = icao_alias_series == tok_icao
+            if alias_mask.any():
+                route_filter_hit = True
+                return cdf[alias_mask]
+
             mapped_iata = ICAO_TO_IATA_MAP.get(tok_icao)
             if mapped_iata:
                 mapped_mask = iata_series == mapped_iata
