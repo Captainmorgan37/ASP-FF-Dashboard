@@ -5698,91 +5698,97 @@ with st.expander("Inline manual updates (UTC)", expanded=False):
 
         _apply_inline_editor_updates(inline_original, edited_inline, editable_source)
 
-with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
-    st.caption(
-        "Manual tester for posting one takeoff time to FL3XX postflight. "
-        "Workflow: GET payload → confirm takeoff is empty → POST with updated unix milliseconds value. "
-        "Tip: enter HHMM (e.g., 0530) to auto-pick the nearest UTC date (yesterday/today/tomorrow)."
-    )
 
-    flight_id_input = st.text_input("Flight ID", key="postflight_tester_flight_id", placeholder="1114918")
-    takeoff_input = st.text_input(
-        "Takeoff time (UTC unless timezone supplied, or HHMM like 0530)",
-        key="postflight_tester_takeoff_input",
-        placeholder="0530",
-    )
+def _is_postflight_tester_ui_enabled() -> bool:
+    """Allow manual FL3XX tester UI only when explicitly enabled."""
+    return _secret_bool(_resolve_secret("ENABLE_POSTFLIGHT_TESTER_UI"), default=False)
 
-    fetch_col, clear_col = st.columns([2, 1])
-    with fetch_col:
-        fetch_clicked = st.button("Fetch postflight payload", key="postflight_tester_fetch")
-    with clear_col:
-        if st.button("Clear cached payload", key="postflight_tester_clear"):
-            st.session_state.pop("postflight_tester_payload", None)
-            st.session_state.pop("postflight_tester_cached_flight_id", None)
-            st.success("Cached postflight payload cleared.")
+if _is_postflight_tester_ui_enabled():
+    with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
+        st.caption(
+            "Manual tester for posting one takeoff time to FL3XX postflight. "
+            "Workflow: GET payload → confirm takeoff is empty → POST with updated unix milliseconds value. "
+            "Tip: enter HHMM (e.g., 0530) to auto-pick the nearest UTC date (yesterday/today/tomorrow)."
+        )
 
-    if fetch_clicked:
-        flight_id_raw = str(flight_id_input or "").strip()
-        if not flight_id_raw:
-            st.error("Provide a flight ID before fetching postflight data.")
-        else:
-            try:
-                fetched_payload = fetch_flight_postflight(config, flight_id_raw)
-                st.session_state["postflight_tester_payload"] = fetched_payload
-                st.session_state["postflight_tester_cached_flight_id"] = flight_id_raw
-                takeoff_current = (
-                    fetched_payload.get("time", {})
-                    .get("dep", {})
-                    .get("takeOff")
-                )
-                st.success(f"Fetched postflight payload for flight {flight_id_raw}.")
-                st.caption(f"Current takeOff value: {takeoff_current!r}")
-            except Exception as exc:
-                st.error(f"Unable to fetch postflight payload: {exc}")
+        flight_id_input = st.text_input("Flight ID", key="postflight_tester_flight_id", placeholder="1114918")
+        takeoff_input = st.text_input(
+            "Takeoff time (UTC unless timezone supplied, or HHMM like 0530)",
+            key="postflight_tester_takeoff_input",
+            placeholder="0530",
+        )
 
-    cached_payload = st.session_state.get("postflight_tester_payload")
-    cached_flight_id = st.session_state.get("postflight_tester_cached_flight_id")
+        fetch_col, clear_col = st.columns([2, 1])
+        with fetch_col:
+            fetch_clicked = st.button("Fetch postflight payload", key="postflight_tester_fetch")
+        with clear_col:
+            if st.button("Clear cached payload", key="postflight_tester_clear"):
+                st.session_state.pop("postflight_tester_payload", None)
+                st.session_state.pop("postflight_tester_cached_flight_id", None)
+                st.success("Cached postflight payload cleared.")
 
-    if cached_payload and cached_flight_id:
-        current_takeoff = cached_payload.get("time", {}).get("dep", {}).get("takeOff")
-        st.info(f"Cached payload ready for flight {cached_flight_id}. Current takeOff: {current_takeoff!r}")
-
-        if st.button("POST updated takeoff", key="postflight_tester_post"):
-            unix_ms, parsed_utc, parse_error = parse_takeoff_input_to_unix_ms(takeoff_input)
-            if parse_error:
-                st.error(parse_error)
-            elif unix_ms is None or parsed_utc is None:
-                st.error("Unable to convert takeoff value to unix milliseconds.")
+        if fetch_clicked:
+            flight_id_raw = str(flight_id_input or "").strip()
+            if not flight_id_raw:
+                st.error("Provide a flight ID before fetching postflight data.")
             else:
                 try:
-                    payload_to_post = build_postflight_takeoff_payload(cached_payload, unix_ms)
-                except ValueError as exc:
-                    st.error(f"Cannot post update: {exc}")
+                    fetched_payload = fetch_flight_postflight(config, flight_id_raw)
+                    st.session_state["postflight_tester_payload"] = fetched_payload
+                    st.session_state["postflight_tester_cached_flight_id"] = flight_id_raw
+                    takeoff_current = (
+                        fetched_payload.get("time", {})
+                        .get("dep", {})
+                        .get("takeOff")
+                    )
+                    st.success(f"Fetched postflight payload for flight {flight_id_raw}.")
+                    st.caption(f"Current takeOff value: {takeoff_current!r}")
+                except Exception as exc:
+                    st.error(f"Unable to fetch postflight payload: {exc}")
+
+        cached_payload = st.session_state.get("postflight_tester_payload")
+        cached_flight_id = st.session_state.get("postflight_tester_cached_flight_id")
+
+        if cached_payload and cached_flight_id:
+            current_takeoff = cached_payload.get("time", {}).get("dep", {}).get("takeOff")
+            st.info(f"Cached payload ready for flight {cached_flight_id}. Current takeOff: {current_takeoff!r}")
+
+            if st.button("POST updated takeoff", key="postflight_tester_post"):
+                unix_ms, parsed_utc, parse_error = parse_takeoff_input_to_unix_ms(takeoff_input)
+                if parse_error:
+                    st.error(parse_error)
+                elif unix_ms is None or parsed_utc is None:
+                    st.error("Unable to convert takeoff value to unix milliseconds.")
                 else:
                     try:
-                        post_flight_postflight(config, cached_flight_id, payload_to_post)
-                        verify_payload = fetch_flight_postflight(config, cached_flight_id)
-                        verified_takeoff = verify_payload.get("time", {}).get("dep", {}).get("takeOff")
+                        payload_to_post = build_postflight_takeoff_payload(cached_payload, unix_ms)
+                    except ValueError as exc:
+                        st.error(f"Cannot post update: {exc}")
+                    else:
+                        try:
+                            post_flight_postflight(config, cached_flight_id, payload_to_post)
+                            verify_payload = fetch_flight_postflight(config, cached_flight_id)
+                            verified_takeoff = verify_payload.get("time", {}).get("dep", {}).get("takeOff")
 
-                        if verified_takeoff == unix_ms:
-                            st.success(
-                                "POST succeeded and was verified by a follow-up GET. "
-                                f"takeOff={verified_takeoff} ({parsed_utc.strftime('%Y-%m-%d %H:%M:%SZ')})."
-                            )
-                            st.session_state["postflight_tester_payload"] = verify_payload
-                        else:
-                            st.warning(
-                                "POST request completed, but verification GET returned a different takeOff value: "
-                                f"{verified_takeoff!r}."
-                            )
-                    except Exception as exc:
-                        st.error(f"Postflight update failed: {exc}")
+                            if verified_takeoff == unix_ms:
+                                st.success(
+                                    "POST succeeded and was verified by a follow-up GET. "
+                                    f"takeOff={verified_takeoff} ({parsed_utc.strftime('%Y-%m-%d %H:%M:%SZ')})."
+                                )
+                                st.session_state["postflight_tester_payload"] = verify_payload
+                            else:
+                                st.warning(
+                                    "POST request completed, but verification GET returned a different takeOff value: "
+                                    f"{verified_takeoff!r}."
+                                )
+                        except Exception as exc:
+                            st.error(f"Postflight update failed: {exc}")
 
-    with st.expander("Preview cached payload", expanded=False):
-        if cached_payload:
-            st.json(cached_payload)
-        else:
-            st.caption("No payload cached yet. Fetch a flight first.")
+        with st.expander("Preview cached payload", expanded=False):
+            if cached_payload:
+                st.json(cached_payload)
+            else:
+                st.caption("No payload cached yet. Fetch a flight first.")
 
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = df  # NOTE: keep original index; do NOT reset here
@@ -6426,6 +6432,7 @@ def imap_poll_once(max_to_process: int = 25, debug: bool = False, edct_only: boo
 
 imap_poll_enabled = _secret_bool(_resolve_secret("IMAP_POLL_ENABLED"), default=True)
 imap_debug = _secret_bool(_resolve_secret("IMAP_DEBUG"), default=False)
+
 
 _max_per_poll_secret = _resolve_secret("IMAP_MAX_PER_POLL")
 max_per_poll = 200
