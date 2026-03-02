@@ -5071,21 +5071,10 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     view = df_subset.loc[:, visible_columns]
     column_config: dict[str, Any] = {}
 
-    outline_booking_param = "outline_booking"
-
     if "Booking" in view.columns:
-        def _outline_link(value: Any) -> str:
-            booking = _normalize_booking_value(value)
-            if not booking:
-                return ""
-            return f"?{outline_booking_param}={quote_plus(booking)}#copy-telus-outline"
-
-        view = view.copy()
-        view["Booking"] = view["Booking"].apply(_outline_link)
-        column_config["Booking"] = st.column_config.LinkColumn(
+        column_config["Booking"] = st.column_config.TextColumn(
             "Booking",
-            help="Click booking to jump to Copy Telus outline and pre-select this flight.",
-            display_text=rf"\?{outline_booking_param}=([^#]+)#copy-telus-outline",
+            help="Click the row, then use the selected booking in Copy Telus outline.",
         )
 
     if "Aircraft" in view.columns:
@@ -5109,17 +5098,47 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     else:
         styler = styler.hide(axis="index")
 
+    selection_key = f"schedule_table_{phase}"
+
     try:
         active_fmt_map = {col: fmt for col, fmt in fmt_map.items() if col in view.columns}
         styler = styler.apply(_style_ops, axis=None).format(active_fmt_map)
-        st.dataframe(styler, width="stretch", column_config=column_config)
+        selection_event = st.dataframe(
+            styler,
+            width="stretch",
+            column_config=column_config,
+            key=selection_key,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
     except Exception:
         st.warning("Styling disabled (env compatibility). Showing plain table.")
         tmp = view.copy()
         for c in ["Off-Block (Sched)", "On-Block (Sched)", "ETA (FA)", "Landing (FA)"]:
             if c in tmp.columns:
                 tmp[c] = tmp[c].apply(lambda v: v.strftime("%H:%MZ") if pd.notna(v) else "—")
-        st.dataframe(tmp, width="stretch", column_config=column_config)
+        selection_event = st.dataframe(
+            tmp,
+            width="stretch",
+            column_config=column_config,
+            key=selection_key,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+
+    selected_rows = []
+    if selection_event is not None:
+        selected_rows = selection_event.get("selection", {}).get("rows", [])
+
+    if selected_rows and "Booking" in view.columns:
+        selected_pos = selected_rows[0]
+        if 0 <= selected_pos < len(view.index):
+            selected_idx = view.index[selected_pos]
+            selected_booking = _normalize_booking_value(view.iloc[selected_pos].get("Booking"))
+            if selected_booking:
+                st.session_state["outline_target_booking"] = selected_booking
+            st.session_state["outline_target_row_idx"] = selected_idx
+            st.session_state["outline_open_requested"] = True
 
 def _normalize_booking_value(value) -> str:
     if value is None:
@@ -5870,7 +5889,9 @@ def _quick_note_outline(
 
 st.markdown('<a id="copy-telus-outline"></a>', unsafe_allow_html=True)
 outline_booking_query = _normalize_booking_value(st.query_params.get("outline_booking", ""))
-open_outline_expander = bool(outline_booking_query)
+outline_target_booking = _normalize_booking_value(st.session_state.get("outline_target_booking", ""))
+outline_target_row_idx = st.session_state.get("outline_target_row_idx")
+open_outline_expander = bool(outline_booking_query or outline_target_booking or st.session_state.get("outline_open_requested"))
 
 with st.expander("Copy Telus outline (any row)", expanded=open_outline_expander):
     gap_mask = _show["_GapRow"] if "_GapRow" in _show.columns else pd.Series(False, index=_show.index)
@@ -5890,16 +5911,23 @@ with st.expander("Copy Telus outline (any row)", expanded=open_outline_expander)
             return f"{booking} · {aircraft} · {route}{(' · ' + status) if status else ''}"
 
         selected_idx_default = row_options[0]
-        if outline_booking_query:
-            matching = copy_source[copy_source["Booking"].astype(str).str.strip() == outline_booking_query]
-            if not matching.empty:
-                selected_idx_default = matching.index[0]
+
+        if outline_target_row_idx in copy_source.index:
+            selected_idx_default = outline_target_row_idx
+        else:
+            preferred_booking = outline_target_booking or outline_booking_query
+            if preferred_booking:
+                matching = copy_source[copy_source["Booking"].astype(str).str.strip() == preferred_booking]
+                if not matching.empty:
+                    selected_idx_default = matching.index[0]
 
         picker_key = "any_row_outline_picker"
         if picker_key not in st.session_state:
             st.session_state[picker_key] = selected_idx_default
-        elif outline_booking_query and st.session_state.get(picker_key) != selected_idx_default:
+        elif st.session_state.get("outline_open_requested") and st.session_state.get(picker_key) != selected_idx_default:
             st.session_state[picker_key] = selected_idx_default
+
+        st.session_state["outline_open_requested"] = False
 
         selected_idx = st.selectbox(
             "Choose row",
