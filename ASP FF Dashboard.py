@@ -5495,23 +5495,8 @@ if downline_risk_summary:
                 st.caption("No downline legs in this date bucket.")
                 continue
             for tail_entry in tails:
-                st.markdown(f"**{tail_entry.get('aircraft') or 'Unknown tail'}**")
                 for leg in tail_entry.get("legs", []):
-                    route_txt = f" · {leg.get('next_route')}" if leg.get("next_route") else ""
-                    service_type = leg.get("next_service_type") or "—"
-                    service_txt = service_type
-                    if service_type == "PAX":
-                        account_txt = format_account_value(leg.get("next_account"))
-                        if account_txt != "—":
-                            service_txt = f"{service_type} · {account_txt}"
-                    if service_txt != "—":
-                        service_txt = f" · {service_txt}"
-                    arrival_label = leg.get("arrival_label") or "—"
-                    arrival_source = leg.get("arrival_source")
-                    if arrival_source:
-                        arrival_label = (
-                            f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
-                        )
+                    route_txt = leg.get("next_route") or "—"
                     minutes_txt = leg.get("delay_minutes")
                     minutes_val = int(minutes_txt) if minutes_txt is not None and not pd.isna(minutes_txt) else 0
                     if minutes_val >= 15:
@@ -5521,23 +5506,11 @@ if downline_risk_summary:
                     else:
                         severity_icon = "🟢"
 
-                    st.markdown(f"{severity_icon} **{leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}**")
-                    c1, c2 = st.columns([1, 2])
-                    with c1:
-                        st.markdown(
-                            f"**Impact**  \n{severity_icon} **+{minutes_val}m downline delay**  \nNew departure: **{leg.get('projected_etd_label') or '—'}**"
-                        )
-                    with c2:
-                        st.markdown(
-                            f"**Cause**  \nInbound leg: **{leg.get('source_booking') or 'previous leg'}**  \nInbound arrival: **{arrival_label}**"
-                        )
-
-                    st.caption(
-                        "Inbound ETA "
-                        f"{arrival_label} + min turn {int(leg.get('required_turn_min') or 45)}m => "
-                        f"earliest dep {leg.get('earliest_dep_label') or '—'} | "
-                        f"planned dep {leg.get('scheduled_etd_label') or '—'} | "
-                        f"result +{minutes_val}m"
+                    st.markdown(
+                        f"{severity_icon} **{leg.get('aircraft') or 'Unknown tail'} | {route_txt}**  \n"
+                        f"Delay: **+{minutes_val}m**  \n"
+                        f"Reason: Inbound **{leg.get('source_booking') or 'previous leg'}**  \n"
+                        f"Departs: **{leg.get('projected_etd_label') or '—'}**"
                     )
 else:
     st.caption("No downline legs currently flagged for carry-forward delays.")
