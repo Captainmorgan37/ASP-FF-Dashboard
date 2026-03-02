@@ -2533,6 +2533,10 @@ def build_downline_risk_map(
                         "delay_minutes": delay_minutes,
                         "arrival_label": prev_arrival_label or "—",
                         "arrival_source": prev_arrival_source or "",
+                        "required_turn_min": int(required_turn_min),
+                        "earliest_dep_label": _format_turn_timestamp(
+                            (prev_projected_arrival + required_turn_td) if prev_projected_arrival is not None else sched_dep
+                        ),
                         "scheduled_etd_label": _format_turn_timestamp(sched_dep),
                         "projected_etd_label": _format_turn_timestamp(projected_dep),
                         "next_route": str(row.get("Route") or "").strip(),
@@ -4382,13 +4386,18 @@ def _format_downline_risk_text(booking_val: str) -> str:
         return "—"
 
     minutes = payload.get("delay_minutes")
-    minutes_txt = f"+{int(minutes)}m" if minutes is not None and not pd.isna(minutes) else "+0m"
+    minutes_val = int(minutes) if minutes is not None and not pd.isna(minutes) else 0
+    if minutes_val >= 15:
+        severity = "🔴"
+    elif minutes_val >= 6:
+        severity = "🟠"
+    else:
+        severity = "🟢"
+    minutes_txt = f"+{minutes_val}m"
     source_booking = payload.get("source_booking") or "previous leg"
-    window_txt = ""
-    if payload.get("arrival_label") != "—" or payload.get("projected_etd_label") != "—":
-        window_txt = f" ({payload.get('arrival_label')} → {payload.get('projected_etd_label')})"
+    dep_txt = payload.get("projected_etd_label") or "—"
 
-    return f"Carry-forward delay from {source_booking}: {minutes_txt}{window_txt}".strip()
+    return f"{severity} {minutes_txt} · Inbound {source_booking} · Dep {dep_txt}".strip()
 
 
 df["Downline Risk"] = df["Booking"].map(_format_downline_risk_text)
@@ -5474,7 +5483,7 @@ for phase, title, description, expanded in SCHEDULE_PHASES:
 st.markdown("### Downline risk monitor")
 if downline_risk_summary:
     st.caption(
-        "Next legs on the same tail projected to depart late after enforcing a 45 minute minimum turn. "
+        "Heads-up view for projected downline delays. Delay impact is shown first, then the inbound cause and turn logic. "
         "Grouped by local departure date (today expanded; future days collapsed)."
     )
     for entry in downline_risk_summary:
@@ -5503,14 +5512,32 @@ if downline_risk_summary:
                         arrival_label = (
                             f"{arrival_label} ({arrival_source})" if arrival_label != "—" else arrival_source
                         )
-                    next_window = f"{arrival_label} → {leg.get('projected_etd_label') or '—'}"
                     minutes_txt = leg.get("delay_minutes")
-                    minutes_txt = (
-                        f"+{int(minutes_txt)}m" if minutes_txt is not None and not pd.isna(minutes_txt) else "+0m"
-                    )
-                    st.markdown(
-                        f"- {leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}: {minutes_txt} "
-                        f"delay from {leg.get('source_booking') or 'previous leg'} ({next_window})"
+                    minutes_val = int(minutes_txt) if minutes_txt is not None and not pd.isna(minutes_txt) else 0
+                    if minutes_val >= 15:
+                        severity_icon = "🔴"
+                    elif minutes_val >= 6:
+                        severity_icon = "🟠"
+                    else:
+                        severity_icon = "🟢"
+
+                    st.markdown(f"{severity_icon} **{leg.get('next_booking') or 'Next leg'}{route_txt}{service_txt}**")
+                    c1, c2 = st.columns([1, 2])
+                    with c1:
+                        st.markdown(
+                            f"**Impact**  \n{severity_icon} **+{minutes_val}m downline delay**  \nNew departure: **{leg.get('projected_etd_label') or '—'}**"
+                        )
+                    with c2:
+                        st.markdown(
+                            f"**Cause**  \nInbound leg: **{leg.get('source_booking') or 'previous leg'}**  \nInbound arrival: **{arrival_label}**"
+                        )
+
+                    st.caption(
+                        "Inbound ETA "
+                        f"{arrival_label} + min turn {int(leg.get('required_turn_min') or 45)}m => "
+                        f"earliest dep {leg.get('earliest_dep_label') or '—'} | "
+                        f"planned dep {leg.get('scheduled_etd_label') or '—'} | "
+                        f"result +{minutes_val}m"
                     )
 else:
     st.caption("No downline legs currently flagged for carry-forward delays.")
