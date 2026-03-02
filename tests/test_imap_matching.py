@@ -222,3 +222,34 @@ def test_airport_codes_equivalent_rejects_unrelated_codes():
     _namespace["IATA_TO_ICAO_MAP"] = {"YCK": "CYCK", "YVL": "CYVL"}
 
     assert not _airport_codes_equivalent("CYCK", "CYVL")
+
+
+def test_choose_booking_matches_flightaware_icao_when_schedule_icao_column_contains_iata_fallback():
+    df_clean = pd.DataFrame(
+        [
+            {
+                "Booking": "4001",
+                "Aircraft": "C-FASP",
+                "From_IATA": "YUL",
+                "From_ICAO": "CYUL",
+                "To_IATA": "",
+                "To_ICAO": "OCA",
+                "ETD_UTC": pd.Timestamp("2024-04-01T12:00:00Z"),
+                "ETA_UTC": pd.Timestamp("2024-04-01T15:00:00Z"),
+            }
+        ]
+    )
+
+    _namespace["df_clean"] = df_clean
+    _namespace["ICAO_TO_IATA_MAP"] = {"07FA": "OCA", "CYUL": "YUL"}
+    _namespace["IATA_TO_ICAO_MAP"] = {"OCA": "07FA", "YUL": "CYUL"}
+
+    subj_info = {
+        "from_airport": "CYUL",
+        "to_airport": "07FA",
+    }
+
+    match = choose_booking_for_event(subj_info, ["C-FASP"], "Departure", None)
+
+    assert match is not None
+    assert match["Booking"] == "4001"
