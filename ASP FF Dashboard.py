@@ -172,6 +172,13 @@ def init_db() -> bool:
         )
         """)
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS postflight_sync_leases (
+            flight_id TEXT PRIMARY KEY,
+            lease_until_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        )
+        """)
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS notification_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sent_at_utc TEXT NOT NULL,
@@ -469,6 +476,45 @@ def save_fl3xx_cache(
             """,
             (payload_json, digest, fetched_at, from_date, to_date, crew_fetched_at),
         )
+
+
+def _acquire_postflight_sync_lease(flight_id: Any, *, now: datetime | None = None, ttl_seconds: int = 45) -> bool:
+    flight_key = str(flight_id or "").strip()
+    if not flight_key:
+        return False
+
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lease_until = current_time + timedelta(seconds=max(1, int(ttl_seconds)))
+    now_iso = _to_iso8601_z(current_time)
+    lease_until_iso = _to_iso8601_z(lease_until)
+    if not now_iso or not lease_until_iso:
+        return False
+
+    with _connect_db() as conn:
+        conn.execute(
+            "DELETE FROM postflight_sync_leases WHERE lease_until_utc <= ?",
+            (now_iso,),
+        )
+        row = conn.execute(
+            "SELECT lease_until_utc FROM postflight_sync_leases WHERE flight_id=?",
+            (flight_key,),
+        ).fetchone()
+        if row:
+            existing_until = _parse_iso8601(row[0])
+            if existing_until and existing_until > current_time:
+                return False
+
+        conn.execute(
+            """
+            INSERT INTO postflight_sync_leases (flight_id, lease_until_utc, updated_at_utc)
+            VALUES (?, ?, ?)
+            ON CONFLICT(flight_id) DO UPDATE SET
+                lease_until_utc=excluded.lease_until_utc,
+                updated_at_utc=excluded.updated_at_utc
+            """,
+            (flight_key, lease_until_iso, now_iso),
+        )
+    return True
 
 
 init_db()
@@ -2888,6 +2934,7 @@ def _sync_automated_takeoff_to_fl3xx_postflight(
     enabled_tails: set[str],
     events_lookup: Any = None,
     recent_departure_window_minutes: int = 20,
+    lease_ttl_seconds: int = 45,
 ) -> dict[str, Any]:
     """Push FlightAware departure times into FL3XX postflight when empty.
 
@@ -2939,6 +2986,14 @@ def _sync_automated_takeoff_to_fl3xx_postflight(
             dep_actual = dep_actual.replace(tzinfo=timezone.utc)
         dep_actual = dep_actual.astimezone(timezone.utc)
         takeoff_unix_ms = int(dep_actual.timestamp() * 1000)
+
+        if not _acquire_postflight_sync_lease(
+            flight_id,
+            now=now_utc,
+            ttl_seconds=lease_ttl_seconds,
+        ):
+            summary["skipped"] += 1
+            continue
 
         summary["attempted"] += 1
         try:
