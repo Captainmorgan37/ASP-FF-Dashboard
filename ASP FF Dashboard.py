@@ -5787,6 +5787,84 @@ with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = df  # NOTE: keep original index; do NOT reset here
 
+def _eta_hhmm_local(row: pd.Series) -> str:
+    eta_label = str(get_local_eta_str(row) or "").upper()
+    hhmm = "".join(ch for ch in eta_label if ch.isdigit())[:4]
+    if len(hhmm) == 4:
+        return f"{hhmm}LT"
+    return ""
+
+
+def _quick_note_outline(row: pd.Series, delay_reason: str = "", note_text: str = "") -> str:
+    tail = str(row.get("Aircraft") or "").replace("-", "").strip().upper() or "NA"
+    booking = str(row.get("Booking") or "").strip().upper() or "NA"
+
+    delta_minutes = int(_default_minutes_delta(row))
+    timing_label = "LATE" if delta_minutes >= 0 else "EARLY"
+    timing_value = f"{abs(delta_minutes)}MINS"
+
+    eta_text = _eta_hhmm_local(row)
+    reason_text = str(delay_reason or "").strip().upper()
+    note_value = str(note_text or "").strip().upper()
+
+    lines = [
+        f"TAIL: {tail} // {booking}",
+        f"{timing_label}: {timing_value}",
+        f"UPDATED ETA: {eta_text}",
+    ]
+
+    if reason_text:
+        lines.append(f"REASON: {reason_text}")
+
+    lines.extend([
+        "ACTION: ",
+        f"NOTE: {note_value}",
+    ])
+
+    return "\n".join(lines)
+
+
+with st.expander("Copy Telus outline (any row)", expanded=False):
+    gap_mask = _show["_GapRow"] if "_GapRow" in _show.columns else pd.Series(False, index=_show.index)
+    copy_source = _show[~gap_mask].copy()
+
+    if copy_source.empty:
+        st.caption("No rows available to generate an outline.")
+    else:
+        row_options = list(copy_source.index)
+
+        def _row_picker_label(row_idx) -> str:
+            row_item = copy_source.loc[row_idx]
+            booking = str(row_item.get("Booking") or "—")
+            aircraft = str(row_item.get("Aircraft") or "—")
+            route = str(row_item.get("Route") or "—")
+            status = str(row_item.get("Status") or "").strip()
+            return f"{booking} · {aircraft} · {route}{(' · ' + status) if status else ''}"
+
+        selected_idx = st.selectbox(
+            "Choose row",
+            options=row_options,
+            format_func=_row_picker_label,
+            key="any_row_outline_picker",
+        )
+        selected_row = copy_source.loc[selected_idx]
+
+        c_reason, c_note = st.columns(2)
+        with c_reason:
+            any_reason = st.text_input(
+                "Reason (optional)",
+                key="any_row_outline_reason",
+                placeholder="Leave blank if unknown",
+            )
+        with c_note:
+            any_note = st.text_input(
+                "Note (optional)",
+                key="any_row_outline_note",
+                placeholder="Leave blank if unknown",
+            )
+
+        st.code(_quick_note_outline(selected_row, delay_reason=any_reason, note_text=any_note), language="text")
+
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
 # Variances vs schedule (same as styling)
@@ -5861,6 +5939,8 @@ def _default_task_title(row: pd.Series) -> str:
 
     delta_minutes = _default_minutes_delta(row)
     return f"{tail} - {booking} - {account} - {_format_task_delta_label(delta_minutes)}"
+
+
 
 
 def _send_quick_notify(
@@ -5974,6 +6054,12 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                             )
                         else:
                             st.error(f"Failed: {result}")
+
+                with st.popover("🧾 Copy outline", use_container_width=True):
+                    reason_val = str(st.session_state.get(reason_key, ""))
+                    notes_val = str(st.session_state.get(notes_key, ""))
+                    st.caption("Generate + copy a Telus-ready text block.")
+                    st.code(_quick_note_outline(row, delay_reason=reason_val, note_text=notes_val), language="text")
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
