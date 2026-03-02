@@ -3,6 +3,7 @@
 import os
 import re
 import json
+from urllib.parse import quote_plus
 import sqlite3
 import imaplib, email
 from collections import defaultdict
@@ -5070,6 +5071,23 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
     view = df_subset.loc[:, visible_columns]
     column_config: dict[str, Any] = {}
 
+    outline_booking_param = "outline_booking"
+
+    if "Booking" in view.columns:
+        def _outline_link(value: Any) -> str:
+            booking = _normalize_booking_value(value)
+            if not booking:
+                return ""
+            return f"?{outline_booking_param}={quote_plus(booking)}#copy-telus-outline"
+
+        view = view.copy()
+        view["Booking"] = view["Booking"].apply(_outline_link)
+        column_config["Booking"] = st.column_config.LinkColumn(
+            "Booking",
+            help="Click booking to jump to Copy Telus outline and pre-select this flight.",
+            display_text=rf"\?{outline_booking_param}=([^#]+)#copy-telus-outline",
+        )
+
     if "Aircraft" in view.columns:
         def _flightaware_tail_link(value: Any) -> str:
             tail = ("" if value is None else str(value)).strip().upper()
@@ -5106,6 +5124,10 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
 def _normalize_booking_value(value) -> str:
     if value is None:
         return ""
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return ""
+        return _normalize_booking_value(value[0])
     if isinstance(value, str):
         return value.strip()
     try:
@@ -5846,7 +5868,11 @@ def _quick_note_outline(
     return "\n".join(lines)
 
 
-with st.expander("Copy Telus outline (any row)", expanded=False):
+st.markdown('<a id="copy-telus-outline"></a>', unsafe_allow_html=True)
+outline_booking_query = _normalize_booking_value(st.query_params.get("outline_booking", ""))
+open_outline_expander = bool(outline_booking_query)
+
+with st.expander("Copy Telus outline (any row)", expanded=open_outline_expander):
     gap_mask = _show["_GapRow"] if "_GapRow" in _show.columns else pd.Series(False, index=_show.index)
     copy_source = _show[~gap_mask].copy()
 
@@ -5863,11 +5889,23 @@ with st.expander("Copy Telus outline (any row)", expanded=False):
             status = str(row_item.get("Status") or "").strip()
             return f"{booking} · {aircraft} · {route}{(' · ' + status) if status else ''}"
 
+        selected_idx_default = row_options[0]
+        if outline_booking_query:
+            matching = copy_source[copy_source["Booking"].astype(str).str.strip() == outline_booking_query]
+            if not matching.empty:
+                selected_idx_default = matching.index[0]
+
+        picker_key = "any_row_outline_picker"
+        if picker_key not in st.session_state:
+            st.session_state[picker_key] = selected_idx_default
+        elif outline_booking_query and st.session_state.get(picker_key) != selected_idx_default:
+            st.session_state[picker_key] = selected_idx_default
+
         selected_idx = st.selectbox(
             "Choose row",
             options=row_options,
             format_func=_row_picker_label,
-            key="any_row_outline_picker",
+            key=picker_key,
         )
         selected_row = copy_source.loc[selected_idx]
 
