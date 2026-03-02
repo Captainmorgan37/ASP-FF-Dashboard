@@ -4551,6 +4551,10 @@ if show_account_column and "Account" in view_df.columns:
 view_df["_GapRow"] = False
 view_df = insert_gap_notice_rows(view_df)
 
+# Keep a unique, monotonic index so Styler mask alignment via ``reindex``
+# remains stable when operators adjust the schedule look-ahead window.
+view_df = view_df.reset_index(drop=True)
+
 # Ensure gap flag remains boolean after any transforms
 if "_GapRow" in view_df.columns:
     view_df["_GapRow"] = view_df["_GapRow"].fillna(False).astype(bool)
