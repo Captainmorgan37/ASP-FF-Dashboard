@@ -2519,6 +2519,8 @@ def build_downline_risk_map(
                 if delay_minutes >= 5 and not has_departed:
                     from_icao = str(row.get("From_ICAO") or "").strip().upper()
                     local_date, date_label, day_delta = _local_departure_date_parts(sched_dep, from_icao)
+                    if day_delta < 0:
+                        continue
                     next_account = str(row.get("Account") or "").strip()
                     next_workflow = str(row.get("Workflow") or "").strip()
                     next_service_type = _infer_service_type(next_workflow, next_account)
