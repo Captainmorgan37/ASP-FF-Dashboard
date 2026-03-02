@@ -5787,6 +5787,43 @@ with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = df  # NOTE: keep original index; do NOT reset here
 
+def _eta_hhmm_local(row: pd.Series) -> str:
+    eta_label = str(get_local_eta_str(row) or "").upper()
+    hhmm = "".join(ch for ch in eta_label if ch.isdigit())[:4]
+    if len(hhmm) == 4:
+        return f"{hhmm}LT"
+    return ""
+
+
+def _quick_note_outline(row: pd.Series, delay_reason: str = "", note_text: str = "") -> str:
+    tail = str(row.get("Aircraft") or "").replace("-", "").strip().upper() or "NA"
+    booking = str(row.get("Booking") or "").strip().upper() or "NA"
+
+    delta_minutes = int(_default_minutes_delta(row))
+    timing_label = "LATE" if delta_minutes >= 0 else "EARLY"
+    timing_value = f"{abs(delta_minutes)}MINS"
+
+    eta_text = _eta_hhmm_local(row)
+    reason_text = str(delay_reason or "").strip().upper()
+    note_value = str(note_text or "").strip().upper()
+
+    lines = [
+        f"TAIL: {tail} // {booking}",
+        f"{timing_label}: {timing_value}",
+        f"UPDATED ETA: {eta_text}",
+    ]
+
+    if reason_text:
+        lines.append(f"REASON: {reason_text}")
+
+    lines.extend([
+        "ACTION: ",
+        f"NOTE: {note_value}",
+    ])
+
+    return "\n".join(lines)
+
+
 with st.expander("Copy Telus outline (any row)", expanded=False):
     gap_mask = _show["_GapRow"] if "_GapRow" in _show.columns else pd.Series(False, index=_show.index)
     copy_source = _show[~gap_mask].copy()
@@ -5904,41 +5941,6 @@ def _default_task_title(row: pd.Series) -> str:
     return f"{tail} - {booking} - {account} - {_format_task_delta_label(delta_minutes)}"
 
 
-def _eta_hhmm_local(row: pd.Series) -> str:
-    eta_label = str(get_local_eta_str(row) or "").upper()
-    hhmm = "".join(ch for ch in eta_label if ch.isdigit())[:4]
-    if len(hhmm) == 4:
-        return f"{hhmm}LT"
-    return ""
-
-
-def _quick_note_outline(row: pd.Series, delay_reason: str = "", note_text: str = "") -> str:
-    tail = str(row.get("Aircraft") or "").replace("-", "").strip().upper() or "NA"
-    booking = str(row.get("Booking") or "").strip().upper() or "NA"
-
-    delta_minutes = int(_default_minutes_delta(row))
-    timing_label = "LATE" if delta_minutes >= 0 else "EARLY"
-    timing_value = f"{abs(delta_minutes)}MINS"
-
-    eta_text = _eta_hhmm_local(row)
-    reason_text = str(delay_reason or "").strip().upper()
-    note_value = str(note_text or "").strip().upper()
-
-    lines = [
-        f"TAIL: {tail} // {booking}",
-        f"{timing_label}: {timing_value}",
-        f"UPDATED ETA: {eta_text}",
-    ]
-
-    if reason_text:
-        lines.append(f"REASON: {reason_text}")
-
-    lines.extend([
-        "ACTION: ",
-        f"NOTE: {note_value}",
-    ])
-
-    return "\n".join(lines)
 
 
 def _send_quick_notify(
