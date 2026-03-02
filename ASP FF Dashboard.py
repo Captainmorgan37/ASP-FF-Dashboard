@@ -5861,11 +5861,21 @@ with st.expander("Copy Telus outline (any row)", expanded=False):
         )
         selected_row = copy_source.loc[selected_idx]
 
+        any_reason_key = "any_row_outline_reason"
+        any_reason_row_key = "any_row_outline_reason_row_idx"
+        auto_reason = str(selected_row.get("Off Block Delay Codes") or "").strip()
+        prev_selected_idx = st.session_state.get(any_reason_row_key)
+        if prev_selected_idx != selected_idx:
+            st.session_state[any_reason_key] = auto_reason
+            st.session_state[any_reason_row_key] = selected_idx
+        elif auto_reason and not str(st.session_state.get(any_reason_key, "")).strip():
+            st.session_state[any_reason_key] = auto_reason
+
         c_reason, c_action, c_note = st.columns(3)
         with c_reason:
             any_reason = st.text_input(
                 "Reason (optional)",
-                key="any_row_outline_reason",
+                key=any_reason_key,
                 placeholder="Leave blank if unknown",
             )
         with c_action:
