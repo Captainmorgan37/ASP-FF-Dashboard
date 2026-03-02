@@ -6040,7 +6040,7 @@ with st.expander("Copy Telus outline (any row)", expanded=open_outline_expander)
                 booking=selected_booking,
                 notify_mode="telus_outline",
             )
-            st.success(f"Marked {selected_booking or 'selected flight'} as posted to Telus")
+            st.rerun()
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
@@ -6258,7 +6258,7 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                             booking=booking_str,
                             notify_mode="telus_outline",
                         )
-                        st.success(f"Marked {row['Booking']} as posted to Telus")
+                        st.rerun()
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
