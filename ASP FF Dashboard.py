@@ -4416,7 +4416,7 @@ if "_Fl3xxFlightId" not in df.columns:
 _sync_automated_takeoff_to_fl3xx_postflight(
     config,
     df,
-    enabled_tails={"CFASF"},
+    enabled_tails={"CFASF", "CGASL", "CFASV", "CFLAS", "CFJAS"},
     events_lookup=_events_for_leg,
 )
 
