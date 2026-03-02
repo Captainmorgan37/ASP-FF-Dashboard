@@ -391,11 +391,57 @@ def load_flight_notification_updates(booking: str, limit: int = 5) -> list[str]:
     entries: list[str] = []
     for sent_at_utc, notify_mode in rows:
         mode = str(notify_mode or "").strip().lower()
-        mode_text = "Task" if mode == "task" else "Note"
+        if mode == "task":
+            mode_text = "Task"
+        elif mode == "telus_outline":
+            mode_text = "Telus outline"
+        else:
+            mode_text = "Note"
         sent_text = str(sent_at_utc or "").strip() or "Unknown time"
         entries.append(f"🔔 {mode_text} posted at {sent_text} UTC")
     entries.reverse()
     return entries
+
+
+def load_telus_outline_posted_map(bookings: list[str]) -> dict[str, str]:
+    booking_keys = [str(b or "").strip() for b in bookings]
+    booking_keys = [b for b in booking_keys if b]
+    if not booking_keys:
+        return {}
+
+    placeholders = ",".join("?" for _ in booking_keys)
+    with _connect_db() as conn:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT booking, MAX(sent_at_utc) AS sent_at_utc
+                FROM notification_history
+                WHERE notify_mode = 'telus_outline'
+                  AND booking IN ({placeholders})
+                GROUP BY booking
+                """,
+                booking_keys,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            _ensure_notification_history_columns(conn)
+            return {}
+
+    status_map: dict[str, str] = {}
+    for booking, sent_at_utc in rows:
+        booking_key = str(booking or "").strip()
+        if not booking_key:
+            continue
+        sent_text = str(sent_at_utc or "").strip()
+        if sent_text:
+            try:
+                sent_dt = datetime.strptime(sent_text, "%Y-%m-%dT%H:%M:%SZ")
+                sent_text = sent_dt.strftime("%H:%MZ")
+            except ValueError:
+                pass
+            status_map[booking_key] = f"✅ {sent_text}"
+        else:
+            status_map[booking_key] = "✅"
+    return status_map
 
 
 def load_ff_assignment() -> tuple[str, str]:
@@ -5068,8 +5114,20 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
         )
 
     visible_columns = filtered_columns_for_phase(phase, df_subset.columns)
-    view = df_subset.loc[:, visible_columns]
+    view = df_subset.loc[:, visible_columns].copy()
     column_config: dict[str, Any] = {}
+
+    if "Booking" in view.columns:
+        telus_status_map = load_telus_outline_posted_map(view["Booking"].astype(str).tolist())
+        view["Telus Posted"] = view["Booking"].astype(str).str.strip().map(telus_status_map).fillna("⬜")
+        booking_idx = view.columns.get_loc("Booking") + 1
+        ordered_columns = list(view.columns)
+        ordered_columns.insert(booking_idx, ordered_columns.pop(ordered_columns.index("Telus Posted")))
+        view = view.loc[:, ordered_columns]
+        column_config["Telus Posted"] = st.column_config.TextColumn(
+            "Telus Posted",
+            help="✅ means a Telus outline was marked as posted; shows latest UTC time.",
+        )
 
     if "Booking" in view.columns:
         column_config["Booking"] = st.column_config.TextColumn(
@@ -5084,7 +5142,6 @@ def _render_schedule_table(df_subset: pd.DataFrame, phase: str) -> None:
                 return ""
             return f"https://flightaware.com/live/flight/{tail.replace('-', '')}"
 
-        view = view.copy()
         view["Aircraft"] = view["Aircraft"].apply(_flightaware_tail_link)
         column_config["Aircraft"] = st.column_config.LinkColumn(
             "Aircraft",
@@ -5967,10 +6024,23 @@ with st.expander("Copy Telus outline (any row)", expanded=open_outline_expander)
                 placeholder="Defaults to NA if blank",
             )
 
-        st.code(
-            _quick_note_outline(selected_row, delay_reason=any_reason, action_text=any_action, note_text=any_note),
-            language="text",
+        outline_text = _quick_note_outline(
+            selected_row,
+            delay_reason=any_reason,
+            action_text=any_action,
+            note_text=any_note,
         )
+        st.code(outline_text, language="text")
+
+        selected_booking = str(selected_row.get("Booking") or "").strip()
+        mark_any_key = f"any_row_outline_mark_posted_{selected_idx}"
+        if st.button("✅ Mark posted to Telus", key=mark_any_key, use_container_width=True):
+            append_notification_history(
+                f"{selected_row.get('Booking', '')} ({selected_row.get('Aircraft', '')}) · {selected_row.get('Route', '')} · Telus outline posted",
+                booking=selected_booking,
+                notify_mode="telus_outline",
+            )
+            st.rerun()
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
@@ -6172,11 +6242,23 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                     reason_val = str(st.session_state.get(reason_key, ""))
                     action_val = str(st.session_state.get(action_key, ""))
                     notes_val = str(st.session_state.get(notes_key, ""))
-                    st.caption("Generate + copy a Telus-ready text block. Blank ACTION/NOTE default to NA.")
-                    st.code(
-                        _quick_note_outline(row, delay_reason=reason_val, action_text=action_val, note_text=notes_val),
-                        language="text",
+                    outline_text = _quick_note_outline(
+                        row,
+                        delay_reason=reason_val,
+                        action_text=action_val,
+                        note_text=notes_val,
                     )
+                    st.caption("Generate + copy a Telus-ready text block. Blank ACTION/NOTE default to NA.")
+                    st.code(outline_text, language="text")
+
+                    mark_key = f"notify_telus_posted_{booking_str}_{idx}"
+                    if st.button("✅ Mark posted to Telus", key=mark_key, use_container_width=True):
+                        append_notification_history(
+                            f"{row['Booking']} ({row['Aircraft']}) · {row['Route']} · Telus outline posted",
+                            booking=booking_str,
+                            notify_mode="telus_outline",
+                        )
+                        st.rerun()
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
