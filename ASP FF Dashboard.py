@@ -5787,6 +5787,109 @@ with st.expander("FL3XX postflight takeoff tester (manual)", expanded=False):
 # -------- Quick Notify (cell-level delays only, with priority reason) --------
 _show = df  # NOTE: keep original index; do NOT reset here
 
+def _eta_hhmm_local(row: pd.Series) -> str:
+    eta_label = str(get_local_eta_str(row) or "").upper()
+    hhmm = "".join(ch for ch in eta_label if ch.isdigit())[:4]
+    if len(hhmm) == 4:
+        return f"{hhmm}LT"
+    return ""
+
+
+def _quick_note_outline(
+    row: pd.Series,
+    delay_reason: str = "",
+    action_text: str = "",
+    note_text: str = "",
+) -> str:
+    tail = str(row.get("Aircraft") or "").replace("-", "").strip().upper() or "NA"
+    booking = str(row.get("Booking") or "").strip().upper() or "NA"
+
+    delta_minutes = int(_default_minutes_delta(row))
+    timing_label = "LATE" if delta_minutes >= 0 else "EARLY"
+    timing_value = f"{abs(delta_minutes)}MINS"
+
+    eta_text = _eta_hhmm_local(row)
+    reason_text = str(delay_reason or "").strip().upper()
+    action_value = str(action_text or "").strip().upper() or "NA"
+    note_value = str(note_text or "").strip().upper() or "NA"
+
+    lines = [
+        f"TAIL: {tail} // {booking}",
+        f"{timing_label}: {timing_value}",
+        f"UPDATED ETA: {eta_text}",
+    ]
+
+    if reason_text:
+        lines.append(f"REASON: {reason_text}")
+
+    lines.extend([
+        f"ACTION: {action_value}",
+        f"NOTE: {note_value}",
+    ])
+
+    return "\n".join(lines)
+
+
+with st.expander("Copy Telus outline (any row)", expanded=False):
+    gap_mask = _show["_GapRow"] if "_GapRow" in _show.columns else pd.Series(False, index=_show.index)
+    copy_source = _show[~gap_mask].copy()
+
+    if copy_source.empty:
+        st.caption("No rows available to generate an outline.")
+    else:
+        row_options = list(copy_source.index)
+
+        def _row_picker_label(row_idx) -> str:
+            row_item = copy_source.loc[row_idx]
+            booking = str(row_item.get("Booking") or "—")
+            aircraft = str(row_item.get("Aircraft") or "—")
+            route = str(row_item.get("Route") or "—")
+            status = str(row_item.get("Status") or "").strip()
+            return f"{booking} · {aircraft} · {route}{(' · ' + status) if status else ''}"
+
+        selected_idx = st.selectbox(
+            "Choose row",
+            options=row_options,
+            format_func=_row_picker_label,
+            key="any_row_outline_picker",
+        )
+        selected_row = copy_source.loc[selected_idx]
+
+        any_reason_key = "any_row_outline_reason"
+        any_reason_row_key = "any_row_outline_reason_row_idx"
+        auto_reason = str(selected_row.get("Off Block Delay Codes") or "").strip()
+        prev_selected_idx = st.session_state.get(any_reason_row_key)
+        if prev_selected_idx != selected_idx:
+            st.session_state[any_reason_key] = auto_reason
+            st.session_state[any_reason_row_key] = selected_idx
+        elif auto_reason and not str(st.session_state.get(any_reason_key, "")).strip():
+            st.session_state[any_reason_key] = auto_reason
+
+        c_reason, c_action, c_note = st.columns(3)
+        with c_reason:
+            any_reason = st.text_input(
+                "Reason (optional)",
+                key=any_reason_key,
+                placeholder="Leave blank if unknown",
+            )
+        with c_action:
+            any_action = st.text_input(
+                "Action (optional)",
+                key="any_row_outline_action",
+                placeholder="Defaults to NA if blank",
+            )
+        with c_note:
+            any_note = st.text_input(
+                "Note (optional)",
+                key="any_row_outline_note",
+                placeholder="Defaults to NA if blank",
+            )
+
+        st.code(
+            _quick_note_outline(selected_row, delay_reason=any_reason, action_text=any_action, note_text=any_note),
+            language="text",
+        )
+
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
 # Variances vs schedule (same as styling)
@@ -5863,6 +5966,8 @@ def _default_task_title(row: pd.Series) -> str:
     return f"{tail} - {booking} - {account} - {_format_task_delta_label(delta_minutes)}"
 
 
+
+
 def _send_quick_notify(
     row: pd.Series,
     delay_reason: str,
@@ -5926,11 +6031,17 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                 if auto_reason and not str(st.session_state.get(reason_key, "")).strip():
                     st.session_state[reason_key] = auto_reason
                 st.text_input("Delay Reason", key=reason_key, placeholder="Enter delay details")
+                action_key = f"delay_action_{booking_str}_{idx}"
+                st.text_input(
+                    "Action",
+                    key=action_key,
+                    placeholder="Defaults to NA in copied outline",
+                )
                 notes_key = f"delay_notes_{booking_str}_{idx}"
                 st.text_area(
                     "Notes",
                     key=notes_key,
-                    placeholder="Optional context shared at the end of the Telus post",
+                    placeholder="Defaults to NA in copied outline",
                     height=80,
                 )
             with btn_col:
@@ -5974,6 +6085,16 @@ with st.expander("Quick Notify - Testing Currently - Will not post to Telus", ex
                             )
                         else:
                             st.error(f"Failed: {result}")
+
+                with st.popover("🧾 Copy outline", use_container_width=True):
+                    reason_val = str(st.session_state.get(reason_key, ""))
+                    action_val = str(st.session_state.get(action_key, ""))
+                    notes_val = str(st.session_state.get(notes_key, ""))
+                    st.caption("Generate + copy a Telus-ready text block. Blank ACTION/NOTE default to NA.")
+                    st.code(
+                        _quick_note_outline(row, delay_reason=reason_val, action_text=action_val, note_text=notes_val),
+                        language="text",
+                    )
 
     notification_entries = load_notification_history(limit=50)
     with st.expander("Notification history (shared)", expanded=False):
