@@ -3178,6 +3178,29 @@ def _airport_token_variants(code: str) -> set[str]:
     return tokens
 
 
+def _airport_codes_equivalent(*codes: Any) -> bool:
+    """Return True when any provided airport codes resolve to the same token set."""
+
+    token_sets: list[set[str]] = []
+    for code in codes:
+        code_text = str(code or "").strip().upper()
+        if not code_text:
+            continue
+        tokens = _airport_token_variants(code_text)
+        if not tokens:
+            tokens = {code_text}
+        token_sets.append(tokens)
+
+    if len(token_sets) < 2:
+        return False
+
+    base = token_sets[0]
+    for current in token_sets[1:]:
+        if base & current:
+            return True
+    return False
+
+
 def _parse_route_mismatch_status(status_text: str):
     """Parse stored RouteMismatch status JSON → dict with normalized fields."""
 
@@ -3693,6 +3716,19 @@ def apply_flightaware_webhook_updates(
                 delta_min = None
                 if sched_dt is not None:
                     delta_min = int(round((event_dt - sched_dt).total_seconds() / 60.0))
+
+                scheduled_to_icao = str(match_row.get("To_ICAO") or "").strip().upper()
+                scheduled_to_iata = str(match_row.get("To_IATA") or "").strip().upper()
+
+                if event_type == "Diversion" and _airport_codes_equivalent(
+                    destination,
+                    scheduled_to_icao,
+                    scheduled_to_iata,
+                ):
+                    # Guard against FlightAware diversion alerts that only flip
+                    # between equivalent ICAO/IATA representations of the same
+                    # airport (for example CYCK vs YCK).
+                    continue
 
                 if event_type == "Arrival":
                     status_label = "🟣 ARRIVED"

@@ -1,6 +1,7 @@
 import ast
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from dateutil import parser as dateparse
@@ -13,6 +14,7 @@ _DEF_NAMES = {
     "normalize_iata",
     "derive_iata_from_icao",
     "_airport_token_variants",
+    "_airport_codes_equivalent",
     "choose_booking_for_event",
     "_parse_time_token_to_utc",
 }
@@ -36,6 +38,7 @@ if missing:
 
 _namespace: dict[str, object] = {
     "pd": pd,
+    "Any": Any,
     "datetime": datetime,
     "timezone": timezone,
     "timedelta": timedelta,
@@ -63,6 +66,7 @@ exec(
             "normalize_iata",
             "derive_iata_from_icao",
             "_airport_token_variants",
+            "_airport_codes_equivalent",
             "choose_booking_for_event",
             "_parse_time_token_to_utc",
         ]
@@ -71,6 +75,7 @@ exec(
 )
 
 choose_booking_for_event = _namespace["choose_booking_for_event"]
+_airport_codes_equivalent = _namespace["_airport_codes_equivalent"]
 _parse_time_token_to_utc = _namespace["_parse_time_token_to_utc"]
 
 
@@ -203,3 +208,17 @@ def test_choose_booking_without_timestamp_and_multiple_candidates_returns_none()
     match = choose_booking_for_event(subj_info, tails_dashed, "Departure", None)
 
     assert match is None
+
+
+def test_airport_codes_equivalent_matches_icao_and_iata_variants():
+    _namespace["ICAO_TO_IATA_MAP"] = {"CYCK": "YCK"}
+    _namespace["IATA_TO_ICAO_MAP"] = {"YCK": "CYCK"}
+
+    assert _airport_codes_equivalent("CYCK", "YCK")
+
+
+def test_airport_codes_equivalent_rejects_unrelated_codes():
+    _namespace["ICAO_TO_IATA_MAP"] = {"CYCK": "YCK", "CYVL": "YVL"}
+    _namespace["IATA_TO_ICAO_MAP"] = {"YCK": "CYCK", "YVL": "CYVL"}
+
+    assert not _airport_codes_equivalent("CYCK", "CYVL")
