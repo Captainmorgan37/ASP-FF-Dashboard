@@ -6024,10 +6024,23 @@ with st.expander("Copy Telus outline (any row)", expanded=open_outline_expander)
                 placeholder="Defaults to NA if blank",
             )
 
-        st.code(
-            _quick_note_outline(selected_row, delay_reason=any_reason, action_text=any_action, note_text=any_note),
-            language="text",
+        outline_text = _quick_note_outline(
+            selected_row,
+            delay_reason=any_reason,
+            action_text=any_action,
+            note_text=any_note,
         )
+        st.code(outline_text, language="text")
+
+        selected_booking = str(selected_row.get("Booking") or "").strip()
+        mark_any_key = f"any_row_outline_mark_posted_{selected_idx}"
+        if st.button("✅ Mark posted to Telus", key=mark_any_key, use_container_width=True):
+            append_notification_history(
+                f"{selected_row.get('Booking', '')} ({selected_row.get('Aircraft', '')}) · {selected_row.get('Route', '')} · Telus outline posted",
+                booking=selected_booking,
+                notify_mode="telus_outline",
+            )
+            st.success(f"Marked {selected_booking or 'selected flight'} as posted to Telus")
 
 thr = pd.Timedelta(minutes=int(delay_threshold_min))  # same threshold as styling
 
