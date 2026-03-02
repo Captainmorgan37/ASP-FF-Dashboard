@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 
-def _load_sync_helper():
+def _load_sync_helper(*, lease_acquired: bool = True):
     source_path = Path("ASP FF Dashboard.py")
     module = ast.parse(source_path.read_text())
     target = None
@@ -35,6 +35,7 @@ def _load_sync_helper():
         "Any": object,
         "Fl3xxApiConfig": object,
         "_parse_iso8601": lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None,
+        "_acquire_postflight_sync_lease": lambda flight_id, **kwargs: lease_acquired,
         "sync_postflight_takeoff_if_empty": fake_sync,
     }
     exec(compile(mini, filename=str(source_path), mode="exec"), namespace)
@@ -119,4 +120,40 @@ def test_sync_helper_skips_when_departure_event_not_recent():
 
     assert summary["attempted"] == 0
     assert summary["updated"] == 0
+    assert calls == []
+
+
+def test_sync_helper_skips_when_lease_not_acquired():
+    fn, calls = _load_sync_helper(lease_acquired=False)
+    now = datetime.now(timezone.utc)
+    recent_dep_received = (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+    frame = pd.DataFrame(
+        [
+            {
+                "Aircraft": "C-FASF",
+                "_Fl3xxFlightId": "111",
+                "_DepActual_ts": pd.Timestamp(now - timedelta(minutes=3)),
+                "_ArrActual_ts": pd.NaT,
+                "_OnBlock_UTC": pd.NaT,
+                "_LegKey": "ABC12",
+                "Booking": "ABC12",
+            }
+        ]
+    )
+
+    events = {"ABC12": {"Departure": {"received_at": recent_dep_received}}}
+
+    summary = fn(
+        object(),
+        frame,
+        enabled_tails={"CFASF"},
+        events_lookup=lambda leg_key, booking: events.get(leg_key, {}),
+        recent_departure_window_minutes=20,
+        lease_ttl_seconds=45,
+    )
+
+    assert summary["attempted"] == 0
+    assert summary["updated"] == 0
+    assert summary["skipped"] == 1
     assert calls == []
