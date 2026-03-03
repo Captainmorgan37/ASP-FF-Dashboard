@@ -3229,6 +3229,10 @@ def normalize_iata(code: str) -> str:
     return c if len(c) == 3 else ""
 
 def derive_iata_from_icao(icao: str) -> str:
+    preload_maps = globals().get("_preload_airport_code_maps")
+    if callable(preload_maps):
+        preload_maps()
+
     c = (icao or "").strip().upper()
     if len(c) != 4:
         return ""
@@ -3260,8 +3264,51 @@ def display_airport(icao: str, iata: str) -> str:
     return "—"
 
 
+def _preload_airport_code_maps() -> None:
+    """Best-effort early load for ICAO/IATA aliases used during webhook matching."""
+
+    global ICAO_TO_IATA_MAP, IATA_TO_ICAO_MAP
+
+    if ICAO_TO_IATA_MAP and IATA_TO_ICAO_MAP:
+        return
+
+    csv_path = Path(__file__).with_name("Airport TZ")
+    if not csv_path.exists():
+        return
+
+    try:
+        airport_df = pd.read_csv(csv_path)
+    except Exception:
+        return
+
+    if airport_df.empty:
+        return
+
+    col_map = {str(col).lower(): col for col in airport_df.columns}
+    icao_col = col_map.get("icao")
+    iata_col = col_map.get("iata")
+    if not icao_col or not iata_col:
+        return
+
+    icao_series = airport_df[icao_col].astype(str).str.strip().str.upper()
+    iata_series = airport_df[iata_col].astype(str).str.strip().str.upper()
+    valid = (icao_series.str.len() == 4) & (iata_series.str.len() == 3)
+    if not valid.any():
+        return
+
+    for icao, iata in zip(icao_series[valid], iata_series[valid]):
+        if not icao or not iata:
+            continue
+        ICAO_TO_IATA_MAP.setdefault(icao, iata)
+        IATA_TO_ICAO_MAP.setdefault(iata, icao)
+
+
 def _airport_token_variants(code: str) -> set[str]:
     """Return possible comparison tokens (ICAO + derived IATA) for a code."""
+
+    preload_maps = globals().get("_preload_airport_code_maps")
+    if callable(preload_maps):
+        preload_maps()
 
     tokens: set[str] = set()
     raw = (code or "").strip().upper()
