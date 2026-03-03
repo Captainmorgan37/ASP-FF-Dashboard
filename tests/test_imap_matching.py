@@ -284,3 +284,19 @@ def test_choose_booking_matches_composite_departure_from_airport_token():
 
     assert match is not None
     assert match["Booking"] == "4002"
+
+def test_airport_token_variants_preload_alias_maps_when_available():
+    _namespace["ICAO_TO_IATA_MAP"] = {}
+    _namespace["IATA_TO_ICAO_MAP"] = {}
+
+    def _stub_preload() -> None:
+        _namespace["ICAO_TO_IATA_MAP"].setdefault("EGGW", "LTN")
+        _namespace["IATA_TO_ICAO_MAP"].setdefault("LTN", "EGGW")
+
+    _namespace["_preload_airport_code_maps"] = _stub_preload
+
+    tokens = _namespace["_airport_token_variants"]("LTN")
+
+    assert "LTN" in tokens
+    assert "EGGW" in tokens
+
