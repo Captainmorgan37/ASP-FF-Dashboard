@@ -253,3 +253,34 @@ def test_choose_booking_matches_flightaware_icao_when_schedule_icao_column_conta
 
     assert match is not None
     assert match["Booking"] == "4001"
+
+
+def test_choose_booking_matches_composite_departure_from_airport_token():
+    df_clean = pd.DataFrame(
+        [
+            {
+                "Booking": "4002",
+                "Aircraft": "C-FASP",
+                "From_IATA": "",
+                "From_ICAO": "OCA",
+                "To_IATA": "YUL",
+                "To_ICAO": "CYUL",
+                "ETD_UTC": pd.Timestamp("2024-04-01T12:00:00Z"),
+                "ETA_UTC": pd.Timestamp("2024-04-01T15:00:00Z"),
+            }
+        ]
+    )
+
+    _namespace["df_clean"] = df_clean
+    _namespace["ICAO_TO_IATA_MAP"] = {"07FA": "OCA", "CYUL": "YUL"}
+    _namespace["IATA_TO_ICAO_MAP"] = {"OCA": "07FA", "YUL": "CYUL"}
+
+    subj_info = {
+        "from_airport": "07FA/OCA",
+        "to_airport": "CYUL",
+    }
+
+    match = choose_booking_for_event(subj_info, ["C-FASP"], "Departure", None)
+
+    assert match is not None
+    assert match["Booking"] == "4002"
