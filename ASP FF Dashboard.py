@@ -3264,19 +3264,20 @@ def _airport_token_variants(code: str) -> set[str]:
     """Return possible comparison tokens (ICAO + derived IATA) for a code."""
 
     tokens: set[str] = set()
-    c = (code or "").strip().upper()
-    if not c:
+    raw = (code or "").strip().upper()
+    if not raw:
         return tokens
-    if len(c) == 4:
-        tokens.add(c)
-        derived = derive_iata_from_icao(c)
-        if derived:
-            tokens.add(derived)
-    elif len(c) == 3:
-        tokens.add(c)
-        mapped_icao = IATA_TO_ICAO_MAP.get(c)
-        if mapped_icao:
-            tokens.add(mapped_icao)
+    for c in raw.replace("/", " ").split():
+        if len(c) == 4:
+            tokens.add(c)
+            derived = derive_iata_from_icao(c)
+            if derived:
+                tokens.add(derived)
+        elif len(c) == 3:
+            tokens.add(c)
+            mapped_icao = IATA_TO_ICAO_MAP.get(c)
+            if mapped_icao:
+                tokens.add(mapped_icao)
     return tokens
 
 
@@ -3364,8 +3365,8 @@ def choose_booking_for_event(
         if not token_norm:
             return cdf
 
-        tok_iata = normalize_iata(token_norm)
-        tok_icao = token_norm if len(token_norm) == 4 else ""
+        token_candidates = _airport_token_variants(token_norm)
+        token_candidates.add(token_norm)
 
         icao_series = (
             cdf[col_icao]
@@ -3382,50 +3383,54 @@ def choose_booking_for_event(
             .str.upper()
         )
 
-        if tok_iata:
-            derived_mask = (
-                (icao_series.str.len() == 4)
-                & icao_series.str[0].isin(["C", "K"])
-                & (icao_series.str[1:] == tok_iata)
-            )
-            if derived_mask.any():
-                route_filter_hit = True
-                return cdf[derived_mask]
+        for candidate in token_candidates:
+            tok_iata = normalize_iata(candidate)
+            tok_icao = candidate if len(candidate) == 4 else ""
 
-            mapped_icao = IATA_TO_ICAO_MAP.get(tok_iata)
-            if mapped_icao:
-                mapped_mask = icao_series == mapped_icao
-                if mapped_mask.any():
+            if tok_iata:
+                derived_mask = (
+                    (icao_series.str.len() == 4)
+                    & icao_series.str[0].isin(["C", "K"])
+                    & (icao_series.str[1:] == tok_iata)
+                )
+                if derived_mask.any():
                     route_filter_hit = True
-                    return cdf[mapped_mask]
+                    return cdf[derived_mask]
 
-            iata_mask = iata_series == tok_iata
-            if iata_mask.any():
-                route_filter_hit = True
-                return cdf[iata_mask]
+                mapped_icao = IATA_TO_ICAO_MAP.get(tok_iata)
+                if mapped_icao:
+                    mapped_mask = icao_series == mapped_icao
+                    if mapped_mask.any():
+                        route_filter_hit = True
+                        return cdf[mapped_mask]
 
-        if tok_icao:
-            icao_mask = icao_series == tok_icao
-            if icao_mask.any():
-                route_filter_hit = True
-                return cdf[icao_mask]
-
-            # FL3XX can sometimes place a 3-character token (typically IATA, but
-            # occasionally FAA/LID style values) in the ICAO column. Resolve those
-            # aliases through the airport metadata map so FlightAware ICAO values
-            # (e.g. 07FA) can still match schedule rows that carry OCA.
-            icao_alias_series = icao_series.where(icao_series.str.len() == 3, "").map(IATA_TO_ICAO_MAP)
-            alias_mask = icao_alias_series == tok_icao
-            if alias_mask.any():
-                route_filter_hit = True
-                return cdf[alias_mask]
-
-            mapped_iata = ICAO_TO_IATA_MAP.get(tok_icao)
-            if mapped_iata:
-                mapped_mask = iata_series == mapped_iata
-                if mapped_mask.any():
+                iata_mask = iata_series == tok_iata
+                if iata_mask.any():
                     route_filter_hit = True
-                    return cdf[mapped_mask]
+                    return cdf[iata_mask]
+
+            if tok_icao:
+                icao_mask = icao_series == tok_icao
+                if icao_mask.any():
+                    route_filter_hit = True
+                    return cdf[icao_mask]
+
+                # FL3XX can sometimes place a 3-character token (typically IATA, but
+                # occasionally FAA/LID style values) in the ICAO column. Resolve those
+                # aliases through the airport metadata map so FlightAware ICAO values
+                # (e.g. 07FA) can still match schedule rows that carry OCA.
+                icao_alias_series = icao_series.where(icao_series.str.len() == 3, "").map(IATA_TO_ICAO_MAP)
+                alias_mask = icao_alias_series == tok_icao
+                if alias_mask.any():
+                    route_filter_hit = True
+                    return cdf[alias_mask]
+
+                mapped_iata = ICAO_TO_IATA_MAP.get(tok_icao)
+                if mapped_iata:
+                    mapped_mask = iata_series == mapped_iata
+                    if mapped_mask.any():
+                        route_filter_hit = True
+                        return cdf[mapped_mask]
 
         return cdf.iloc[0:0]
     
