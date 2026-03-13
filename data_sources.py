@@ -94,6 +94,13 @@ FL3XX_SCHEDULE_COLUMNS = [
 ]
 
 
+def _is_subcharter_workflow(workflow: Any) -> bool:
+    """Return True when the workflow represents a subcharter leg."""
+
+    workflow_text = str(workflow or "").strip().lower()
+    return "subcharter" in workflow_text or "sub charter" in workflow_text
+
+
 def _normalize_flights_for_schedule(flights: Iterable[Dict[str, Any]]) -> pd.DataFrame:
     """Transform FL3XX flight dictionaries into the dashboard's CSV-friendly structure."""
 
@@ -107,6 +114,9 @@ def _normalize_flights_for_schedule(flights: Iterable[Dict[str, Any]]) -> pd.Dat
         aircraft = flight.get("registrationNumber") or flight.get("requestedAircraftType") or ""
         aircraft_type = flight.get("aircraftCategory") or ""
         workflow = flight.get("workflowCustomName") or flight.get("workflow") or ""
+
+        if _is_subcharter_workflow(workflow):
+            continue
 
         off_block = _format_utc_timestamp(flight.get("blockOffEstUTC"))
         on_block = _format_utc_timestamp(flight.get("blockOnEstUTC"))
