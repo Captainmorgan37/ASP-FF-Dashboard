@@ -41,6 +41,35 @@ class Fl3xxApiLoaderTests(unittest.TestCase):
         self.assertEqual(row["PIC"], "Stuart Weaver")
         self.assertEqual(row["SIC"], "Jason MacNeil")
 
+
+    def test_excludes_subcharter_workflows(self):
+        flights = [
+            {
+                "bookingIdentifier": "KEPT1",
+                "workflowCustomName": "FEX As Available",
+                "airportFrom": "CYUL",
+                "airportTo": "CYYZ",
+            },
+            {
+                "bookingIdentifier": "DROP1",
+                "workflowCustomName": "Subcharter",
+                "airportFrom": "CYVR",
+                "airportTo": "CYYC",
+            },
+            {
+                "bookingIdentifier": "DROP2",
+                "workflowCustomName": "Sub Charter - Vendor",
+                "airportFrom": "CYEG",
+                "airportTo": "CYLW",
+            },
+        ]
+
+        data = load_schedule("fl3xx_api", metadata={"flights": flights})
+        frame = data.frame
+
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame.iloc[0]["Booking"], "KEPT1")
+
     def test_handles_missing_or_invalid_fields(self):
         flights = [
             {
