@@ -4961,18 +4961,29 @@ def get_local_eta_str(row) -> str:
 _base = view_df  # same frame used to make df_display; contains internal *_ts columns
 now_utc = datetime.now(timezone.utc)
 
+# Defensive datetime normalization for style-mask arithmetic.
+# Streamlit sessions can occasionally rehydrate object-typed columns here,
+# which breaks timezone-aware subtraction against ``now_utc``.
+_etd_utc = pd.to_datetime(_base.get("ETD_UTC"), errors="coerce", utc=True)
+_eta_utc = pd.to_datetime(_base.get("ETA_UTC"), errors="coerce", utc=True)
+_dep_actual_ts = pd.to_datetime(_base.get("_DepActual_ts"), errors="coerce", utc=True)
+_eta_fa_ts = pd.to_datetime(_base.get("_ETA_FA_ts"), errors="coerce", utc=True)
+_arr_actual_ts = pd.to_datetime(_base.get("_ArrActual_ts"), errors="coerce", utc=True)
+_on_block_utc = pd.to_datetime(_base.get("_OnBlock_UTC"), errors="coerce", utc=True)
+_edct_ts = pd.to_datetime(_base.get("_EDCT_ts"), errors="coerce", utc=True)
+
 delay_thr_td    = pd.Timedelta(minutes=int(delay_threshold_min))           # e.g. 15
 row_red_thr_td  = pd.Timedelta(minutes=max(30, int(delay_threshold_min)))  # 30+
 
 # Row-level operational delays (no-email state)
-no_dep = _base["_DepActual_ts"].isna()
-dep_lateness = now_utc - _base["ETD_UTC"]
-row_dep_yellow = _base["ETD_UTC"].notna() & no_dep & (dep_lateness > delay_thr_td) & (dep_lateness < row_red_thr_td)
-row_dep_red    = _base["ETD_UTC"].notna() & no_dep & (dep_lateness >= row_red_thr_td)
+no_dep = _dep_actual_ts.isna()
+dep_lateness = now_utc - _etd_utc
+row_dep_yellow = _etd_utc.notna() & no_dep & (dep_lateness > delay_thr_td) & (dep_lateness < row_red_thr_td)
+row_dep_red    = _etd_utc.notna() & no_dep & (dep_lateness >= row_red_thr_td)
 
-has_dep = _base["_DepActual_ts"].notna()
-no_arr  = _base["_ArrActual_ts"].isna()
-eta_baseline = _base["_ETA_FA_ts"].where(_base["_ETA_FA_ts"].notna(), _base["ETA_UTC"])
+has_dep = _dep_actual_ts.notna()
+no_arr  = _arr_actual_ts.isna()
+eta_baseline = _eta_fa_ts.where(_eta_fa_ts.notna(), _eta_utc)
 eta_lateness = now_utc - eta_baseline
 row_arr_yellow = eta_baseline.notna() & has_dep & no_arr & (eta_lateness > delay_thr_td) & (eta_lateness < row_red_thr_td)
 row_arr_red    = eta_baseline.notna() & has_dep & no_arr & (eta_lateness >= row_red_thr_td)
@@ -4981,9 +4992,9 @@ row_yellow = (row_dep_yellow | row_arr_yellow)
 row_red    = (row_dep_red    | row_arr_red)
 
 # Cell-level variance checks
-dep_delay        = _base["_DepActual_ts"] - _base["ETD_UTC"]   # Takeoff (FA) − Off-Block (Sched)
-eta_fa_vs_sched  = _base["_ETA_FA_ts"]    - _base["ETA_UTC"]   # ETA(FA) − On-Block (Sched)
-arr_vs_sched     = _base["_ArrActual_ts"] - _base["ETA_UTC"]   # Landing (FA) − On-Block (Sched)
+dep_delay        = _dep_actual_ts - _etd_utc   # Takeoff (FA) − Off-Block (Sched)
+eta_fa_vs_sched  = _eta_fa_ts     - _eta_utc   # ETA(FA) − On-Block (Sched)
+arr_vs_sched     = _arr_actual_ts - _eta_utc   # Landing (FA) − On-Block (Sched)
 
 if "Status" in _base.columns:
     depart_delay_status = _base["Status"].eq("🔴 Departed (Delay)")
@@ -4999,17 +5010,17 @@ cell_eta = eta_fa_vs_sched.notna() & (eta_fa_vs_sched > delay_thr_td)
 cell_arr = arr_vs_sched.notna()    & (arr_vs_sched    > delay_thr_td)
 
 # Landed-leg green overlay
-row_green = _base["_ArrActual_ts"].notna()
+row_green = _arr_actual_ts.notna()
 
 # Flash landed legs that have not yet gone on blocks for 15+ minutes
 landed_overdue = (
-    _base["_ArrActual_ts"].notna()
-    & _base["_OnBlock_UTC"].isna()
-    & ((now_utc - _base["_ArrActual_ts"]) >= pd.Timedelta(minutes=15))
+    _arr_actual_ts.notna()
+    & _on_block_utc.isna()
+    & ((now_utc - _arr_actual_ts) >= pd.Timedelta(minutes=15))
 )
 
 # EDCT purple (until true departure is received)
-idx_edct = _base["_EDCT_ts"].notna() & _base["_DepActual_ts"].isna()
+idx_edct = _edct_ts.notna() & _dep_actual_ts.isna()
 
 if "_TurnMinutes" in _base.columns:
     turn_warn = _base["_TurnMinutes"].notna() & (_base["_TurnMinutes"] < TURNAROUND_MIN_GAP_MINUTES)
