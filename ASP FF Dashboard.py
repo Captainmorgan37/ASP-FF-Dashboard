@@ -1687,6 +1687,26 @@ def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
                     return text
         return None
 
+    def _sanitize_actual_timestamp(
+        raw_value: str | None,
+        *,
+        now: datetime | None = None,
+        future_tolerance: timedelta = timedelta(minutes=5),
+        minimum_year: int = 2000,
+    ) -> datetime | None:
+        parsed = parse_iso_to_utc(raw_value) if raw_value else None
+        if parsed is None:
+            return None
+
+        if parsed.year < minimum_year:
+            return None
+
+        reference_now = now or datetime.now(timezone.utc)
+        if parsed > reference_now + future_tolerance:
+            return None
+
+        return parsed
+
     for flight in flights:
         if not isinstance(flight, dict):
             continue
@@ -1712,8 +1732,8 @@ def _ingest_fl3xx_actuals(flights: list[dict[str, Any]]) -> None:
             ),
         )
 
-        off_dt = parse_iso_to_utc(off_raw) if off_raw else None
-        on_dt = parse_iso_to_utc(on_raw) if on_raw else None
+        off_dt = _sanitize_actual_timestamp(off_raw)
+        on_dt = _sanitize_actual_timestamp(on_raw)
 
         flight["_OffBlock_UTC"] = _to_iso8601_z(off_dt) if off_dt else None
         flight["_OnBlock_UTC"] = _to_iso8601_z(on_dt) if on_dt else None
