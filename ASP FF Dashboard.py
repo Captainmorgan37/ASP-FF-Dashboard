@@ -3947,8 +3947,13 @@ def apply_flightaware_webhook_updates(
             existing_forecast = leg_events.get("ArrivalForecast")
             update_forecast = True
             if existing_forecast:
+                existing_source = str(existing_forecast.get("source") or "").strip().lower()
                 existing_dt = parse_iso_to_utc(existing_forecast.get("actual_time_utc"))
-                if existing_dt and existing_dt == forecast_dt:
+                if existing_source == "manual":
+                    # Respect inline manual ETA edits in the active dashboard session.
+                    # They should remain in place until a new status message is applied.
+                    update_forecast = False
+                elif existing_dt and existing_dt >= forecast_dt:
                     update_forecast = False
             if update_forecast:
                 delta_min_forecast = None
@@ -5707,6 +5712,7 @@ def _apply_inline_editor_updates(original_df: pd.DataFrame, edited_df: pd.DataFr
                 "actual_time_utc": new_val.isoformat(),
                 "delta_min": delta_min,
                 "status": status_label,
+                "source": "manual",
                 "booking": booking_val,
             }
             time_saved += 1
